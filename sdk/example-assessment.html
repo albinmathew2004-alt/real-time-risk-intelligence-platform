@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Risk Telemetry SDK — Example Assessment</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        margin: 24px;
+        line-height: 1.35;
+      }
+      .row { display: flex; gap: 16px; flex-wrap: wrap; }
+      .card {
+        border: 1px solid #ddd;
+        border-radius: 12px;
+        padding: 16px;
+        max-width: 980px;
+      }
+      label { display: block; margin: 8px 0 4px; font-weight: 600; }
+      input, textarea {
+        width: 100%;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid #ccc;
+        box-sizing: border-box;
+      }
+      button {
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid #222;
+        background: #111;
+        color: white;
+        cursor: pointer;
+        margin-right: 8px;
+      }
+      button.secondary {
+        background: white;
+        color: #111;
+      }
+      .muted { color: #555; font-size: 0.95rem; }
+      .q {
+        margin-top: 12px;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid #eee;
+      }
+      .q h3 { margin: 0 0 8px; }
+      .status { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95rem; }
+    </style>
+  </head>
+  <body>
+    <h1>Risk Telemetry SDK — Example Assessment</h1>
+    <p class="muted">
+      This page demonstrates how to embed <strong>sdk/risk-telemetry-sdk.js</strong> into a simple assessment.
+      It sends metadata-only events to your existing backend endpoint: <code>POST /v1/events/ingest</code>.
+    </p>
+
+    <div class="row">
+      <div class="card" style="flex: 1; min-width: 320px;">
+        <h2>1) Setup</h2>
+
+        <label>Base URL (FastAPI)</label>
+        <input id="baseUrl" value="http://localhost:8000" />
+
+        <label>Attempt ID</label>
+        <input id="attemptId" value="attempt_demo_001" />
+
+        <label>Candidate ID</label>
+        <input id="candidateId" value="candidate_demo_001" />
+
+        <label>Candidate Name</label>
+        <input id="candidateName" value="Demo Candidate" />
+
+        <label>Candidate Email</label>
+        <input id="candidateEmail" value="demo.candidate@example.com" />
+
+        <label>Assessment ID</label>
+        <input id="assessmentId" value="assessment_python_01" />
+
+        <label>Assessment Name</label>
+        <input id="assessmentName" value="Python Coding Assessment" />
+
+        <div style="margin-top: 14px;">
+          <button id="btnInit" class="secondary">Init SDK</button>
+          <button id="btnStart">Start Exam</button>
+          <button id="btnSubmit">Submit Exam</button>
+          <button id="btnDestroy" class="secondary">Destroy SDK</button>
+        </div>
+
+        <p class="status" id="status" style="margin-top: 10px;">SDK status: not initialized</p>
+      </div>
+
+      <div class="card" style="flex: 2; min-width: 320px;">
+        <h2>2) Assessment</h2>
+        <p class="muted">Focus inputs, type, paste, switch tabs, and wait idle to generate telemetry.</p>
+
+        <div class="q">
+          <h3>Question q1</h3>
+          <p class="muted">Explain what a Python list comprehension does.</p>
+          <textarea
+            id="a1"
+            data-question-id="q1"
+            rows="3"
+            placeholder="Type an answer (not sent; only length is recorded)"
+          ></textarea>
+        </div>
+
+        <div class="q">
+          <h3>Question q2</h3>
+          <p class="muted">What is the difference between a list and a tuple?</p>
+          <textarea
+            id="a2"
+            data-question-id="q2"
+            rows="3"
+            placeholder="Type an answer (not sent; only length is recorded)"
+          ></textarea>
+        </div>
+
+        <div class="q">
+          <h3>Question q3</h3>
+          <p class="muted">Write a short function signature for parsing a timestamp.</p>
+          <input
+            id="a3"
+            data-question-id="q3"
+            placeholder="def parse_time(ts: str) -> datetime:"
+          />
+        </div>
+
+        <p class="muted" style="margin-top: 12px;">
+          Tip: To see risk updates live, run the frontend and watch your dashboard.
+        </p>
+      </div>
+    </div>
+
+    <!-- SDK (local relative import) -->
+    <script src="./risk-telemetry-sdk.js"></script>
+
+    <script>
+      (function () {
+        'use strict';
+
+        var sdkReady = false;
+
+        function setStatus(msg) {
+          document.getElementById('status').textContent = 'SDK status: ' + msg;
+        }
+
+        function getInitOptions() {
+          return {
+            baseUrl: document.getElementById('baseUrl').value,
+            attemptId: document.getElementById('attemptId').value,
+            candidateId: document.getElementById('candidateId').value,
+            candidateName: document.getElementById('candidateName').value,
+            candidateEmail: document.getElementById('candidateEmail').value,
+            assessmentId: document.getElementById('assessmentId').value,
+            assessmentName: document.getElementById('assessmentName').value,
+
+            // Dev quality-of-life:
+            devMode: true,
+            idleTimeoutMs: 30000,
+            typingStopMs: 1200,
+          };
+        }
+
+        function wireQuestionInput(el, questionId) {
+          el.addEventListener('focus', function () {
+            if (!sdkReady) return;
+            RiskTelemetry.enterQuestion(questionId);
+          });
+
+          el.addEventListener('blur', function () {
+            if (!sdkReady) return;
+            RiskTelemetry.leaveQuestion(questionId);
+          });
+
+          el.addEventListener('input', function () {
+            if (!sdkReady) return;
+            RiskTelemetry.trackAnswerChange(questionId, el.value);
+          });
+        }
+
+        document.getElementById('btnInit').addEventListener('click', function () {
+          try {
+            RiskTelemetry.init(getInitOptions());
+            sdkReady = true;
+            setStatus('initialized');
+          } catch (e) {
+            sdkReady = false;
+            setStatus('init failed: ' + e.message);
+          }
+        });
+
+        document.getElementById('btnStart').addEventListener('click', function () {
+          if (!sdkReady) return setStatus('click Init SDK first');
+          RiskTelemetry.startExam();
+          setStatus('exam started');
+        });
+
+        document.getElementById('btnSubmit').addEventListener('click', function () {
+          if (!sdkReady) return setStatus('click Init SDK first');
+          RiskTelemetry.endExam();
+          setStatus('exam submitted');
+        });
+
+        document.getElementById('btnDestroy').addEventListener('click', function () {
+          if (!sdkReady) return setStatus('not initialized');
+          RiskTelemetry.destroy();
+          sdkReady = false;
+          setStatus('destroyed');
+        });
+
+        wireQuestionInput(document.getElementById('a1'), 'q1');
+        wireQuestionInput(document.getElementById('a2'), 'q2');
+        wireQuestionInput(document.getElementById('a3'), 'q3');
+
+      })();
+    </script>
+  </body>
+</html>
