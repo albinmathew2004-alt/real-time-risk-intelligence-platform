@@ -23,11 +23,27 @@ import {
 
 import "./App.css";
 
-const API_URL = "http://127.0.0.1:8000/v1/logs";
-const WS_URL = "ws://127.0.0.1:8000/ws/risk";
-const EVENTS_URL = "http://127.0.0.1:8000/v1/events";
-const RISK_HISTORY_URL = "http://127.0.0.1:8000/v1/risk-history";
-const AUTH_URL = "http://127.0.0.1:8000/v1/auth";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+
+function toWsUrl(baseUrl, path) {
+  try {
+    const url = new URL(baseUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = path;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return `ws://127.0.0.1:8000${path}`;
+  }
+}
+
+const API_URL = `${API_BASE_URL}/v1/logs`;
+const WS_URL = toWsUrl(API_BASE_URL, "/ws/risk");
+const EVENTS_URL = `${API_BASE_URL}/v1/events`;
+const RISK_HISTORY_URL = `${API_BASE_URL}/v1/risk-history`;
+const CASES_URL = `${API_BASE_URL}/v1/cases`;
+const AUTH_URL = `${API_BASE_URL}/v1/auth`;
 
 const TOKEN_KEY = "riskintel_access_token";
 
@@ -115,6 +131,17 @@ function getExamStatus(item, events = []) {
 function statusClass(status) {
   if (status === "COMPLETED") return "status completed";
   return "status ongoing";
+}
+
+function caseStatusTone(status) {
+  if (status === "ESCALATED" || status === "CONFIRMED_RISK") return "urgent";
+  if (status === "CLEARED" || status === "FALSE_POSITIVE" || status === "CLOSED") return "completed";
+  if (status === "TRIAGED" || status === "UNDER_INVESTIGATION" || status === "NEW") return "review";
+  return "ongoing";
+}
+
+function caseStatusClass(status) {
+  return `status ${caseStatusTone(status)}`;
 }
 
 function eventLabel(event) {
@@ -365,6 +392,8 @@ async function authJsonFetch(url, { token, method = "GET", body } = {}) {
 export default function App() {
   const [page, setPage] = useState("dashboard");
   const [logs, setLogs] = useState([]);
+  const [cases, setCases] = useState([]);
+  const [caseAccessError, setCaseAccessError] = useState("");
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
@@ -380,6 +409,8 @@ export default function App() {
     setStoredToken(null);
     setToken(null);
     setCurrentUser(null);
+    setCases([]);
+    setSelected(null);
     setPage("dashboard");
   }, []);
 
@@ -404,6 +435,48 @@ export default function App() {
       setLoading(false);
     }
   }, [logout, token]);
+
+  const fetchCases = useCallback(async () => {
+    try {
+      const result = await authJsonFetch(CASES_URL, { token });
+      if (!result.ok) {
+        if (result.status === 401) {
+          logout();
+          return;
+        }
+        if (result.status === 403) {
+          setCaseAccessError("Your role can sign in, but reviewer workflow access is restricted.");
+          setCases([]);
+          return;
+        }
+        return;
+      }
+      setCaseAccessError("");
+      setCases(Array.isArray(result.data?.data) ? result.data.data : []);
+    } catch (err) {
+      console.error("Failed to fetch cases:", err);
+    }
+  }, [logout, token]);
+
+  const performCaseAction = useCallback(async ({ caseId, endpoint, body }) => {
+    if (!caseId) {
+      return { ok: false, error: "Missing case id" };
+    }
+    const result = await authJsonFetch(`${CASES_URL}/${caseId}/${endpoint}`, {
+      token,
+      method: "POST",
+      body,
+    });
+    if (!result.ok) {
+      if (result.status === 401) logout();
+      return {
+        ok: false,
+        error: result?.data?.detail || result?.data?.message || "Case action failed",
+      };
+    }
+    await fetchCases();
+    return { ok: true, data: result.data };
+  }, [fetchCases, logout, token]);
 
   const login = useCallback(async ({ email, password }) => {
     setAuthError("");
@@ -463,6 +536,7 @@ export default function App() {
     if (!token) return;
     const timeoutId = window.setTimeout(() => {
       if (token) void fetchLogs();
+      if (token) void fetchCases();
     }, 0);
     const ws = new WebSocket(WS_URL);
 
@@ -504,6 +578,7 @@ export default function App() {
         });
 
         setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
+        void fetchCases();
       } catch (err) {
         console.error("WS parse error:", err);
       }
@@ -513,7 +588,16 @@ export default function App() {
       window.clearTimeout(timeoutId);
       ws.close();
     };
-  }, [fetchLogs, token]);
+  }, [fetchCases, fetchLogs, token]);
+
+  const caseByAttemptId = useMemo(() => {
+    return Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
+  }, [cases]);
+
+  const selectedCase = useMemo(() => {
+    if (!selected?.attempt_id) return null;
+    return caseByAttemptId[selected.attempt_id] || null;
+  }, [caseByAttemptId, selected?.attempt_id]);
 
   const filteredLogs = useMemo(() => {
     return logs.filter((x) => {
@@ -610,6 +694,8 @@ export default function App() {
         {page === "queue" && (
           <QueuePage
             filteredLogs={filteredLogs}
+            caseByAttemptId={caseByAttemptId}
+            caseAccessError={caseAccessError}
             searchTerm={searchTerm}
             setSearchTerm={setSearchTerm}
             riskFilter={riskFilter}
@@ -619,7 +705,16 @@ export default function App() {
           />
         )}
 
-        {page === "report" && <ReportPage selected={selected} token={token} onUnauthorized={logout} />}
+        {page === "report" && (
+          <ReportPage
+            selected={selected}
+            selectedCase={selectedCase}
+            caseAccessError={caseAccessError}
+            token={token}
+            onUnauthorized={logout}
+            onCaseAction={performCaseAction}
+          />
+        )}
       </main>
     </div>
   );
@@ -699,7 +794,7 @@ function DashboardPage({ stats, filteredLogs, setSelected, setPage, loading, wsC
   );
 }
 
-function QueuePage({ filteredLogs, searchTerm, setSearchTerm, riskFilter, setRiskFilter, setSelected, setPage }) {
+function QueuePage({ filteredLogs, caseByAttemptId, caseAccessError, searchTerm, setSearchTerm, riskFilter, setRiskFilter, setSelected, setPage }) {
   const sorted = [...filteredLogs].reverse();
 
   return (
@@ -735,13 +830,15 @@ function QueuePage({ filteredLogs, searchTerm, setSearchTerm, riskFilter, setRis
       </section>
 
       <section className="panel queue-panel">
-        <PanelTitle title="Candidate Attempts" subtitle="Clear status, score, and latest activity" />
+        <PanelTitle title="Candidate Attempts" subtitle="Case status, score, and latest activity" />
+
+        {caseAccessError && <div className="workflow-message workflow-message-warning">{caseAccessError}</div>}
 
         <div className="queue-table">
           <div className="queue-header">
             <span>Candidate</span>
             <span>Assessment</span>
-            <span>Status</span>
+            <span>Case Status</span>
             <span>Risk</span>
             <span>Score</span>
             <span>Last Activity</span>
@@ -753,7 +850,9 @@ function QueuePage({ filteredLogs, searchTerm, setSearchTerm, riskFilter, setRis
             <EmptyState text="No attempts found for the selected filters." />
           ) : (
             sorted.slice(0, 150).map((item, index) => {
-              const status = getExamStatus(item);
+              const examStatus = getExamStatus(item);
+              const caseRecord = caseByAttemptId[item.attempt_id];
+              const caseStatus = caseRecord?.status || "NEW";
               const lastAt = getLastActivityAt(item);
               const duration = getAttemptDurationSeconds(item);
               const eventCount = getEventCount(item);
@@ -770,12 +869,13 @@ function QueuePage({ filteredLogs, searchTerm, setSearchTerm, riskFilter, setRis
                     <strong>{getCandidateName(item)}</strong>
                     <small>{getCandidateEmail(item)}</small>
                     <small className="mono">{item.attempt_id}</small>
+                    <small className="muted">Exam: {examStatus}</small>
                   </span>
                   <span className="assessment-cell">
                     <strong>{getAssessmentName(item)}</strong>
                     <small className="muted">{item.assessment_id || "—"}</small>
                   </span>
-                  <span className={statusClass(status)}>{status}</span>
+                  <span className={caseStatusClass(caseStatus)}>{caseStatus}</span>
                   <span className={riskClass(item.risk)}>{item.risk || "LOW"}</span>
                   <span className="score-cell">{formatNumber(item.combined_score)}</span>
                   <span className="activity-cell">
@@ -795,10 +895,14 @@ function QueuePage({ filteredLogs, searchTerm, setSearchTerm, riskFilter, setRis
   );
 }
 
-function ReportPage({ selected, token, onUnauthorized }) {
+function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthorized, onCaseAction }) {
   const [events, setEvents] = useState([]);
   const [riskHistory, setRiskHistory] = useState([]);
+  const [caseDetail, setCaseDetail] = useState(null);
   const [reportLoading, setReportLoading] = useState(false);
+  const [workflowNote, setWorkflowNote] = useState("");
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [workflowMessage, setWorkflowMessage] = useState("");
 
   useEffect(() => {
     async function fetchReportData() {
@@ -832,6 +936,54 @@ function ReportPage({ selected, token, onUnauthorized }) {
     fetchReportData();
   }, [onUnauthorized, selected?.attempt_id, token]);
 
+  useEffect(() => {
+    async function fetchCaseDetail() {
+      if (!selectedCase?.id) {
+        setCaseDetail(null);
+        return;
+      }
+      const result = await authJsonFetch(`${CASES_URL}/${selectedCase.id}`, { token });
+      if (!result.ok) {
+        if (result.status === 401) {
+          onUnauthorized();
+          return;
+        }
+        if (result.status === 403) {
+          setCaseDetail(null);
+          setWorkflowMessage("You do not have permission to open reviewer workflow details.");
+          return;
+        }
+        setWorkflowMessage(result?.data?.detail || "Unable to load case details");
+        return;
+      }
+      setWorkflowMessage("");
+      setCaseDetail(result.data?.data || null);
+    }
+
+    void fetchCaseDetail();
+  }, [onUnauthorized, selectedCase?.id, token]);
+
+  const runCaseAction = useCallback(async (endpoint, body) => {
+    if (!caseDetail?.id) {
+      setWorkflowMessage("Case record is not ready yet.");
+      return;
+    }
+    try {
+      setWorkflowBusy(true);
+      setWorkflowMessage("");
+      const result = await onCaseAction({ caseId: caseDetail.id, endpoint, body });
+      if (!result?.ok) {
+        setWorkflowMessage(result?.error || "Case action failed");
+        return;
+      }
+      setCaseDetail(result.data?.data || null);
+      setWorkflowMessage("Case updated.");
+      if (endpoint === "notes") setWorkflowNote("");
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }, [caseDetail?.id, onCaseAction]);
+
   if (!selected) {
     return (
       <>
@@ -864,6 +1016,11 @@ function ReportPage({ selected, token, onUnauthorized }) {
   const lastEvent = events[events.length - 1]?.occurred_at || selected.timestamp;
   const durationSeconds = getAttemptDurationSeconds(selected);
   const eventCount = getEventCount(selected) ?? (events.length ? events.length : null);
+  const activeCase = caseDetail || selectedCase;
+  const caseStatus = activeCase?.status || "NEW";
+  const assignedReviewer = activeCase?.assigned_reviewer_name || activeCase?.assigned_reviewer_email || "Unassigned";
+  const actionHistory = Array.isArray(activeCase?.actions) ? activeCase.actions : [];
+  const riskTimeline = [...riskHistory].reverse();
 
   return (
     <>
@@ -917,6 +1074,8 @@ function ReportPage({ selected, token, onUnauthorized }) {
         <div className="report-meta-grid">
           <MiniStat label="Assessment" value={assessmentName} />
           <MiniStat label="Attempt ID" value={selected.attempt_id} />
+          <MiniStat label="Case Status" value={caseStatus} />
+          <MiniStat label="Assigned To" value={assignedReviewer} />
           <MiniStat label="Started" value={formatDateTime(firstEvent)} />
           <MiniStat label="Last Activity" value={formatDateTime(lastEvent)} />
           <MiniStat label="Duration" value={formatDuration(durationSeconds)} />
@@ -926,7 +1085,7 @@ function ReportPage({ selected, token, onUnauthorized }) {
         </div>
 
         <div className="section-heading">
-          <h3>Evidence Breakdown</h3>
+          <h3>Evidence & Violations</h3>
           <span>{evidence.length} evidence item{evidence.length === 1 ? "" : "s"}</span>
         </div>
 
@@ -934,12 +1093,111 @@ function ReportPage({ selected, token, onUnauthorized }) {
           {evidence.map((item, index) => <EvidenceCard item={item} key={`${item.title}-${index}`} />)}
         </div>
 
+        <ViolationTable events={violations} />
+
         <div className="section-heading">
-          <h3>Violation List</h3>
-          <span>{reportLoading ? "Loading..." : `${violations.length} event${violations.length === 1 ? "" : "s"}`}</span>
+          <h3>Case Workflow</h3>
+          <span>{activeCase ? `Case #${activeCase.id}` : "Loading case..."}</span>
         </div>
 
-        <ViolationTable events={violations} />
+        <section className="workflow-panel">
+          <div className="workflow-header">
+            <div>
+              <span className="workflow-label">Current state</span>
+              <strong className={caseStatusClass(caseStatus)}>{caseStatus}</strong>
+            </div>
+            <div>
+              <span className="workflow-label">Assignment</span>
+              <strong>{assignedReviewer}</strong>
+            </div>
+            <div>
+              <span className="workflow-label">Action log</span>
+              <strong>{activeCase?.action_count ?? 0}</strong>
+            </div>
+          </div>
+
+          {caseAccessError && <div className="workflow-message workflow-message-warning">{caseAccessError}</div>}
+
+          <div className="workflow-note-row">
+            <label htmlFor="reviewer-note">Reviewer note</label>
+            <textarea
+              id="reviewer-note"
+              value={workflowNote}
+              onChange={(e) => setWorkflowNote(e.target.value)}
+              placeholder="Add a concise audit note for this case..."
+              rows={4}
+              disabled={!activeCase || workflowBusy}
+            />
+          </div>
+
+          <div className="workflow-actions">
+            <button disabled={!activeCase || workflowBusy} onClick={() => void runCaseAction("assign", {})}>Assign to me</button>
+            <button disabled={!activeCase || workflowBusy || !workflowNote.trim()} onClick={() => void runCaseAction("notes", { comment: workflowNote })}>Add note</button>
+            <button disabled={!activeCase || workflowBusy} onClick={() => void runCaseAction("transition", { new_status: "ESCALATED", comment: "Escalated from investigation console" })}>Escalate</button>
+            <button disabled={!activeCase || workflowBusy} onClick={() => void runCaseAction("transition", { new_status: "CLEARED", comment: "Marked cleared from investigation console" })}>Clear</button>
+            <button disabled={!activeCase || workflowBusy} onClick={() => void runCaseAction("transition", { new_status: "CONFIRMED_RISK", comment: "Confirmed risk from investigation console" })}>Confirm risk</button>
+            <button disabled={!activeCase || workflowBusy} onClick={() => void runCaseAction("transition", { new_status: "FALSE_POSITIVE", comment: "Marked false positive from investigation console" })}>Mark false positive</button>
+          </div>
+
+          {workflowMessage && <div className="workflow-message">{workflowMessage}</div>}
+
+          <div className="workflow-history">
+            <div className="workflow-history-head">
+              <span className="workflow-label">Action history</span>
+              <strong>{actionHistory.length ? `${actionHistory.length} entries` : "No reviewer actions yet"}</strong>
+            </div>
+            {actionHistory.length === 0 ? (
+              <div className="timeline-empty">Reviewer actions will appear here as the case is worked.</div>
+            ) : (
+              <div className="workflow-history-list">
+                {actionHistory.map((action) => {
+                  const actor = action.reviewer_name || action.reviewer_email || `Reviewer ${action.reviewer_id}`;
+                  const transitionLabel = action.new_status
+                    ? `${action.previous_status || "NONE"} → ${action.new_status}`
+                    : action.previous_status || action.action_type;
+                  return (
+                    <div className="workflow-history-item" key={action.id}>
+                      <div>
+                        <strong>{action.action_type}</strong>
+                        <small>{actor}</small>
+                      </div>
+                      <div>
+                        <strong>{transitionLabel}</strong>
+                        <small>{formatDateTime(action.created_at)}</small>
+                      </div>
+                      <p>{action.comment || "No reviewer comment provided."}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+
+        <div className="section-heading">
+          <h3>Risk History</h3>
+          <span>{reportLoading ? "Loading..." : `${riskTimeline.length} update${riskTimeline.length === 1 ? "" : "s"}`}</span>
+        </div>
+
+        {riskTimeline.length === 0 ? (
+          <div className="timeline-empty">No risk history points are available for this attempt yet.</div>
+        ) : (
+          <div className="risk-history-list">
+            {riskTimeline.map((item) => (
+              <div className="risk-history-item" key={item.id}>
+                <div className="risk-history-top">
+                  <strong className={riskClass(item.risk)}>{item.risk}</strong>
+                  <small>{formatDateTime(item.timestamp)}</small>
+                </div>
+                <div className="risk-history-metrics">
+                  <span>Score {formatNumber(item.combined_score)}</span>
+                  <span>Confidence {formatNumber(item.confidence)}</span>
+                </div>
+                <p>{item.reason || "No scoring explanation available."}</p>
+              </div>
+            ))}
+          </div>
+        )}
 
         <details className="advanced-details">
           <summary>Advanced Technical Details</summary>

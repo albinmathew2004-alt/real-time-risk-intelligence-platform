@@ -60,6 +60,8 @@ RiskTelemetry.init({
 })
 ```
 
+The SDK endpoint is configurable through `baseUrl`. For a multi-device demo, this should be your public backend tunnel URL rather than `localhost`.
+
 ## SDK API
 
 ```js
@@ -131,6 +133,12 @@ npm run dev
 
 Open `sdk/example-assessment.html` directly in your browser.
 
+You can also prefill the backend endpoint with a query string:
+
+```text
+sdk/example-assessment.html?baseUrl=https://your-backend-tunnel.example
+```
+
 Then:
 1. Click **Init SDK**
 2. Click **Start Exam**
@@ -147,6 +155,7 @@ Tip: The SDK uses `devMode: true` in the example page so you can watch console l
 ## Troubleshooting
 
 - If your browser blocks requests due to CORS, ensure you are using an origin allowed by the backend CORS list.
+- For tunneled demos, add the public frontend / SDK origin to backend `CORS_ALLOW_ORIGINS`.
   - For local testing, opening the HTML file as `file://` may not be treated as `http://localhost:5173`.
   - Easiest: serve `sdk/` via a simple static server or open the file in a browser that allows local requests.
 

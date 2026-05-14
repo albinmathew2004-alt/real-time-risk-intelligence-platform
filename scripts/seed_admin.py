@@ -34,7 +34,7 @@ def main() -> None:
     try:
         existing = db.query(User).filter(User.email == email).first()
         if existing:
-            print(f"✅ Admin already exists: {existing.email} (role={existing.role}, active={existing.is_active})")
+            print(f"[OK] Admin already exists: {existing.email} (role={existing.role}, active={existing.is_active})")
             return
 
         user = User(
@@ -48,7 +48,7 @@ def main() -> None:
         db.commit()
         db.refresh(user)
 
-        print(f"✅ Created admin user: {user.email} (id={user.id})")
+        print(f"[OK] Created admin user: {user.email} (id={user.id})")
     finally:
         db.close()
 

@@ -62,6 +62,7 @@
 
         <label>Base URL (FastAPI)</label>
         <input id="baseUrl" value="http://localhost:8000" />
+        <p class="muted">For multi-device demos, point this to your public backend tunnel URL.</p>
 
         <label>Attempt ID</label>
         <input id="attemptId" value="attempt_demo_001" />
@@ -141,14 +142,31 @@
         'use strict';
 
         var sdkReady = false;
+        var params = new URLSearchParams(window.location.search);
+        var savedBaseUrl = null;
+
+        try {
+          savedBaseUrl = window.localStorage.getItem('riskTelemetryDemoBaseUrl');
+        } catch (e) {
+          savedBaseUrl = null;
+        }
+
+        var initialBaseUrl = params.get('baseUrl') || savedBaseUrl || 'http://localhost:8000';
+        document.getElementById('baseUrl').value = initialBaseUrl;
 
         function setStatus(msg) {
           document.getElementById('status').textContent = 'SDK status: ' + msg;
         }
 
         function getInitOptions() {
+          var baseUrl = document.getElementById('baseUrl').value;
+          try {
+            window.localStorage.setItem('riskTelemetryDemoBaseUrl', baseUrl);
+          } catch (e) {
+            // ignore
+          }
           return {
-            baseUrl: document.getElementById('baseUrl').value,
+            baseUrl: baseUrl,
             attemptId: document.getElementById('attemptId').value,
             candidateId: document.getElementById('candidateId').value,
             candidateName: document.getElementById('candidateName').value,

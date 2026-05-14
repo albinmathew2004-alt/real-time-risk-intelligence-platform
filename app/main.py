@@ -8,7 +8,7 @@ import os
 import traceback
 
 from engine.core.scorer import run_scoring
-from engine.db.database import Base, engine, SessionLocal
+from engine.db.database import Base, engine, SessionLocal, ensure_demo_schema
 from engine.db.models import RawExamEvent, RiskHistory
 
 from engine.cache.redis_client import (
@@ -23,9 +23,30 @@ from app.websocket_manager import manager
 # Auth (Phase 1)
 from app.auth.routes import router as auth_router
 from app.auth.dependencies import require_reviewer
+from app.cases.routes import router as cases_router
 from app.models.user import User  # noqa: F401 (ensures users table is registered on startup)
 
 from fastapi import Depends
+
+
+def _allowed_origins() -> list[str]:
+    defaults = [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+    ]
+    configured = os.getenv("CORS_ALLOW_ORIGINS", "")
+    extra = [origin.strip() for origin in configured.split(",") if origin.strip()]
+    seen = set()
+    merged = []
+    for origin in defaults + extra:
+        if origin not in seen:
+            seen.add(origin)
+            merged.append(origin)
+    return merged
 
 
 app = FastAPI(
@@ -34,18 +55,12 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+app.include_router(cases_router)
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://localhost:5500",
-        "http://127.0.0.1:5500",
-    ],
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,9 +71,10 @@ app.add_middleware(
 def startup_event():
     try:
         Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created/verified")
+        ensure_demo_schema()
+        print("[OK] Database tables created/verified")
     except Exception as e:
-        print("⚠️ Database initialization failed:", e)
+        print("[WARN] Database initialization failed:", e)
 
 
 class EventBatch(BaseModel):

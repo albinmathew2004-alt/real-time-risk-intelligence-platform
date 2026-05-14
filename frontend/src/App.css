@@ -863,6 +863,199 @@ button {
   margin-bottom: 26px;
 }
 
+.workflow-panel {
+  margin-bottom: 26px;
+  padding: 18px;
+  border-radius: 22px;
+  border: 1px solid var(--border);
+  background: rgba(17, 24, 39, 0.72);
+}
+
+.workflow-header {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.workflow-header > div {
+  padding: 14px;
+  border-radius: 18px;
+  background: rgba(2, 6, 23, 0.34);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+
+.workflow-label {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 900;
+  margin-bottom: 8px;
+}
+
+.workflow-header strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  word-break: break-word;
+}
+
+.workflow-note-row {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.workflow-note-row label {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 900;
+}
+
+.workflow-note-row textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 110px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.34);
+  color: var(--text);
+  outline: none;
+}
+
+.workflow-note-row textarea:disabled {
+  opacity: 0.7;
+}
+
+.workflow-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.workflow-actions button {
+  padding: 11px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.78);
+  color: var(--text);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.workflow-actions button:hover:not(:disabled) {
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(30, 41, 59, 0.86);
+}
+
+.workflow-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.workflow-message {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(56, 189, 248, 0.22);
+  background: rgba(56, 189, 248, 0.1);
+  color: #dbeafe;
+  font-weight: 700;
+}
+
+.workflow-message-warning {
+  border-color: rgba(245, 158, 11, 0.28);
+  background: rgba(245, 158, 11, 0.1);
+  color: #fde68a;
+}
+
+.workflow-history {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.workflow-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.workflow-history-list {
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-history-item {
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.34);
+}
+
+.workflow-history-item > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workflow-history-item small {
+  color: var(--muted);
+}
+
+.workflow-history-item p {
+  margin: 10px 0 0;
+  color: var(--text);
+}
+
+.risk-history-list {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.risk-history-item {
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(17, 24, 39, 0.72);
+}
+
+.risk-history-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.risk-history-top small {
+  color: var(--muted);
+}
+
+.risk-history-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
+  color: #cbd5e1;
+  font-weight: 700;
+}
+
+.risk-history-item p {
+  margin: 10px 0 0;
+  color: var(--text);
+}
+
 .mini-stat {
   padding: 16px;
   border-radius: 18px;
@@ -936,7 +1129,7 @@ button {
 .violation-table {
   display: grid;
   gap: 10px;
-  margin-bottom: 18px;
+  margin-bottom: 26px;
 }
 
 .violation-header {
@@ -1066,6 +1259,9 @@ button {
   .attempt-meta { white-space: normal; }
   .violation-header { display: none; }
   .violation-row { grid-template-columns: 1fr; }
+  .workflow-history-head,
+  .workflow-history-item > div,
+  .risk-history-top { display: grid; }
 }
 
 @media (max-width: 850px) {

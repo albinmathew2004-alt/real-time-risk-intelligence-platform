@@ -37,6 +37,33 @@ CANDIDATES = [
     ("Sneha Kapoor", "sneha@example.com"),
 ]
 
+DEMO_PROFILES = [
+    {
+        "attempt_id": "demo_normal_1001",
+        "candidate_name": "Nina Verma",
+        "candidate_email": "nina.verma@example.com",
+        "profile": "NormalThoughtfulCandidate",
+    },
+    {
+        "attempt_id": "demo_borderline_1002",
+        "candidate_name": "Rahul Mehta",
+        "candidate_email": "rahul.mehta@example.com",
+        "profile": "BorderlineCandidate",
+    },
+    {
+        "attempt_id": "demo_cheater_1003",
+        "candidate_name": "Kavya Sen",
+        "candidate_email": "kavya.sen@example.com",
+        "profile": "AggressiveCheater",
+    },
+    {
+        "attempt_id": "demo_template_1004",
+        "candidate_name": "Ishaan Roy",
+        "candidate_email": "ishaan.roy@example.com",
+        "profile": "TemplateCopier",
+    },
+]
+
 
 def now_iso(offset_seconds=0.0):
     return (datetime.now(timezone.utc) + timedelta(seconds=float(offset_seconds))).isoformat()
@@ -60,7 +87,7 @@ def send_event(event, *, base_url: str):
         try:
             data = response.json()
             print(
-                f"  → Risk: {data.get('current_risk')} | "
+                f"  -> Risk: {data.get('current_risk')} | "
                 f"Score: {data.get('current_score')}"
             )
         except Exception:
@@ -235,6 +262,11 @@ def main() -> int:
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print events instead of sending")
+    parser.add_argument(
+        "--demo-pack",
+        action="store_true",
+        help="Send a predictable four-candidate enterprise demo pack with the required profiles",
+    )
     parser.add_argument("--max-events", type=int, default=None, help="Limit printed/sent events")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--sleep-min", type=float, default=1.0, help="Min sleep between events")
@@ -251,6 +283,25 @@ def main() -> int:
 
     print("Available profiles:")
     print("  - " + "\n  - ".join(p.name for p in all_profiles()))
+
+    if args.demo_pack:
+        print("\nRunning predictable enterprise demo pack:")
+        for index, candidate in enumerate(DEMO_PROFILES, start=1):
+            if base_seed is not None:
+                random.seed(base_seed + index)
+            simulate_candidate(
+                attempt_id=candidate["attempt_id"],
+                candidate_name=candidate["candidate_name"],
+                candidate_email=candidate["candidate_email"],
+                candidate_type=candidate["profile"],
+                base_url=str(args.base_url),
+                dry_run=bool(args.dry_run),
+                max_events=args.max_events,
+                sleep_min_s=float(args.sleep_min),
+                sleep_max_s=float(args.sleep_max),
+                seed=args.seed,
+            )
+        return 0
 
     n_candidates = max(1, min(int(args.n_candidates), len(CANDIDATES)))
 
