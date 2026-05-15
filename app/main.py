@@ -9,7 +9,7 @@ import traceback
 
 from engine.core.scorer import run_scoring
 from engine.db.database import Base, engine, SessionLocal, ensure_demo_schema
-from engine.db.models import RawExamEvent, RiskHistory
+from engine.db.models import AttemptLog, RawExamEvent, RiskHistory
 
 from engine.cache.redis_client import (
     append_event,
@@ -25,6 +25,13 @@ from app.auth.routes import router as auth_router
 from app.auth.dependencies import require_reviewer
 from app.cases.routes import router as cases_router
 from app.models.user import User  # noqa: F401 (ensures users table is registered on startup)
+from app.services.evidence_service import (
+    build_violation_overview_counts,
+    normalize_evidence,
+    normalize_risk_level,
+    safe_float,
+)
+from app.services.report_summary_service import build_report_summary
 
 from fastapi import Depends
 
@@ -126,6 +133,112 @@ def db_events_to_scoring_events(events: List[RawExamEvent]) -> List[Dict[str, An
         }
         for e in events
     ]
+
+
+def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
+    events = (
+        db.query(RawExamEvent)
+        .filter(RawExamEvent.attempt_id == attempt_id)
+        .order_by(RawExamEvent.occurred_at.asc())
+        .all()
+    )
+    history = (
+        db.query(RiskHistory)
+        .filter(RiskHistory.attempt_id == attempt_id)
+        .order_by(RiskHistory.timestamp.asc())
+        .all()
+    )
+    latest_attempt_log = (
+        db.query(AttemptLog)
+        .filter(AttemptLog.attempt_id == attempt_id)
+        .order_by(AttemptLog.id.desc())
+        .first()
+    )
+    current_risk = get_current_risk(attempt_id) or {}
+
+    if not events and not history and not latest_attempt_log and not current_risk:
+        return {}
+
+    scoring_events = db_events_to_scoring_events(events)
+    runtime_risk = current_risk
+    if not runtime_risk and scoring_events:
+        scoring_result = run_scoring(scoring_events, attempt_id)
+        runtime_risk = {
+            "attempt_id": attempt_id,
+            "risk": scoring_result.get("risk"),
+            "confidence": scoring_result.get("confidence"),
+            "combined_score": scoring_result.get("combined_score"),
+            "explanation": scoring_result.get("explanation"),
+            "event_count": len(scoring_events),
+        }
+
+    latest_history = history[-1] if history else None
+    features = getattr(latest_attempt_log, "features", None) or {}
+    risk_score = (
+        current_risk.get("combined_score")
+        if current_risk.get("combined_score") is not None
+        else getattr(latest_history, "combined_score", None)
+        if latest_history is not None
+        else getattr(latest_attempt_log, "combined_score", None)
+    )
+    confidence = (
+        current_risk.get("confidence")
+        if current_risk.get("confidence") is not None
+        else getattr(latest_history, "confidence", None)
+        if latest_history is not None
+        else getattr(latest_attempt_log, "confidence", None)
+    )
+    risk_score = safe_float(risk_score, 0.0)
+    confidence = safe_float(confidence, 0.0)
+    risk_level = normalize_risk_level(risk_score)
+
+    event_payloads = [
+        {
+            "event_type": event.event_type,
+            "payload": event.payload or {},
+            "occurred_at": event.occurred_at,
+        }
+        for event in events
+    ]
+    evidence_items = normalize_evidence(
+        events=event_payloads,
+        features=features,
+        risk_score=risk_score,
+        risk_level=risk_level,
+    )
+    summary = build_report_summary(
+        risk_score=risk_score,
+        confidence=confidence,
+        evidence_items=evidence_items,
+    )
+    overview_counts = build_violation_overview_counts(events=event_payloads, features=features)
+
+    metadata_source = current_risk if current_risk else {}
+    latest_event = events[-1] if events else None
+    first_event = events[0] if events else None
+
+    return {
+        **summary,
+        "attempt_id": attempt_id,
+        "event_count": len(events),
+        "evidence_items": evidence_items,
+        "violation_overview_counts": overview_counts,
+        "candidate_name": metadata_source.get("candidate_name")
+        or getattr(latest_history, "candidate_name", None)
+        or getattr(latest_event, "candidate_name", None),
+        "candidate_email": metadata_source.get("candidate_email")
+        or getattr(latest_history, "candidate_email", None)
+        or getattr(latest_event, "candidate_email", None),
+        "assessment_name": metadata_source.get("assessment_name")
+        or getattr(latest_history, "assessment_name", None)
+        or getattr(latest_event, "assessment_name", None),
+        "latest_event_at": metadata_source.get("updated_at")
+        or getattr(latest_history, "timestamp", None)
+        or getattr(latest_event, "occurred_at", None),
+        "started_at": getattr(first_event, "occurred_at", None),
+        "raw_explanation": metadata_source.get("explanation")
+        or getattr(latest_history, "reason", None),
+    }
 
 
 @app.get("/")
@@ -401,6 +514,34 @@ def get_risk_history(attempt_id: str, _user=Depends(require_reviewer)):
             "data": [],
         }
 
+    finally:
+        db.close()
+
+
+@app.get("/v1/reports/{attempt_id}")
+def get_attempt_report(attempt_id: str, _user=Depends(require_reviewer)):
+    db = SessionLocal()
+    try:
+        report = _build_attempt_report(db, attempt_id)
+        if not report:
+            return {
+                "status": "not_found",
+                "attempt_id": attempt_id,
+                "data": None,
+            }
+        return {
+            "status": "success",
+            "attempt_id": attempt_id,
+            "data": report,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "attempt_id": attempt_id,
+            "message": str(e),
+            "data": None,
+        }
     finally:
         db.close()
 
