@@ -3,13 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
+from pathlib import Path
 import json
 import os
 import traceback
 
 from engine.core.scorer import run_scoring
 from engine.db.database import Base, engine, SessionLocal, ensure_demo_schema
-from engine.db.models import AttemptLog, RawExamEvent, RiskHistory
+from engine.db.models import AttemptLog, InvestigationCase, RawExamEvent, RiskHistory
 
 from engine.cache.redis_client import (
     append_event,
@@ -24,6 +25,7 @@ from app.websocket_manager import manager
 from app.auth.routes import router as auth_router
 from app.auth.dependencies import require_reviewer
 from app.cases.routes import router as cases_router
+from app.cases.routes import _sync_cases_from_attempts
 from app.models.user import User  # noqa: F401 (ensures users table is registered on startup)
 from app.services.evidence_service import (
     build_violation_overview_counts,
@@ -37,6 +39,7 @@ from fastapi import Depends
 
 RISK_HISTORY_SCORE_EPSILON = 0.01
 RISK_HISTORY_CONFIDENCE_EPSILON = 0.05
+ATTEMPT_LOG_FILE = Path("logs/attempt_logs.jsonl")
 
 
 def _allowed_origins() -> list[str]:
@@ -109,6 +112,17 @@ class ExamEventIngest(BaseModel):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def build_reason(result: Dict[str, Any]) -> str:
@@ -202,6 +216,259 @@ def _record_risk_snapshot_if_needed(
     )
     db.add(entry)
     return entry
+
+
+def _load_attempt_logs() -> List[Dict[str, Any]]:
+    if not ATTEMPT_LOG_FILE.exists():
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        with ATTEMPT_LOG_FILE.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return rows
+
+
+def _dedupe_latest_attempt_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest_by_attempt: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        attempt_id = row.get("attempt_id")
+        if not attempt_id:
+            continue
+        previous = latest_by_attempt.get(attempt_id)
+        if previous is None:
+            latest_by_attempt[attempt_id] = row
+            continue
+        prev_ts = parse_timestamp(previous.get("timestamp"))
+        row_ts = parse_timestamp(row.get("timestamp"))
+        if prev_ts is None or (row_ts is not None and row_ts >= prev_ts):
+            latest_by_attempt[attempt_id] = row
+    return sorted(
+        latest_by_attempt.values(),
+        key=lambda row: parse_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+
+def _risk_rank(value: str) -> int:
+    if value == "HIGH":
+        return 0
+    if value == "MEDIUM":
+        return 1
+    return 2
+
+
+def _case_status_rank(value: str) -> int:
+    if value == "ESCALATED":
+        return 0
+    if value == "CONFIRMED_RISK":
+        return 1
+    if value == "UNDER_INVESTIGATION":
+        return 2
+    if value == "TRIAGED":
+        return 3
+    if value == "NEW":
+        return 4
+    if value in {"CLEARED", "FALSE_POSITIVE"}:
+        return 5
+    if value == "CLOSED":
+        return 6
+    return 7
+
+
+def _queue_status(case_record: Optional[InvestigationCase]) -> str:
+    status = getattr(case_record, "status", None) or "NEW"
+    if status in {"CLEARED", "FALSE_POSITIVE"}:
+        return "RESOLVED"
+    return status
+
+
+def _resolved_case_status(status: str) -> bool:
+    return status in {"RESOLVED", "CLEARED", "FALSE_POSITIVE", "CLOSED"}
+
+
+def _latest_event_metadata(db) -> Dict[str, RawExamEvent]:
+    rows = (
+        db.query(RawExamEvent)
+        .order_by(RawExamEvent.received_at.desc(), RawExamEvent.id.desc())
+        .all()
+    )
+    by_attempt: Dict[str, RawExamEvent] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in by_attempt:
+            by_attempt[row.attempt_id] = row
+    return by_attempt
+
+
+def _build_dashboard_summary(db) -> Dict[str, Any]:
+    _sync_cases_from_attempts(db)
+    logs = _load_attempt_logs()
+    latest_attempts = _dedupe_latest_attempt_rows(logs)
+    latest_event_by_attempt = _latest_event_metadata(db)
+    cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
+    case_by_attempt = {case.attempt_id: case for case in cases if case.attempt_id}
+
+    total_attempts = len(latest_attempts)
+    active_sessions = sum(
+        1
+        for row in latest_attempts
+        if not bool((row.get("features") or {}).get("has_submit_event"))
+    )
+    high_risk_count = sum(1 for row in latest_attempts if normalize_risk_level(row.get("combined_score")) == "HIGH")
+    medium_risk_count = sum(1 for row in latest_attempts if normalize_risk_level(row.get("combined_score")) == "MEDIUM")
+    low_risk_count = sum(1 for row in latest_attempts if normalize_risk_level(row.get("combined_score")) == "LOW")
+    unresolved_cases = [
+        case for case in cases
+        if getattr(case, "status", None) not in {"CLEARED", "FALSE_POSITIVE", "CLOSED"}
+    ]
+    needs_review_count = len(unresolved_cases)
+    escalated_count = sum(1 for case in cases if getattr(case, "status", None) == "ESCALATED")
+    avg_confidence = round(
+        sum(safe_float(row.get("confidence"), 0.0) for row in latest_attempts) / max(1, total_attempts),
+        4,
+    )
+
+    latest_log_time = max(
+        (parse_timestamp(row.get("timestamp")) for row in logs if row.get("timestamp")),
+        default=None,
+    )
+    if latest_log_time is not None:
+        window_start = latest_log_time.timestamp() - 300
+        live_event_rate = max(
+            0,
+            round(
+                sum(
+                    1
+                    for row in logs
+                    if (parse_timestamp(row.get("timestamp")) or latest_log_time).timestamp() >= window_start
+                ) / 5
+            ),
+        )
+    else:
+        live_event_rate = 0
+
+    recent_risk_feed = []
+    for row in latest_attempts[:5]:
+        event_meta = latest_event_by_attempt.get(row.get("attempt_id"))
+        risk_level = normalize_risk_level(row.get("combined_score"))
+        recent_risk_feed.append({
+            "attempt_id": row.get("attempt_id"),
+            "candidate_name": row.get("candidate_name") or getattr(event_meta, "candidate_name", None),
+            "candidate_email": row.get("candidate_email") or getattr(event_meta, "candidate_email", None),
+            "timestamp": row.get("timestamp") or getattr(event_meta, "received_at", None) or getattr(event_meta, "occurred_at", None),
+            "risk_level": risk_level,
+            "risk": risk_level,
+            "score": round(safe_float(row.get("combined_score"), 0.0), 4),
+            "confidence": round(safe_float(row.get("confidence"), 0.0), 4),
+            "attempt_summary": build_reason({
+                "risk": risk_level,
+                "explanation": row.get("explanation"),
+            }),
+            "latest_event_type": getattr(event_meta, "event_type", None),
+        })
+
+    cases_needing_review: List[Dict[str, Any]] = []
+    candidate_rows = []
+    for row in latest_attempts:
+        attempt_id = row.get("attempt_id")
+        if not attempt_id:
+            continue
+        case_record = case_by_attempt.get(attempt_id)
+        queue_status = _queue_status(case_record)
+        if _resolved_case_status(queue_status):
+            continue
+        event_meta = latest_event_by_attempt.get(attempt_id)
+        candidate_rows.append({
+            "attempt_id": attempt_id,
+            "candidate_name": row.get("candidate_name") or getattr(event_meta, "candidate_name", None),
+            "candidate_email": row.get("candidate_email") or getattr(event_meta, "candidate_email", None),
+            "assessment_name": row.get("assessment_name") or getattr(event_meta, "assessment_name", None),
+            "risk_level": normalize_risk_level(row.get("combined_score")),
+            "risk": normalize_risk_level(row.get("combined_score")),
+            "score": round(safe_float(row.get("combined_score"), 0.0), 4),
+            "status": queue_status,
+            "assigned_to": f"Reviewer #{case_record.assigned_reviewer_id}" if getattr(case_record, "assigned_reviewer_id", None) else "Unassigned",
+            "last_activity": row.get("timestamp") or getattr(event_meta, "received_at", None) or getattr(case_record, "latest_event_at", None),
+        })
+    candidate_rows.sort(
+        key=lambda item: (
+            _case_status_rank(item["status"]),
+            _risk_rank(item["risk_level"]),
+            -item["score"],
+            -(parse_timestamp(item["last_activity"]).timestamp() if parse_timestamp(item["last_activity"]) else 0),
+        )
+    )
+    for index, item in enumerate(candidate_rows[:5], start=1):
+        cases_needing_review.append({"priority": index, **item})
+
+    risk_distribution = {
+        "total_attempts": total_attempts,
+        "high_risk_count": high_risk_count,
+        "medium_risk_count": medium_risk_count,
+        "low_risk_count": low_risk_count,
+    }
+
+    recent_evidence_signals = {
+        "clipboard_copy_paste": sum(int(safe_float((row.get("features") or {}).get("paste_count"), 0.0)) for row in latest_attempts),
+        "tab_switch_events": sum(int(safe_float((row.get("features") or {}).get("tab_hidden_count"), 0.0)) for row in latest_attempts),
+        "idle_time_spikes": sum(int(safe_float((row.get("features") or {}).get("idle_spike_count"), 0.0)) for row in latest_attempts),
+        "rapid_answer_bursts": sum(1 for row in latest_attempts if safe_float((row.get("features") or {}).get("time_per_question_mean_s"), 0.0) > 0 and safe_float((row.get("features") or {}).get("time_per_question_mean_s"), 0.0) <= 15),
+        "focus_blur_events": sum(int(safe_float((row.get("features") or {}).get("tab_hidden_count"), 0.0)) for row in latest_attempts),
+    }
+
+    system_health_basic = {
+        "backend_api": "Healthy",
+        "websocket_stream": "Connected" if latest_log_time is not None else "Disconnected",
+        "event_stream": "Receiving" if live_event_rate > 0 else "Idle",
+        "authentication": "Active",
+        "database": "Healthy",
+        "last_updated": latest_log_time.isoformat() if latest_log_time else None,
+    }
+
+    return {
+        "active_sessions": active_sessions,
+        "total_attempts": total_attempts,
+        "high_risk_count": high_risk_count,
+        "medium_risk_count": medium_risk_count,
+        "low_risk_count": low_risk_count,
+        "needs_review_count": needs_review_count,
+        "escalated_count": escalated_count,
+        "avg_confidence": avg_confidence,
+        "live_event_rate": live_event_rate,
+        "recent_risk_feed": recent_risk_feed,
+        "cases_needing_review": cases_needing_review,
+        "risk_distribution": risk_distribution,
+        "recent_evidence_signals": recent_evidence_signals,
+        "system_health_basic": system_health_basic,
+    }
+
+
+@app.get("/v1/dashboard/summary")
+def get_dashboard_summary(_user=Depends(require_reviewer)):
+    db = SessionLocal()
+    try:
+        data = _build_dashboard_summary(db)
+        return {
+            "status": "success",
+            "data": data,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "message": str(e),
+            "data": None,
+        }
+    finally:
+        db.close()
 
 
 def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:

@@ -63,6 +63,7 @@ const WS_URL = toWsUrl(API_BASE_URL, "/ws/risk");
 const EVENTS_URL = `${API_BASE_URL}/v1/events`;
 const RISK_HISTORY_URL = `${API_BASE_URL}/v1/risk-history`;
 const REPORTS_URL = `${API_BASE_URL}/v1/reports`;
+const DASHBOARD_SUMMARY_URL = `${API_BASE_URL}/v1/dashboard/summary`;
 const CASES_URL = `${API_BASE_URL}/v1/cases`;
 const AUTH_URL = `${API_BASE_URL}/v1/auth`;
 
@@ -940,6 +941,7 @@ export default function App() {
   const [page, setPage] = useState("dashboard");
   const [logs, setLogs] = useState([]);
   const [cases, setCases] = useState([]);
+  const [dashboardSummary, setDashboardSummary] = useState(null);
   const [caseAccessError, setCaseAccessError] = useState("");
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1002,6 +1004,24 @@ export default function App() {
       setCases(Array.isArray(result.data?.data) ? result.data.data : []);
     } catch (err) {
       console.error("Failed to fetch cases:", err);
+    }
+  }, [logout, token]);
+
+  const fetchDashboardSummary = useCallback(async () => {
+    try {
+      const result = await authJsonFetch(DASHBOARD_SUMMARY_URL, { token });
+      if (!result.ok) {
+        if (result.status === 401) {
+          logout();
+          return;
+        }
+        setDashboardSummary(null);
+        return;
+      }
+      setDashboardSummary(result.data?.data || null);
+    } catch (err) {
+      console.error("Failed to fetch dashboard summary:", err);
+      setDashboardSummary(null);
     }
   }, [logout, token]);
 
@@ -1084,6 +1104,7 @@ export default function App() {
     const timeoutId = window.setTimeout(() => {
       if (token) void fetchLogs();
       if (token) void fetchCases();
+      if (token) void fetchDashboardSummary();
     }, 0);
     const ws = new WebSocket(WS_URL);
 
@@ -1126,6 +1147,7 @@ export default function App() {
 
         setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
         void fetchCases();
+        void fetchDashboardSummary();
       } catch (err) {
         console.error("WS parse error:", err);
       }
@@ -1135,7 +1157,7 @@ export default function App() {
       window.clearTimeout(timeoutId);
       ws.close();
     };
-  }, [fetchCases, fetchLogs, token]);
+  }, [fetchCases, fetchDashboardSummary, fetchLogs, token]);
 
   const caseByAttemptId = useMemo(() => {
     return Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
@@ -1269,6 +1291,7 @@ export default function App() {
             logs={logs}
             cases={cases}
             stats={stats}
+            dashboardSummary={dashboardSummary}
             currentUser={currentUser}
             setSelected={setSelected}
             setPage={setPage}
@@ -1313,32 +1336,56 @@ export default function App() {
   );
 }
 
-function DashboardPage({ logs, cases, stats, currentUser, setSelected, setPage, loading, wsConnected }) {
+function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setSelected, setPage, loading, wsConnected }) {
   const sortedLogs = [...logs].sort((a, b) => compareIso(b?.timestamp, a?.timestamp));
   const caseByAttemptId = Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
   const reviewRows = buildReviewQueueItems(logs, caseByAttemptId);
-  const feedRows = sortedLogs.slice(0, 5);
-  const reviewCases = reviewRows.filter((row) => !isQueueResolvedStatus(row.queueStatus)).slice(0, 5);
+  const fallbackFeedRows = sortedLogs.slice(0, 5);
+  const fallbackReviewCases = reviewRows.filter((row) => !isQueueResolvedStatus(row.queueStatus)).slice(0, 5);
   const unresolvedCases = cases.filter((item) => !isResolvedCaseStatus(item.status) && item.status !== "CLOSED").length;
-  const signalSummary = buildAggregateSignals(logs);
-  const liveEventRate = getLiveEventRate(logs);
+  const fallbackSignalSummary = buildAggregateSignals(logs);
+  const fallbackLiveEventRate = getLiveEventRate(logs);
   const riskTotal = Math.max(1, stats.total);
-  const lastUpdated = sortedLogs[0]?.timestamp || null;
+  const fallbackLastUpdated = sortedLogs[0]?.timestamp || null;
+  const feedRows = Array.isArray(dashboardSummary?.recent_risk_feed) && dashboardSummary.recent_risk_feed.length
+    ? dashboardSummary.recent_risk_feed
+    : fallbackFeedRows;
+  const reviewCases = Array.isArray(dashboardSummary?.cases_needing_review) && dashboardSummary.cases_needing_review.length
+    ? dashboardSummary.cases_needing_review
+    : fallbackReviewCases;
+  const signalSummary = dashboardSummary?.recent_evidence_signals
+    ? {
+        clipboard: Number(dashboardSummary.recent_evidence_signals.clipboard_copy_paste || 0),
+        tabSwitches: Number(dashboardSummary.recent_evidence_signals.tab_switch_events || 0),
+        idleSpikes: Number(dashboardSummary.recent_evidence_signals.idle_time_spikes || 0),
+        rapidBursts: Number(dashboardSummary.recent_evidence_signals.rapid_answer_bursts || 0),
+        focusBlur: Number(dashboardSummary.recent_evidence_signals.focus_blur_events || 0),
+      }
+    : fallbackSignalSummary;
+  const liveEventRate = dashboardSummary?.live_event_rate ?? fallbackLiveEventRate;
+  const lastUpdated = dashboardSummary?.system_health_basic?.last_updated || fallbackLastUpdated;
+  const metricTotalAttempts = dashboardSummary?.total_attempts ?? stats.total;
+  const metricHighRisk = dashboardSummary?.high_risk_count ?? stats.high;
+  const metricMediumRisk = dashboardSummary?.medium_risk_count ?? stats.medium;
+  const metricLowRisk = dashboardSummary?.low_risk_count ?? stats.low;
+  const metricActiveSessions = dashboardSummary?.active_sessions ?? stats.ongoing;
+  const metricNeedsReview = dashboardSummary?.needs_review_count ?? unresolvedCases;
+  const metricAvgConfidence = dashboardSummary?.avg_confidence ?? stats.avgConfidence;
 
   const metrics = [
-    { title: "Active Sessions", value: stats.ongoing, subtitle: "Live exams in progress", tone: "blue", icon: <Users size={20} /> },
-    { title: "Total Attempts", value: stats.total, subtitle: "All time attempts", tone: "cyan", icon: <ClipboardList size={20} /> },
-    { title: "High Risk Now", value: stats.high, subtitle: "Requires attention", tone: "high", icon: <AlertTriangle size={20} /> },
-    { title: "Medium Risk", value: stats.medium, subtitle: "Monitoring", tone: "medium", icon: <ShieldAlert size={20} /> },
-    { title: "Needs Review", value: unresolvedCases, subtitle: "Unresolved cases", tone: "violet", icon: <ListChecks size={20} /> },
-    { title: "Avg Confidence", value: formatNumber(stats.avgConfidence, 2), subtitle: "Model certainty", tone: "purple", icon: <Gauge size={20} /> },
+    { title: "Active Sessions", value: metricActiveSessions, subtitle: "Live exams in progress", tone: "blue", icon: <Users size={20} /> },
+    { title: "Total Attempts", value: metricTotalAttempts, subtitle: "All time attempts", tone: "cyan", icon: <ClipboardList size={20} /> },
+    { title: "High Risk Now", value: metricHighRisk, subtitle: "Requires attention", tone: "high", icon: <AlertTriangle size={20} /> },
+    { title: "Medium Risk", value: metricMediumRisk, subtitle: "Monitoring", tone: "medium", icon: <ShieldAlert size={20} /> },
+    { title: "Needs Review", value: metricNeedsReview, subtitle: "Unresolved cases", tone: "violet", icon: <ListChecks size={20} /> },
+    { title: "Avg Confidence", value: formatNumber(metricAvgConfidence, 2), subtitle: "Model certainty", tone: "purple", icon: <Gauge size={20} /> },
     { title: "Live Event Rate", value: liveEventRate, subtitle: "Events / min", tone: "blue", icon: <Radio size={20} /> },
   ];
 
   const distributionSegments = [
-    { label: "High Risk", value: Number(((stats.high / riskTotal) * 100).toFixed(1)), color: "#ff5f67", count: stats.high },
-    { label: "Medium Risk", value: Number(((stats.medium / riskTotal) * 100).toFixed(1)), color: "#ffb703", count: stats.medium },
-    { label: "Low Risk", value: Number(((stats.low / riskTotal) * 100).toFixed(1)), color: "#65d46e", count: stats.low },
+    { label: "High Risk", value: Number((((dashboardSummary?.risk_distribution?.high_risk_count ?? metricHighRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#ff5f67", count: dashboardSummary?.risk_distribution?.high_risk_count ?? metricHighRisk },
+    { label: "Medium Risk", value: Number((((dashboardSummary?.risk_distribution?.medium_risk_count ?? metricMediumRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#ffb703", count: dashboardSummary?.risk_distribution?.medium_risk_count ?? metricMediumRisk },
+    { label: "Low Risk", value: Number((((dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#65d46e", count: dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk },
   ];
 
   return (
@@ -1380,12 +1427,12 @@ function DashboardPage({ logs, cases, stats, currentUser, setSelected, setPage, 
                   }}
                 >
                   <span className="activity-feed-time">{formatTime(item.timestamp)}</span>
-                  <span className="activity-feed-event">{eventIcon(item.latest_event?.event_type || item.risk)}</span>
+                  <span className="activity-feed-event">{eventIcon(item.latest_event?.event_type || item.latest_event_type || item.risk || item.risk_level)}</span>
                   <span className="activity-feed-copy">
                     <strong>{getCandidateName(item)} <small>({item.attempt_id})</small></strong>
-                    <p>{getLatestActivity(item)}</p>
+                    <p>{item.attempt_summary || getLatestActivity(item)}</p>
                   </span>
-                  <span className={riskClass(item.risk)}>{item.risk || "LOW"}</span>
+                  <span className={riskClass(item.risk || item.risk_level)}>{item.risk || item.risk_level || "LOW"}</span>
                   <ArrowRight size={16} />
                 </button>
               ))}
@@ -1410,20 +1457,20 @@ function DashboardPage({ logs, cases, stats, currentUser, setSelected, setPage, 
                 <span>Action</span>
               </div>
               {reviewCases.map((row, index) => (
-                <div className="review-priority-row" key={row.attemptId}>
-                  <span className={`priority-index tone-${riskTone(row.risk)}`}>{index + 1}</span>
+                <div className="review-priority-row" key={row.attemptId || row.attempt_id}>
+                  <span className={`priority-index tone-${riskTone(row.risk || row.risk_level)}`}>{row.priority || index + 1}</span>
                   <span className="review-priority-candidate">
-                    <strong>{row.candidateName}</strong>
-                    <small>{row.attemptId}</small>
+                    <strong>{row.candidateName || row.candidate_name || "Unknown Candidate"}</strong>
+                    <small>{row.attemptId || row.attempt_id}</small>
                   </span>
-                  <span className={riskClass(row.risk)}>{row.risk}</span>
-                  <span className={caseStatusClass(row.queueStatus)}>{row.queueStatus}</span>
+                  <span className={riskClass(row.risk || row.risk_level)}>{row.risk || row.risk_level}</span>
+                  <span className={caseStatusClass(row.queueStatus || row.status)}>{row.queueStatus || row.status}</span>
                   <span>{formatNumber(row.score)}</span>
-                  <span>{formatDateTime(row.lastActivity)}</span>
+                  <span>{formatDateTime(row.lastActivity || row.last_activity)}</span>
                   <button
                     className="action-link-button"
                     onClick={() => {
-                      setSelected(row.item);
+                      setSelected(row.item || logs.find((item) => item.attempt_id === (row.attemptId || row.attempt_id)) || null);
                       setPage("report");
                     }}
                     type="button"
@@ -1454,7 +1501,7 @@ function DashboardPage({ logs, cases, stats, currentUser, setSelected, setPage, 
               ))}
             </div>
           </div>
-          <div className="panel-caption">Total Attempts: {stats.total}</div>
+          <div className="panel-caption">Total Attempts: {dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts}</div>
         </div>
 
         <div className="enterprise-panel">
@@ -1471,11 +1518,11 @@ function DashboardPage({ logs, cases, stats, currentUser, setSelected, setPage, 
         <div className="enterprise-panel">
           <PanelHeader title="System Health" subtitle="Real-time system status" />
           <div className="system-health-list">
-            <SystemHealthRow icon={<Server size={16} />} label="Backend API" value={getHealthLabel(logs.length > 0, loading)} tone="success" />
-            <SystemHealthRow icon={<Wifi size={16} />} label="WebSocket Stream" value={wsConnected ? "Connected" : "Disconnected"} tone={wsConnected ? "success" : "danger"} />
-            <SystemHealthRow icon={<Radio size={16} />} label="Event Stream" value={logs.length ? "Receiving" : "Idle"} tone={logs.length ? "success" : "warning"} />
-            <SystemHealthRow icon={<ShieldCheck size={16} />} label="Authentication" value={currentUser ? "Active" : "Unknown"} tone="success" />
-            <SystemHealthRow icon={<Database size={16} />} label="Database" value={logs.length || cases.length ? "Healthy" : "Awaiting Data"} tone="success" />
+            <SystemHealthRow icon={<Server size={16} />} label="Backend API" value={dashboardSummary?.system_health_basic?.backend_api || getHealthLabel(logs.length > 0, loading)} tone="success" />
+            <SystemHealthRow icon={<Wifi size={16} />} label="WebSocket Stream" value={dashboardSummary?.system_health_basic?.websocket_stream || (wsConnected ? "Connected" : "Disconnected")} tone={(dashboardSummary?.system_health_basic?.websocket_stream || (wsConnected ? "Connected" : "Disconnected")) === "Disconnected" ? "danger" : "success"} />
+            <SystemHealthRow icon={<Radio size={16} />} label="Event Stream" value={dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")} tone={(dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")) === "Idle" ? "warning" : "success"} />
+            <SystemHealthRow icon={<ShieldCheck size={16} />} label="Authentication" value={dashboardSummary?.system_health_basic?.authentication || (currentUser ? "Active" : "Unknown")} tone="success" />
+            <SystemHealthRow icon={<Database size={16} />} label="Database" value={dashboardSummary?.system_health_basic?.database || (logs.length || cases.length ? "Healthy" : "Awaiting Data")} tone="success" />
           </div>
           <div className="panel-caption">Last Updated: {formatDateTime(lastUpdated)}</div>
         </div>
