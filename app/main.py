@@ -25,7 +25,7 @@ from app.websocket_manager import manager
 from app.auth.routes import router as auth_router
 from app.auth.dependencies import require_reviewer
 from app.cases.routes import router as cases_router
-from app.cases.routes import _sync_cases_from_attempts
+from app.cases.routes import _build_review_queue_payload, _sync_cases_from_attempts
 from app.models.user import User  # noqa: F401 (ensures users table is registered on startup)
 from app.services.evidence_service import (
     build_violation_overview_counts,
@@ -467,6 +467,27 @@ def get_dashboard_summary(_user=Depends(require_reviewer)):
             "message": str(e),
             "data": None,
         }
+    finally:
+        db.close()
+
+
+@app.get("/v1/review-queue")
+def get_review_queue(
+    status: Optional[str] = None,
+    risk_level: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    search: Optional[str] = None,
+    _user=Depends(require_reviewer),
+):
+    db = SessionLocal()
+    try:
+        return _build_review_queue_payload(
+            db,
+            status_filter=status,
+            risk_level_filter=risk_level,
+            assigned_to_filter=assigned_to,
+            search=search,
+        )
     finally:
         db.close()
 

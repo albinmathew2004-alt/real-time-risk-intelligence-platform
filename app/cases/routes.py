@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import distinct
 
 from app.auth.dependencies import require_reviewer
 from app.models.user import User
+from app.services.evidence_service import normalize_evidence, normalize_risk_level, safe_float
 from app.schemas.cases import (
     CaseAssignRequest,
     CaseDetailOut,
@@ -75,6 +76,15 @@ ALLOWED_TRANSITIONS = {
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _latest_snapshot(db, attempt_id: str) -> Optional[Dict[str, object]]:
@@ -260,6 +270,211 @@ def _serialize_case(db, case: InvestigationCase, *, include_actions: bool = Fals
     return InvestigationCaseOut(**payload)
 
 
+def _queue_status(case: InvestigationCase) -> str:
+    status = case.status or CaseStatus.NEW.value
+    if status in {CaseStatus.CLEARED.value, CaseStatus.FALSE_POSITIVE.value}:
+        return "RESOLVED"
+    return status
+
+
+def _status_priority(status_value: str) -> int:
+    if status_value == CaseStatus.ESCALATED.value:
+        return 0
+    if status_value == CaseStatus.CONFIRMED_RISK.value:
+        return 1
+    if status_value == CaseStatus.UNDER_INVESTIGATION.value:
+        return 2
+    if status_value == CaseStatus.TRIAGED.value:
+        return 3
+    if status_value == CaseStatus.NEW.value:
+        return 4
+    if status_value == "RESOLVED":
+        return 5
+    if status_value == CaseStatus.CLOSED.value:
+        return 6
+    return 7
+
+
+def _risk_priority(risk_level: str) -> int:
+    if risk_level == "HIGH":
+        return 0
+    if risk_level == "MEDIUM":
+        return 1
+    return 2
+
+
+def _event_counts_by_attempt(db) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    rows = db.query(RawExamEvent).all()
+    for row in rows:
+        if not row.attempt_id:
+            continue
+        counts[row.attempt_id] = counts.get(row.attempt_id, 0) + 1
+    return counts
+
+
+def _latest_events_by_attempt(db) -> Dict[str, RawExamEvent]:
+    rows = (
+        db.query(RawExamEvent)
+        .order_by(RawExamEvent.received_at.desc(), RawExamEvent.id.desc())
+        .all()
+    )
+    result: Dict[str, RawExamEvent] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in result:
+            result[row.attempt_id] = row
+    return result
+
+
+def _latest_attempt_logs_by_attempt(db) -> Dict[str, AttemptLog]:
+    rows = (
+        db.query(AttemptLog)
+        .order_by(AttemptLog.id.desc())
+        .all()
+    )
+    result: Dict[str, AttemptLog] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in result:
+            result[row.attempt_id] = row
+    return result
+
+
+def _strongest_signal_for_case(*, latest_log: Optional[AttemptLog], latest_event: Optional[RawExamEvent], risk_score: float, risk_level: str) -> str:
+    features = getattr(latest_log, "features", None) or {}
+    events = []
+    if latest_event is not None:
+        events.append(
+            {
+                "event_type": latest_event.event_type,
+                "payload": latest_event.payload or {},
+                "occurred_at": latest_event.occurred_at,
+            }
+        )
+    evidence_items = normalize_evidence(
+        events=events,
+        features=features,
+        risk_score=risk_score,
+        risk_level=risk_level,
+    )
+    if evidence_items:
+        return str(evidence_items[0].get("title") or "Behavioral signal")
+    if risk_level == "HIGH":
+        return "High Risk Score"
+    if risk_level == "MEDIUM":
+        return "Elevated Risk Score"
+    return "No major signal"
+
+
+def _build_review_queue_payload(
+    db,
+    *,
+    status_filter: Optional[str],
+    risk_level_filter: Optional[str],
+    assigned_to_filter: Optional[str],
+    search: Optional[str],
+) -> Dict[str, object]:
+    _sync_cases_from_attempts(db)
+    cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
+    users = {user.id: user for user in db.query(User).all()}
+    event_counts = _event_counts_by_attempt(db)
+    latest_events = _latest_events_by_attempt(db)
+    latest_logs = _latest_attempt_logs_by_attempt(db)
+
+    rows = []
+    for case in cases:
+        assigned_user = users.get(case.assigned_reviewer_id) if case.assigned_reviewer_id else None
+        risk_score = safe_float(case.current_combined_score, 0.0)
+        risk_level = normalize_risk_level(risk_score)
+        queue_status = _queue_status(case)
+        latest_event = latest_events.get(case.attempt_id)
+        latest_log = latest_logs.get(case.attempt_id)
+        assigned_to = getattr(assigned_user, "full_name", None) or getattr(assigned_user, "email", None) or "Unassigned"
+        last_activity = case.latest_event_at or getattr(latest_event, "received_at", None) or getattr(latest_event, "occurred_at", None)
+
+        rows.append(
+            {
+                "case_id": case.id,
+                "attempt_id": case.attempt_id,
+                "candidate_name": case.candidate_name or getattr(latest_event, "candidate_name", None) or "Unknown Candidate",
+                "candidate_email": case.candidate_email or getattr(latest_event, "candidate_email", None) or "No email available",
+                "assessment_name": case.assessment_name or getattr(latest_event, "assessment_name", None) or "Python Coding Assessment",
+                "risk_level": risk_level,
+                "risk_score": round(risk_score, 4),
+                "confidence": round(safe_float(case.current_confidence, 0.0), 4),
+                "case_status": queue_status,
+                "assigned_to": assigned_to,
+                "last_activity": last_activity,
+                "event_count": event_counts.get(case.attempt_id, 0),
+                "strongest_signal": _strongest_signal_for_case(
+                    latest_log=latest_log,
+                    latest_event=latest_event,
+                    risk_score=risk_score,
+                    risk_level=risk_level,
+                ),
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            _status_priority(str(row["case_status"])),
+            _risk_priority(str(row["risk_level"])),
+            -safe_float(row["risk_score"], 0.0),
+            -((_parse_iso(row["last_activity"]).timestamp()) if _parse_iso(row["last_activity"]) else 0),
+        )
+    )
+    for index, row in enumerate(rows, start=1):
+        row["priority_rank"] = index
+
+    status_counts = {
+        "all": len(rows),
+        "new": sum(1 for row in rows if row["case_status"] == CaseStatus.NEW.value),
+        "under_investigation": sum(1 for row in rows if row["case_status"] == CaseStatus.UNDER_INVESTIGATION.value),
+        "escalated": sum(1 for row in rows if row["case_status"] == CaseStatus.ESCALATED.value),
+        "resolved": sum(1 for row in rows if row["case_status"] == "RESOLVED"),
+        "closed": sum(1 for row in rows if row["case_status"] == CaseStatus.CLOSED.value),
+    }
+
+    filtered_rows = rows
+    if status_filter:
+        normalized_status = status_filter.strip().upper()
+        status_alias = {
+            "UNDER INVESTIGATION": CaseStatus.UNDER_INVESTIGATION.value,
+            "UNDER_INVESTIGATION": CaseStatus.UNDER_INVESTIGATION.value,
+        }
+        normalized_status = status_alias.get(normalized_status, normalized_status)
+        if normalized_status != "ALL":
+            filtered_rows = [row for row in filtered_rows if row["case_status"] == normalized_status]
+    if risk_level_filter:
+        normalized_risk = risk_level_filter.strip().upper()
+        filtered_rows = [row for row in filtered_rows if row["risk_level"] == normalized_risk]
+    if assigned_to_filter:
+        assigned_query = assigned_to_filter.strip().lower()
+        if assigned_query == "unassigned":
+            filtered_rows = [row for row in filtered_rows if row["assigned_to"] == "Unassigned"]
+        else:
+            filtered_rows = [row for row in filtered_rows if assigned_query in str(row["assigned_to"]).lower()]
+    if search:
+        needle = search.strip().lower()
+        filtered_rows = [
+            row for row in filtered_rows
+            if needle in " ".join(
+                [
+                    str(row["attempt_id"]),
+                    str(row["candidate_name"]),
+                    str(row["candidate_email"]),
+                    str(row["assessment_name"]),
+                    str(row["strongest_signal"]),
+                ]
+            ).lower()
+        ]
+
+    return {
+        "count": len(filtered_rows),
+        "status_counts": status_counts,
+        "data": filtered_rows,
+    }
+
+
 def _get_case_or_404(db, case_id: int) -> InvestigationCase:
     case = db.query(InvestigationCase).filter(InvestigationCase.id == case_id).first()
     if case is None:
@@ -320,6 +535,27 @@ def list_cases(_user: User = Depends(require_reviewer)):
         cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
         data = [_serialize_case(db, case) for case in cases]
         return CaseListResponse(count=len(data), data=data)
+    finally:
+        db.close()
+
+
+@router.get("/review-queue")
+def review_queue(
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    risk_level: Optional[str] = Query(default=None),
+    assigned_to: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    _user: User = Depends(require_reviewer),
+):
+    db = SessionLocal()
+    try:
+        return _build_review_queue_payload(
+            db,
+            status_filter=status_filter,
+            risk_level_filter=risk_level,
+            assigned_to_filter=assigned_to,
+            search=search,
+        )
     finally:
         db.close()
 

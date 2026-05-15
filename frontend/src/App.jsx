@@ -64,6 +64,7 @@ const EVENTS_URL = `${API_BASE_URL}/v1/events`;
 const RISK_HISTORY_URL = `${API_BASE_URL}/v1/risk-history`;
 const REPORTS_URL = `${API_BASE_URL}/v1/reports`;
 const DASHBOARD_SUMMARY_URL = `${API_BASE_URL}/v1/dashboard/summary`;
+const REVIEW_QUEUE_URL = `${API_BASE_URL}/v1/review-queue`;
 const CASES_URL = `${API_BASE_URL}/v1/cases`;
 const AUTH_URL = `${API_BASE_URL}/v1/auth`;
 
@@ -942,6 +943,7 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [cases, setCases] = useState([]);
   const [dashboardSummary, setDashboardSummary] = useState(null);
+  const [reviewQueuePayload, setReviewQueuePayload] = useState(null);
   const [caseAccessError, setCaseAccessError] = useState("");
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -959,6 +961,7 @@ export default function App() {
     setToken(null);
     setCurrentUser(null);
     setCases([]);
+    setReviewQueuePayload(null);
     setSelected(null);
     setPage("dashboard");
   }, []);
@@ -1025,6 +1028,30 @@ export default function App() {
     }
   }, [logout, token]);
 
+  const fetchReviewQueue = useCallback(async () => {
+    try {
+      const result = await authJsonFetch(REVIEW_QUEUE_URL, { token });
+      if (!result.ok) {
+        if (result.status === 401) {
+          logout();
+          return;
+        }
+        if (result.status === 403) {
+          setCaseAccessError("Your role can sign in, but reviewer workflow access is restricted.");
+          setReviewQueuePayload(null);
+          return;
+        }
+        setReviewQueuePayload(null);
+        return;
+      }
+      setCaseAccessError("");
+      setReviewQueuePayload(result.data || null);
+    } catch (err) {
+      console.error("Failed to fetch review queue:", err);
+      setReviewQueuePayload(null);
+    }
+  }, [logout, token]);
+
   const performCaseAction = useCallback(async ({ caseId, endpoint, body }) => {
     if (!caseId) {
       return { ok: false, error: "Missing case id" };
@@ -1042,8 +1069,9 @@ export default function App() {
       };
     }
     await fetchCases();
+    await fetchReviewQueue();
     return { ok: true, data: result.data };
-  }, [fetchCases, logout, token]);
+  }, [fetchCases, fetchReviewQueue, logout, token]);
 
   const login = useCallback(async ({ email, password }) => {
     setAuthError("");
@@ -1105,6 +1133,7 @@ export default function App() {
       if (token) void fetchLogs();
       if (token) void fetchCases();
       if (token) void fetchDashboardSummary();
+      if (token) void fetchReviewQueue();
     }, 0);
     const ws = new WebSocket(WS_URL);
 
@@ -1148,6 +1177,7 @@ export default function App() {
         setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
         void fetchCases();
         void fetchDashboardSummary();
+        void fetchReviewQueue();
       } catch (err) {
         console.error("WS parse error:", err);
       }
@@ -1157,7 +1187,7 @@ export default function App() {
       window.clearTimeout(timeoutId);
       ws.close();
     };
-  }, [fetchCases, fetchDashboardSummary, fetchLogs, token]);
+  }, [fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, token]);
 
   const caseByAttemptId = useMemo(() => {
     return Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
@@ -1304,12 +1334,14 @@ export default function App() {
           <QueuePage
             logs={logs}
             cases={cases}
+            reviewQueuePayload={reviewQueuePayload}
             caseByAttemptId={caseByAttemptId}
             caseAccessError={caseAccessError}
             currentUser={currentUser}
             onRefresh={() => {
               void fetchLogs();
               void fetchCases();
+              void fetchReviewQueue();
             }}
             setSelected={setSelected}
             setPage={setPage}
@@ -1531,12 +1563,55 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
   );
 }
 
-function QueuePage({ logs, caseByAttemptId, caseAccessError, currentUser, onRefresh, setSelected, setPage }) {
+function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError, currentUser, onRefresh, setSelected, setPage }) {
   const [activeTab, setActiveTab] = useState("all");
   const [pageIndex, setPageIndex] = useState(0);
   const rowsPerPage = 8;
-  const reviewRows = useMemo(() => buildReviewQueueItems(logs, caseByAttemptId), [logs, caseByAttemptId]);
-  const tabCounts = useMemo(() => buildQueueTabCounts(reviewRows), [reviewRows]);
+  const fallbackRows = useMemo(() => buildReviewQueueItems(logs, caseByAttemptId), [logs, caseByAttemptId]);
+  const reviewRows = useMemo(() => {
+    if (!Array.isArray(reviewQueuePayload?.data)) return fallbackRows;
+    return reviewQueuePayload.data.map((row) => ({
+      item: logs.find((item) => item.attempt_id === row.attempt_id) || {
+        attempt_id: row.attempt_id,
+        candidate_name: row.candidate_name,
+        candidate_email: row.candidate_email,
+        assessment_name: row.assessment_name,
+        combined_score: row.risk_score,
+        confidence: row.confidence,
+        risk: row.risk_level,
+        timestamp: row.last_activity,
+        event_count: row.event_count,
+      },
+      caseRecord: caseByAttemptId[row.attempt_id] || null,
+      attemptId: row.attempt_id,
+      candidateName: row.candidate_name,
+      candidateEmail: row.candidate_email,
+      assessmentName: row.assessment_name,
+      score: Number(row.risk_score || 0),
+      risk: row.risk_level || "LOW",
+      queueStatus: row.case_status || "NEW",
+      assignedTo: row.assigned_to || "Unassigned",
+      lastActivity: row.last_activity,
+      eventCount: Number(row.event_count || 0),
+      strongestSignal: row.strongest_signal || "No major signal",
+      priorityRank: Number(row.priority_rank || 0),
+      caseId: row.case_id,
+      confidence: Number(row.confidence || 0),
+    }));
+  }, [caseByAttemptId, fallbackRows, logs, reviewQueuePayload]);
+  const tabCounts = useMemo(() => {
+    if (reviewQueuePayload?.status_counts) {
+      return {
+        all: Number(reviewQueuePayload.status_counts.all || reviewRows.length),
+        new: Number(reviewQueuePayload.status_counts.new || 0),
+        under_investigation: Number(reviewQueuePayload.status_counts.under_investigation || 0),
+        escalated: Number(reviewQueuePayload.status_counts.escalated || 0),
+        resolved: Number(reviewQueuePayload.status_counts.resolved || 0),
+        closed: Number(reviewQueuePayload.status_counts.closed || 0),
+      };
+    }
+    return buildQueueTabCounts(reviewRows);
+  }, [reviewQueuePayload, reviewRows]);
   const filteredRows = useMemo(() => filterQueueRows(reviewRows, activeTab), [reviewRows, activeTab]);
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / rowsPerPage));
   const currentPage = Math.min(pageIndex, totalPages - 1);
@@ -1663,7 +1738,7 @@ function QueuePage({ logs, caseByAttemptId, caseAccessError, currentUser, onRefr
             pageRows.map((row, index) => (
               <div className="queue-enterprise-row" key={row.attemptId}>
                 <span><input type="checkbox" /></span>
-                <span className={`priority-index tone-${riskTone(row.risk)}`}>{currentPage * rowsPerPage + index + 1}</span>
+                <span className={`priority-index tone-${riskTone(row.risk)}`}>{row.priorityRank || currentPage * rowsPerPage + index + 1}</span>
                 <span className="queue-candidate-block">
                   <span className="queue-candidate-avatar">{getInitials(row.candidateName)}</span>
                   <span>
@@ -1687,7 +1762,7 @@ function QueuePage({ logs, caseByAttemptId, caseAccessError, currentUser, onRefr
                   <button
                     className="action-link-button"
                     onClick={() => {
-                      setSelected(row.item);
+                      setSelected(row.item || logs.find((item) => item.attempt_id === row.attemptId) || null);
                       setPage("report");
                     }}
                     type="button"
@@ -1755,7 +1830,7 @@ function QueuePage({ logs, caseByAttemptId, caseAccessError, currentUser, onRefr
           <div className="avg-time-card">
             <div className="avg-time-circle"><Clock3 size={22} /></div>
             <div>
-              <strong>{avgReviewSeconds ? formatDuration(avgReviewSeconds) : "18:00"}</strong>
+              <strong>{avgReviewSeconds ? formatDuration(avgReviewSeconds) : "—"}</strong>
               <small>Average time to resolution</small>
             </div>
           </div>
