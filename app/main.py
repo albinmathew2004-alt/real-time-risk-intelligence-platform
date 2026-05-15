@@ -35,6 +35,9 @@ from app.services.report_summary_service import build_report_summary
 
 from fastapi import Depends
 
+RISK_HISTORY_SCORE_EPSILON = 0.01
+RISK_HISTORY_CONFIDENCE_EPSILON = 0.05
+
 
 def _allowed_origins() -> list[str]:
     defaults = [
@@ -133,6 +136,72 @@ def db_events_to_scoring_events(events: List[RawExamEvent]) -> List[Dict[str, An
         }
         for e in events
     ]
+
+
+def _risk_history_changed(previous: Optional[RiskHistory], *, risk_level: str, score: float, confidence: float, reason: str) -> bool:
+    if previous is None:
+        return True
+    previous_score = safe_float(previous.combined_score, 0.0)
+    previous_confidence = safe_float(previous.confidence, 0.0)
+    previous_risk = str(previous.risk or normalize_risk_level(previous_score))
+    previous_reason = str(previous.reason or "")
+
+    if previous_risk != risk_level:
+        return True
+    if abs(previous_score - score) >= RISK_HISTORY_SCORE_EPSILON:
+        return True
+    if abs(previous_confidence - confidence) >= RISK_HISTORY_CONFIDENCE_EPSILON:
+        return True
+    if previous_reason != reason:
+        return True
+    return False
+
+
+def _record_risk_snapshot_if_needed(
+    db,
+    *,
+    attempt_id: str,
+    candidate_id: Optional[str],
+    candidate_name: Optional[str],
+    candidate_email: Optional[str],
+    assessment_id: Optional[str],
+    assessment_name: Optional[str],
+    risk_level: str,
+    confidence: float,
+    score: float,
+    reason: str,
+    timestamp: str,
+) -> Optional[RiskHistory]:
+    latest_history = (
+        db.query(RiskHistory)
+        .filter(RiskHistory.attempt_id == attempt_id)
+        .order_by(RiskHistory.timestamp.desc(), RiskHistory.id.desc())
+        .first()
+    )
+    if not _risk_history_changed(
+        latest_history,
+        risk_level=risk_level,
+        score=score,
+        confidence=confidence,
+        reason=reason,
+    ):
+        return None
+
+    entry = RiskHistory(
+        attempt_id=attempt_id,
+        candidate_id=candidate_id,
+        candidate_name=candidate_name,
+        candidate_email=candidate_email,
+        assessment_id=assessment_id,
+        assessment_name=assessment_name,
+        risk=risk_level,
+        confidence=confidence,
+        combined_score=score,
+        reason=reason,
+        timestamp=timestamp,
+    )
+    db.add(entry)
+    return entry
 
 
 def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
@@ -254,24 +323,53 @@ def home():
 
 @app.post("/v1/score")
 async def score(batch: EventBatch):
+    db = SessionLocal()
     try:
         result = run_scoring(batch.events, batch.attempt_id)
+        score_value = safe_float(result.get("combined_score"), 0.0)
+        confidence_value = safe_float(result.get("confidence"), 0.0)
+        risk_level = normalize_risk_level(score_value)
+        reason = build_reason(result)
+
+        _record_risk_snapshot_if_needed(
+            db,
+            attempt_id=batch.attempt_id,
+            candidate_id=None,
+            candidate_name=None,
+            candidate_email=None,
+            assessment_id=None,
+            assessment_name=None,
+            risk_level=risk_level,
+            confidence=confidence_value,
+            score=score_value,
+            reason=reason,
+            timestamp=utc_now(),
+        )
+        db.commit()
 
         await manager.broadcast({
             "type": "risk_update",
             "mode": "batch_score",
             "attempt_id": result.get("attempt_id"),
-            "risk": result.get("risk"),
-            "confidence": result.get("confidence"),
-            "combined_score": result.get("combined_score"),
+            "risk": risk_level,
+            "confidence": confidence_value,
+            "combined_score": score_value,
             "explanation": result.get("explanation"),
         })
 
-        return result
+        return {
+            **result,
+            "risk": risk_level,
+            "confidence": confidence_value,
+            "combined_score": score_value,
+        }
 
     except Exception as e:
+        db.rollback()
         traceback.print_exc()
         return {"error": str(e)}
+    finally:
+        db.close()
 
 
 @app.post("/v1/events/ingest")
@@ -316,6 +414,10 @@ async def ingest_event(event: ExamEventIngest):
             scoring_events = db_events_to_scoring_events(all_events)
 
         result = run_scoring(scoring_events, event.attempt_id)
+        score_value = safe_float(result.get("combined_score"), 0.0)
+        confidence_value = safe_float(result.get("confidence"), 0.0)
+        risk_level = normalize_risk_level(score_value)
+        reason = build_reason(result)
 
         current_risk_state = {
             "attempt_id": event.attempt_id,
@@ -324,9 +426,9 @@ async def ingest_event(event: ExamEventIngest):
             "candidate_email": event.candidate_email,
             "assessment_id": event.assessment_id,
             "assessment_name": event.assessment_name,
-            "risk": result.get("risk"),
-            "confidence": result.get("confidence"),
-            "combined_score": result.get("combined_score"),
+            "risk": risk_level,
+            "confidence": confidence_value,
+            "combined_score": score_value,
             "explanation": result.get("explanation"),
             "event_count": len(scoring_events),
             "updated_at": received_at,
@@ -334,21 +436,20 @@ async def ingest_event(event: ExamEventIngest):
 
         set_current_risk(event.attempt_id, current_risk_state)
 
-        risk_entry = RiskHistory(
+        _record_risk_snapshot_if_needed(
+            db,
             attempt_id=event.attempt_id,
             candidate_id=event.candidate_id,
             candidate_name=event.candidate_name,
             candidate_email=event.candidate_email,
             assessment_id=event.assessment_id,
             assessment_name=event.assessment_name,
-            risk=result.get("risk"),
-            confidence=float(result.get("confidence", 0.0) or 0.0),
-            combined_score=float(result.get("combined_score", 0.0) or 0.0),
-            reason=build_reason(result),
+            risk_level=risk_level,
+            confidence=confidence_value,
+            score=score_value,
+            reason=reason,
             timestamp=received_at,
         )
-
-        db.add(risk_entry)
         db.commit()
 
         broadcast_payload = {
@@ -365,15 +466,18 @@ async def ingest_event(event: ExamEventIngest):
                 "payload": event.payload,
                 "occurred_at": event.occurred_at,
             },
-            "risk": result.get("risk"),
-            "confidence": result.get("confidence"),
-            "combined_score": result.get("combined_score"),
+            "risk": risk_level,
+            "confidence": confidence_value,
+            "combined_score": score_value,
             "explanation": result.get("explanation"),
             "event_count": len(scoring_events),
             "timeline_point": {
-                "risk": result.get("risk"),
-                "combined_score": result.get("combined_score"),
-                "reason": build_reason(result),
+                "risk": risk_level,
+                "combined_score": score_value,
+                "score": score_value,
+                "risk_level": risk_level,
+                "reason": reason,
+                "summary": reason,
                 "timestamp": received_at,
             },
         }
@@ -385,10 +489,15 @@ async def ingest_event(event: ExamEventIngest):
             "message": "Event ingested into Redis + PostgreSQL and attempt re-scored",
             "attempt_id": event.attempt_id,
             "event_count": len(scoring_events),
-            "current_risk": result.get("risk"),
-            "current_confidence": result.get("confidence"),
-            "current_score": result.get("combined_score"),
-            "result": result,
+            "current_risk": risk_level,
+            "current_confidence": confidence_value,
+            "current_score": score_value,
+            "result": {
+                **result,
+                "risk": risk_level,
+                "confidence": confidence_value,
+                "combined_score": score_value,
+            },
         }
 
     except Exception as e:
@@ -491,9 +600,12 @@ def get_risk_history(attempt_id: str, _user=Depends(require_reviewer)):
                 "assessment_id": h.assessment_id,
                 "assessment_name": h.assessment_name,
                 "risk": h.risk,
-                "confidence": h.confidence,
-                "combined_score": h.combined_score,
+                "risk_level": h.risk or normalize_risk_level(h.combined_score),
+                "confidence": safe_float(h.confidence, 0.0),
+                "combined_score": safe_float(h.combined_score, 0.0),
+                "score": safe_float(h.combined_score, 0.0),
                 "reason": h.reason,
+                "summary": h.reason,
                 "timestamp": h.timestamp,
             }
             for h in history

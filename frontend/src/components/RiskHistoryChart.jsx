@@ -14,8 +14,10 @@ export default function RiskHistoryChart({ data, loading }) {
   const chartData = data.map((item) => ({
     ...item,
     label: item.label,
-    score: Number(item.combined_score || 0),
-    confidence: Number(item.confidence || 0),
+    score: Number(item.score ?? item.combined_score ?? 0),
+    confidence: Number(item.confidence ?? 0),
+    riskLevel: item.risk_level || item.risk || "LOW",
+    summary: item.summary || item.reason || "",
   }));
 
   return (
@@ -59,7 +61,11 @@ export default function RiskHistoryChart({ data, loading }) {
                     color: "#f8fafc",
                   }}
                   formatter={(value, name) => [Number(value).toFixed(2), name === "score" ? "Risk Score" : "Confidence"]}
-                  labelFormatter={(label) => `Time ${label}`}
+                  labelFormatter={(label, payload) => {
+                    const point = payload?.[0]?.payload;
+                    const level = point?.riskLevel ? ` • ${point.riskLevel}` : "";
+                    return `Time ${label}${level}`;
+                  }}
                 />
                 <Legend wrapperStyle={{ display: "none" }} />
                 <Line

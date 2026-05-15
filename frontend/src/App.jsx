@@ -1883,6 +1883,8 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
   const chartData = riskHistory.map((item) => ({
     ...item,
     label: formatTime(item.timestamp).slice(0, 5),
+    score: item.score ?? item.combined_score,
+    risk_level: item.risk_level || item.risk,
   }));
 
   return (
