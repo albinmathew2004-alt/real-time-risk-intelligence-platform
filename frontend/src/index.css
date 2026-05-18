@@ -5,6 +5,14 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+:root[data-theme="midnight"] {
+  color-scheme: dark;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
 html,
 body,
 #root {

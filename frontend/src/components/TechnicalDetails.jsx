@@ -7,8 +7,8 @@ export default function TechnicalDetails({ items }) {
       <div className="technical-details-grid">
         {items.map((item) => (
           <div className="technical-details-item" key={item.label}>
-            <span>{item.label}</span>
-            <strong>{item.value}</strong>
+            <span className="technical-details-label">{item.label}</span>
+            <strong className="technical-details-value">{item.value}</strong>
           </div>
         ))}
       </div>

@@ -166,8 +166,6 @@ def _risk_history_changed(previous: Optional[RiskHistory], *, risk_level: str, s
         return True
     if abs(previous_confidence - confidence) >= RISK_HISTORY_CONFIDENCE_EPSILON:
         return True
-    if previous_reason != reason:
-        return True
     return False
 
 

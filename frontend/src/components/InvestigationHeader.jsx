@@ -11,9 +11,10 @@ export default function InvestigationHeader({
   score,
   confidence,
   confidenceLabel,
+  metadataItems = [],
 }) {
   return (
-    <section className="investigation-card investigation-header-card">
+    <section className="investigation-card investigation-header-card report-summary-card">
       <div className="investigation-header-grid">
         <div className="investigation-identity">
           <div className="investigation-avatar">{initials}</div>
@@ -24,6 +25,16 @@ export default function InvestigationHeader({
             </div>
             <h2>{candidateName}</h2>
             <p>{candidateEmail}</p>
+            {metadataItems.length ? (
+              <div className="investigation-meta-grid">
+                {metadataItems.map((item) => (
+                  <div className="investigation-meta-item" key={item.label}>
+                    <span>{item.label}</span>
+                    <strong title={item.value}>{item.value}</strong>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         </div>
 

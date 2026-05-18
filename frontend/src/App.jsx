@@ -663,6 +663,13 @@ function buildEvidenceRows(attempt, overviewItems, eventCount) {
     subtitle: score >= 0.7 ? "Overall risk exceeded high-risk threshold" : "Combined telemetry signals pushed this attempt into review territory",
     severity: scoreSeverity,
     details: `Combined score ${formatNumber(score)} across ${eventCount ?? 0} captured events`,
+    count: formatNumber(score),
+    countDisplay: formatNumber(score),
+    relatedEventCount: eventCount ?? 0,
+    impactLabel: severityLabel(scoreSeverity),
+    signalType: "RISK_SCORE",
+    firstSeen: attempt?.timestamp || null,
+    lastSeen: attempt?.latest_event?.occurred_at || attempt?.timestamp || null,
   });
 
   for (const item of overviewItems) {
@@ -674,11 +681,18 @@ function buildEvidenceRows(attempt, overviewItems, eventCount) {
       subtitle: item.subtitle,
       severity: item.severity,
       details: `${item.value} observed during this attempt`,
+      count: Number(item.value) || 0,
+      countDisplay: item.value,
+      relatedEventCount: eventCount ?? 0,
+      impactLabel: item.severityLabel,
+      signalType: String(item.key || "signal").toUpperCase(),
+      firstSeen: attempt?.timestamp || null,
+      lastSeen: attempt?.latest_event?.occurred_at || attempt?.timestamp || null,
     });
   }
 
   rows.sort((a, b) => severityRank(b.severity) - severityRank(a.severity));
-  return rows.slice(0, 6);
+  return rows;
 }
 
 function buildEvidenceRowsFromReport(evidenceItems = []) {
@@ -688,7 +702,20 @@ function buildEvidenceRowsFromReport(evidenceItems = []) {
     subtitle: item.explanation || "Behavioral evidence was observed for this attempt.",
     severity: item.severity || "LOW",
     details: `${Number(item.count || 0)} observed; ${Number(item.related_event_count || 0)} related event${Number(item.related_event_count || 0) === 1 ? "" : "s"}`,
+    count: Number(item.count || 0),
+    countDisplay: Number(item.count || 0),
+    relatedEventCount: Number(item.related_event_count || 0),
+    impactLabel: severityLabel(item.severity || "LOW"),
+    signalType: item.signal_type || "SIGNAL",
+    firstSeen: item.first_seen || null,
+    lastSeen: item.last_seen || null,
   }));
+}
+
+function evidencePriority(row) {
+  if (row.key === "suspicious_sequence" || row.key === "suspicious_sequences") return 3;
+  if (row.key === "high_risk_score" || row.key === "score") return 2;
+  return 0;
 }
 
 function buildTechnicalDetails({ attempt, events, eventCount, firstEvent, lastEvent, durationSeconds }) {
@@ -842,22 +869,80 @@ function buildReviewQueueItems(logs, caseByAttemptId) {
 function buildQueueTabCounts(rows) {
   return {
     all: rows.length,
-    new: rows.filter((row) => row.queueStatus === "NEW").length,
-    under_investigation: rows.filter((row) => row.queueStatus === "UNDER_INVESTIGATION").length,
-    escalated: rows.filter((row) => row.queueStatus === "ESCALATED").length,
-    resolved: rows.filter((row) => row.queueStatus === "RESOLVED").length,
-    closed: rows.filter((row) => row.queueStatus === "CLOSED").length,
+    new: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "NEW").length,
+    under_investigation: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "UNDER_INVESTIGATION").length,
+    escalated: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "ESCALATED").length,
+    resolved: rows.filter((row) => ["RESOLVED", "CLEARED", "FALSE_POSITIVE", "COMPLETED"].includes(normalizeQueueStatus(row.queueStatus))).length,
+    closed: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "CLOSED").length,
   };
 }
 
 function filterQueueRows(rows, tab) {
   if (tab === "all") return rows;
-  if (tab === "new") return rows.filter((row) => row.queueStatus === "NEW");
-  if (tab === "under_investigation") return rows.filter((row) => row.queueStatus === "UNDER_INVESTIGATION");
-  if (tab === "escalated") return rows.filter((row) => row.queueStatus === "ESCALATED");
-  if (tab === "resolved") return rows.filter((row) => row.queueStatus === "RESOLVED");
-  if (tab === "closed") return rows.filter((row) => row.queueStatus === "CLOSED");
+  if (tab === "new") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "NEW");
+  if (tab === "under_investigation") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "UNDER_INVESTIGATION");
+  if (tab === "escalated") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "ESCALATED");
+  if (tab === "resolved") return rows.filter((row) => ["RESOLVED", "CLEARED", "FALSE_POSITIVE", "COMPLETED"].includes(normalizeQueueStatus(row.queueStatus)));
+  if (tab === "closed") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "CLOSED");
   return rows;
+}
+
+function normalizeQueueRisk(risk) {
+  const normalized = String(risk || "LOW").toUpperCase();
+  if (normalized === "HIGH" || normalized === "MEDIUM") return normalized;
+  return "LOW";
+}
+
+function normalizeQueueStatus(status) {
+  const normalized = String(status || "NEW").toUpperCase();
+  if (normalized === "COMPLETED") return "COMPLETED";
+  return normalized;
+}
+
+function getQueuePrioritySortValue(row) {
+  const status = normalizeQueueStatus(row.queueStatus);
+  const risk = normalizeQueueRisk(row.risk);
+  if (status === "ESCALATED") return 0;
+  if (risk === "HIGH") return 1;
+  if (status === "UNDER_INVESTIGATION") return 2;
+  if (risk === "MEDIUM") return 3;
+  if (status === "NEW") return 4;
+  if (risk === "LOW") return 5;
+  if (["RESOLVED", "CLEARED", "FALSE_POSITIVE", "CLOSED", "COMPLETED"].includes(status)) return 6;
+  return 7;
+}
+
+function compareQueueRows(rowA, rowB, sortKey) {
+  if (sortKey === "score_desc") return Number(rowB.score || 0) - Number(rowA.score || 0);
+  if (sortKey === "score_asc") return Number(rowA.score || 0) - Number(rowB.score || 0);
+  if (sortKey === "last_oldest") return compareIso(rowA.lastActivity, rowB.lastActivity);
+  if (sortKey === "last_newest") return compareIso(rowB.lastActivity, rowA.lastActivity);
+  if (sortKey === "status") {
+    const statusCompare = normalizeQueueStatus(rowA.queueStatus).localeCompare(normalizeQueueStatus(rowB.queueStatus));
+    if (statusCompare !== 0) return statusCompare;
+    return compareIso(rowB.lastActivity, rowA.lastActivity);
+  }
+  if (sortKey === "candidate_name") {
+    const nameCompare = String(rowA.candidateName || rowA.attemptId || "").localeCompare(String(rowB.candidateName || rowB.attemptId || ""));
+    if (nameCompare !== 0) return nameCompare;
+    return compareIso(rowB.lastActivity, rowA.lastActivity);
+  }
+
+  const priorityCompare = getQueuePrioritySortValue(rowA) - getQueuePrioritySortValue(rowB);
+  if (priorityCompare !== 0) return priorityCompare;
+  const scoreCompare = Number(rowB.score || 0) - Number(rowA.score || 0);
+  if (scoreCompare !== 0) return scoreCompare;
+  return compareIso(rowB.lastActivity, rowA.lastActivity);
+}
+
+function sortLabel(sortKey) {
+  if (sortKey === "score_desc") return "Risk Score: High to Low";
+  if (sortKey === "score_asc") return "Risk Score: Low to High";
+  if (sortKey === "last_newest") return "Last Activity: Newest";
+  if (sortKey === "last_oldest") return "Last Activity: Oldest";
+  if (sortKey === "status") return "Status";
+  if (sortKey === "candidate_name") return "Candidate Name";
+  return "Priority: High to Low";
 }
 
 function buildDonutStyle(segments) {
@@ -918,6 +1003,23 @@ function setStoredToken(token) {
   }
 }
 
+function getStoredSetting(key, fallback) {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function setStoredSetting(key, value) {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // ignore
+  }
+}
+
 async function authJsonFetch(url, { token, method = "GET", body } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -955,6 +1057,10 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [themeMode, setThemeMode] = useState(() => getStoredSetting("riskintel_theme_mode", "dark"));
+  const [autoRefreshInterval, setAutoRefreshInterval] = useState(() => getStoredSetting("riskintel_auto_refresh", "30"));
+  const [liveUpdatesEnabled, setLiveUpdatesEnabled] = useState(() => getStoredSetting("riskintel_live_updates", "true") === "true");
+  const [notificationsEnabled, setNotificationsEnabled] = useState(() => getStoredSetting("riskintel_notifications", "true") === "true");
 
   const logout = useCallback(() => {
     setStoredToken(null);
@@ -1104,6 +1210,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    setStoredSetting("riskintel_theme_mode", themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    setStoredSetting("riskintel_auto_refresh", autoRefreshInterval);
+  }, [autoRefreshInterval]);
+
+  useEffect(() => {
+    setStoredSetting("riskintel_live_updates", liveUpdatesEnabled);
+  }, [liveUpdatesEnabled]);
+
+  useEffect(() => {
+    setStoredSetting("riskintel_notifications", notificationsEnabled);
+  }, [notificationsEnabled]);
+
+  useEffect(() => {
     let cancelled = false;
     async function loadMe() {
       if (!token) return;
@@ -1135,6 +1258,13 @@ export default function App() {
       if (token) void fetchDashboardSummary();
       if (token) void fetchReviewQueue();
     }, 0);
+    if (!liveUpdatesEnabled) {
+      setWsConnected(false);
+      return () => {
+        window.clearTimeout(timeoutId);
+      };
+    }
+
     const ws = new WebSocket(WS_URL);
 
     ws.onopen = () => setWsConnected(true);
@@ -1187,7 +1317,22 @@ export default function App() {
       window.clearTimeout(timeoutId);
       ws.close();
     };
-  }, [fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, token]);
+  }, [fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, liveUpdatesEnabled, token]);
+
+  useEffect(() => {
+    if (!token) return;
+    const seconds = Number(autoRefreshInterval);
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    const intervalId = window.setInterval(() => {
+      void fetchLogs();
+      void fetchCases();
+      void fetchDashboardSummary();
+      void fetchReviewQueue();
+    }, seconds * 1000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [autoRefreshInterval, fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, token]);
 
   const caseByAttemptId = useMemo(() => {
     return Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
@@ -1243,36 +1388,31 @@ export default function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="sidebar-top">
-          <div className="brand-mark"><ShieldAlert size={24} /></div>
-          <h2>RiskIntel</h2>
-          <p>Assessment Integrity Console</p>
-          {currentUser && (
-            <div className="user-pill">
-              <div>
-                <strong>{currentUser.full_name || currentUser.email}</strong>
-                <small>{currentUser.email} â€¢ {currentUser.role}</small>
-              </div>
-              <button className="logout-btn" onClick={logout}>Logout</button>
+          <div className="sidebar-brand">
+            <ProctorIQLogo className="brand-mark brand-mark-proctoriq" />
+            <div className="sidebar-brand-copy">
+              <h2>ProctorIQ</h2>
+              <p>Assessment Integrity Console</p>
             </div>
-          )}
-          <div className={`connection-pill ${wsConnected ? "online" : "offline"}`}>
-            <span className="pulse"></span>
-            {wsConnected ? "Live stream connected" : "Live stream offline"}
           </div>
         </div>
 
         <nav className="nav">
           <button className={page === "dashboard" ? "active" : ""} onClick={() => setPage("dashboard")}>
-            <Home size={18} /> Command Center
+            <Home size={18} />
+            <span>Command Center</span>
           </button>
           <button className={page === "queue" ? "active" : ""} onClick={() => setPage("queue")}>
-            <ListChecks size={18} /> Review Queue
+            <ListChecks size={18} />
+            <span>Review Queue</span>
           </button>
           <button className={page === "report" ? "active" : ""} onClick={() => setPage("report")}>
-            <ShieldAlert size={18} /> Investigation Report
+            <ShieldAlert size={18} />
+            <span>Investigation</span>
           </button>
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>
-            <Settings size={18} /> Settings
+            <Settings size={18} />
+            <span>Settings</span>
           </button>
         </nav>
 
@@ -1286,36 +1426,24 @@ export default function App() {
           </div>
 
           {currentUser ? (
-            <button className="sidebar-user-card" type="button">
-              <span className="sidebar-user-avatar">{getInitials(currentUser.full_name || currentUser.email)}</span>
-              <span className="sidebar-user-copy">
-                <strong>{currentUser.full_name || currentUser.email}</strong>
-                <small>{currentUser.role}</small>
-              </span>
-              <ChevronDown size={16} />
-            </button>
+            <div className="sidebar-user-panel">
+              <button className="sidebar-user-card" type="button">
+                <span className="sidebar-user-avatar">{getInitials(currentUser.full_name || currentUser.email)}</span>
+                <span className="sidebar-user-copy">
+                  <strong>{currentUser.full_name || currentUser.email}</strong>
+                  <small>{currentUser.role}</small>
+                </span>
+                <ChevronDown size={16} />
+              </button>
+              <button className="sidebar-logout-btn" onClick={logout} type="button">
+                <ArrowRight size={16} /> Logout
+              </button>
+            </div>
           ) : null}
         </div>
       </aside>
 
       <main className="main">
-        <div className="shell-toolbar">
-          {page === "dashboard" ? <span className="shell-live-badge"><span className="pulse"></span>LIVE</span> : null}
-          {currentUser ? (
-            <button className="shell-user-button" type="button">
-              <span className="shell-user-avatar">{getInitials(currentUser.full_name || currentUser.email)}</span>
-              <span className="shell-user-details">
-                <strong>{currentUser.full_name || currentUser.email}</strong>
-                <small>{currentUser.role}</small>
-              </span>
-              <ChevronDown size={16} />
-            </button>
-          ) : null}
-          <button className="shell-logout-btn" onClick={logout} type="button">
-            <ArrowRight size={16} /> Logout
-          </button>
-        </div>
-
         {page === "dashboard" && (
           <DashboardPage
             logs={logs}
@@ -1361,7 +1489,19 @@ export default function App() {
         )}
 
         {page === "settings" && (
-          <SettingsPage currentUser={currentUser} apiBaseUrl={API_BASE_URL} wsConnected={wsConnected} />
+          <SettingsPage
+            currentUser={currentUser}
+            apiBaseUrl={API_BASE_URL}
+            wsConnected={wsConnected}
+            themeMode={themeMode}
+            onThemeModeChange={setThemeMode}
+            autoRefreshInterval={autoRefreshInterval}
+            onAutoRefreshIntervalChange={setAutoRefreshInterval}
+            liveUpdatesEnabled={liveUpdatesEnabled}
+            onLiveUpdatesEnabledChange={setLiveUpdatesEnabled}
+            notificationsEnabled={notificationsEnabled}
+            onNotificationsEnabledChange={setNotificationsEnabled}
+          />
         )}
       </main>
     </div>
@@ -1369,6 +1509,7 @@ export default function App() {
 }
 
 function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setSelected, setPage, loading, wsConnected }) {
+  const [feedExpanded, setFeedExpanded] = useState(false);
   const sortedLogs = [...logs].sort((a, b) => compareIso(b?.timestamp, a?.timestamp));
   const caseByAttemptId = Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
   const reviewRows = buildReviewQueueItems(logs, caseByAttemptId);
@@ -1382,6 +1523,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
   const feedRows = Array.isArray(dashboardSummary?.recent_risk_feed) && dashboardSummary.recent_risk_feed.length
     ? dashboardSummary.recent_risk_feed
     : fallbackFeedRows;
+  const visibleFeedRows = feedExpanded ? feedRows : feedRows.slice(0, 5);
   const reviewCases = Array.isArray(dashboardSummary?.cases_needing_review) && dashboardSummary.cases_needing_review.length
     ? dashboardSummary.cases_needing_review
     : fallbackReviewCases;
@@ -1444,15 +1586,20 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
 
       <section className="command-primary-grid">
         <div className="enterprise-panel">
-          <PanelHeader title="Live Risk Feed" subtitle="Real-time suspicious activity" actionLabel="View All" />
+          <PanelHeader
+            title="Live Risk Feed"
+            subtitle="Real-time suspicious activity"
+            actionLabel={feedRows.length > 5 ? (feedExpanded ? "Show Less" : "View All") : null}
+            onActionClick={feedRows.length > 5 ? () => setFeedExpanded((value) => !value) : undefined}
+          />
           {feedRows.length === 0 ? (
             <EmptyState text="No recent live activity has been received yet." />
           ) : (
             <div className="activity-feed-list">
-              {feedRows.map((item) => (
+              {visibleFeedRows.map((item, index) => (
                 <button
                   className="activity-feed-row"
-                  key={item.attempt_id}
+                  key={`${item.attempt_id}-${item.timestamp || item.last_activity || index}`}
                   onClick={() => {
                     setSelected(item);
                     setPage("report");
@@ -1470,11 +1617,23 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
               ))}
             </div>
           )}
-          <div className="panel-footer-link">Showing latest 5 events <span>View All Activity</span></div>
+          <div className="panel-footer-link">
+            <span>{feedExpanded ? `Showing ${visibleFeedRows.length} recent events` : `Showing latest ${visibleFeedRows.length} events`}</span>
+            {feedRows.length > 5 ? (
+              <button className="panel-footer-action" onClick={() => setFeedExpanded((value) => !value)} type="button">
+                {feedExpanded ? "Show Less" : "View All Activity"}
+              </button>
+            ) : null}
+          </div>
         </div>
 
         <div className="enterprise-panel">
-          <PanelHeader title="Cases Needing Review" subtitle="Prioritized unresolved cases" actionLabel="View Review Queue" />
+          <PanelHeader
+            title="Cases Needing Review"
+            subtitle="Prioritized unresolved cases"
+            actionLabel="View Review Queue"
+            onActionClick={() => setPage("queue")}
+          />
           {reviewCases.length === 0 ? (
             <EmptyState text="No unresolved cases require review right now." />
           ) : (
@@ -1513,7 +1672,12 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
               ))}
             </div>
           )}
-          <div className="panel-footer-link">Showing top 5 cases <span>View All Cases</span></div>
+          <div className="panel-footer-link">
+            <span>Showing top {reviewCases.length} cases</span>
+            <button className="panel-footer-action" onClick={() => setPage("queue")} type="button">
+              View All Cases
+            </button>
+          </div>
         </div>
       </section>
 
@@ -1565,11 +1729,29 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
 
 function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError, currentUser, onRefresh, setSelected, setPage }) {
   const [activeTab, setActiveTab] = useState("all");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [riskFilter, setRiskFilter] = useState("all");
+  const [assignedFilter, setAssignedFilter] = useState("all");
+  const [sortKey, setSortKey] = useState("priority_desc");
   const [pageIndex, setPageIndex] = useState(0);
-  const rowsPerPage = 8;
+  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [refreshing, setRefreshing] = useState(false);
+
   const fallbackRows = useMemo(() => buildReviewQueueItems(logs, caseByAttemptId), [logs, caseByAttemptId]);
   const reviewRows = useMemo(() => {
-    if (!Array.isArray(reviewQueuePayload?.data)) return fallbackRows;
+    if (!Array.isArray(reviewQueuePayload?.data)) {
+      return fallbackRows.map((row) => ({
+        ...row,
+        candidateName: row.candidateName || row.attemptId || "Unknown Candidate",
+        candidateEmail: row.candidateEmail || "No email available",
+        assessmentName: row.assessmentName || "Unknown Assessment",
+        risk: normalizeQueueRisk(row.risk),
+        queueStatus: normalizeQueueStatus(row.queueStatus),
+        assignedTo: row.assignedTo || "Unassigned",
+      }));
+    }
+
     return reviewQueuePayload.data.map((row) => ({
       item: logs.find((item) => item.attempt_id === row.attempt_id) || {
         attempt_id: row.attempt_id,
@@ -1584,12 +1766,12 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
       },
       caseRecord: caseByAttemptId[row.attempt_id] || null,
       attemptId: row.attempt_id,
-      candidateName: row.candidate_name,
-      candidateEmail: row.candidate_email,
-      assessmentName: row.assessment_name,
+      candidateName: row.candidate_name || row.attempt_id || "Unknown Candidate",
+      candidateEmail: row.candidate_email || "No email available",
+      assessmentName: row.assessment_name || "Unknown Assessment",
       score: Number(row.risk_score || 0),
-      risk: row.risk_level || "LOW",
-      queueStatus: row.case_status || "NEW",
+      risk: normalizeQueueRisk(row.risk_level || "LOW"),
+      queueStatus: normalizeQueueStatus(row.case_status || "NEW"),
       assignedTo: row.assigned_to || "Unassigned",
       lastActivity: row.last_activity,
       eventCount: Number(row.event_count || 0),
@@ -1599,39 +1781,64 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
       confidence: Number(row.confidence || 0),
     }));
   }, [caseByAttemptId, fallbackRows, logs, reviewQueuePayload]);
-  const tabCounts = useMemo(() => {
-    if (reviewQueuePayload?.status_counts) {
-      return {
-        all: Number(reviewQueuePayload.status_counts.all || reviewRows.length),
-        new: Number(reviewQueuePayload.status_counts.new || 0),
-        under_investigation: Number(reviewQueuePayload.status_counts.under_investigation || 0),
-        escalated: Number(reviewQueuePayload.status_counts.escalated || 0),
-        resolved: Number(reviewQueuePayload.status_counts.resolved || 0),
-        closed: Number(reviewQueuePayload.status_counts.closed || 0),
-      };
+
+  const currentReviewerIdentity = currentUser?.full_name || currentUser?.email || "";
+  const reviewerOptions = useMemo(() => {
+    const unique = new Set();
+    for (const row of reviewRows) {
+      if (row.assignedTo && row.assignedTo !== "Unassigned") unique.add(row.assignedTo);
     }
-    return buildQueueTabCounts(reviewRows);
-  }, [reviewQueuePayload, reviewRows]);
-  const filteredRows = useMemo(() => filterQueueRows(reviewRows, activeTab), [reviewRows, activeTab]);
+    return Array.from(unique).sort((a, b) => a.localeCompare(b));
+  }, [reviewRows]);
+
+  const baseFilteredRows = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase();
+    return reviewRows.filter((row) => {
+      const matchesSearch = !query || [
+        row.candidateName,
+        row.candidateEmail,
+        row.attemptId,
+        row.assessmentName,
+        row.caseId,
+      ].some((value) => String(value || "").toLowerCase().includes(query));
+
+      const matchesRisk = riskFilter === "all" || normalizeQueueRisk(row.risk) === riskFilter;
+      const matchesStatus = statusFilter === "all" || normalizeQueueStatus(row.queueStatus) === statusFilter;
+      const matchesAssigned = assignedFilter === "all"
+        || (assignedFilter === "unassigned" && row.assignedTo === "Unassigned")
+        || (assignedFilter === "me" && currentReviewerIdentity && row.assignedTo === currentReviewerIdentity)
+        || row.assignedTo === assignedFilter;
+
+      return matchesSearch && matchesRisk && matchesStatus && matchesAssigned;
+    });
+  }, [assignedFilter, currentReviewerIdentity, reviewRows, riskFilter, searchTerm, statusFilter]);
+
+  const tabCounts = useMemo(() => buildQueueTabCounts(baseFilteredRows), [baseFilteredRows]);
+  const filteredRows = useMemo(() => {
+    const tabbed = filterQueueRows(baseFilteredRows, activeTab);
+    return [...tabbed].sort((a, b) => compareQueueRows(a, b, sortKey));
+  }, [activeTab, baseFilteredRows, sortKey]);
+
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / rowsPerPage));
   const currentPage = Math.min(pageIndex, totalPages - 1);
   const pageRows = filteredRows.slice(currentPage * rowsPerPage, currentPage * rowsPerPage + rowsPerPage);
 
   const summary = {
-    highPriority: reviewRows.filter((row) => row.risk === "HIGH" && !isQueueResolvedStatus(row.queueStatus)).length,
-    mediumPriority: reviewRows.filter((row) => row.risk === "MEDIUM" && !isQueueResolvedStatus(row.queueStatus)).length,
-    newCases: reviewRows.filter((row) => row.queueStatus === "NEW").length,
-    underInvestigation: reviewRows.filter((row) => row.queueStatus === "UNDER_INVESTIGATION").length,
-    resolved: reviewRows.filter((row) => row.queueStatus === "RESOLVED").length,
+    highPriority: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "HIGH" && !isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length,
+    mediumPriority: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "MEDIUM" && !isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length,
+    newCases: reviewRows.filter((row) => normalizeQueueStatus(row.queueStatus) === "NEW").length,
+    underInvestigation: reviewRows.filter((row) => normalizeQueueStatus(row.queueStatus) === "UNDER_INVESTIGATION").length,
+    resolved: reviewRows.filter((row) => ["RESOLVED", "CLEARED", "FALSE_POSITIVE", "COMPLETED"].includes(normalizeQueueStatus(row.queueStatus))).length,
     total: reviewRows.length,
   };
 
   const queueHealth = [
     { label: "High", count: summary.highPriority, color: "#ff5f67" },
     { label: "Medium", count: summary.mediumPriority, color: "#ffb703" },
-    { label: "Low", count: reviewRows.filter((row) => row.risk === "LOW" && !isQueueResolvedStatus(row.queueStatus)).length, color: "#65d46e" },
-    { label: "Resolved", count: reviewRows.filter((row) => isQueueResolvedStatus(row.queueStatus)).length, color: "#4f8cff" },
+    { label: "Low", count: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "LOW" && !isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length, color: "#65d46e" },
+    { label: "Resolved", count: reviewRows.filter((row) => isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length, color: "#4f8cff" },
   ];
+
   const resolvedWithDates = Object.values(caseByAttemptId).filter((item) => item?.updated_at && item?.created_at && isResolvedCaseStatus(item.status));
   const avgReviewSeconds = resolvedWithDates.length
     ? resolvedWithDates.reduce((sum, item) => sum + (getSecondsBetween(item.created_at, item.updated_at) || 0), 0) / resolvedWithDates.length
@@ -1641,12 +1848,12 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
     return ageSeconds === null || ageSeconds / 3600 <= 24;
   }).length;
   const slaPercent = reviewRows.length ? Math.round((withinSla / reviewRows.length) * 100) : 100;
-  const reviewerMap = new Map();
-  for (const row of reviewRows) {
-    reviewerMap.set(row.assignedTo, (reviewerMap.get(row.assignedTo) || 0) + 1);
-  }
-  if (currentUser && reviewerMap.size === 0) reviewerMap.set(currentUser.full_name || currentUser.email, 0);
-  const topReviewers = Array.from(reviewerMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 4);
+  const topReviewers = reviewerOptions.length
+    ? reviewerOptions
+        .map((name) => [name, reviewRows.filter((row) => row.assignedTo === name).length])
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+    : (currentReviewerIdentity ? [[currentReviewerIdentity, 0]] : []);
 
   const summaryCards = [
     { title: "High Priority", value: summary.highPriority, subtitle: "Requires immediate attention", tone: "high", icon: <AlertTriangle size={20} /> },
@@ -1666,17 +1873,61 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
     { key: "closed", label: "Closed", count: tabCounts.closed },
   ];
 
+  useEffect(() => {
+    setPageIndex(0);
+  }, [activeTab, assignedFilter, riskFilter, rowsPerPage, searchTerm, sortKey, statusFilter]);
+
+  const clearFilters = () => {
+    setSearchTerm("");
+    setStatusFilter("all");
+    setRiskFilter("all");
+    setAssignedFilter("all");
+    setSortKey("priority_desc");
+    setActiveTab("all");
+    setPageIndex(0);
+  };
+
+  const handleRefresh = async () => {
+    try {
+      setRefreshing(true);
+      await Promise.resolve(onRefresh?.());
+    } finally {
+      setTimeout(() => setRefreshing(false), 250);
+    }
+  };
+
+  const handleScrollToFilters = () => {
+    const el = document.getElementById("review-queue-filters");
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
   return (
     <div className="review-queue-page">
       <div className="page-title-row">
         <div className="page-title-block">
           <h1>Review Queue</h1>
-          <p>Monitor and review all assessment attempts requiring investigation.</p>
+          <p>Prioritized investigation queue</p>
         </div>
         <div className="page-inline-actions">
-          <button className="toolbar-button" type="button"><User size={16} /> All Reviewers <ChevronDown size={14} /></button>
-          <button className="toolbar-button" type="button"><SlidersHorizontal size={16} /> Filters <ChevronDown size={14} /></button>
-          <button className="toolbar-button" onClick={onRefresh} type="button"><RefreshCw size={16} /> Refresh</button>
+          <label className="toolbar-select" htmlFor="queue-header-assigned">
+            <User size={16} />
+            <select id="queue-header-assigned" value={assignedFilter} onChange={(event) => setAssignedFilter(event.target.value)}>
+              <option value="all">All Reviewers</option>
+              <option value="unassigned">Unassigned</option>
+              {currentReviewerIdentity ? <option value="me">Me</option> : null}
+              {reviewerOptions.map((option) => (
+                <option key={option} value={option}>{option}</option>
+              ))}
+            </select>
+            <ChevronDown size={14} />
+          </label>
+          <button className="toolbar-button" onClick={handleScrollToFilters} type="button">
+            <SlidersHorizontal size={16} /> Filters
+          </button>
+          <button className="toolbar-button" onClick={() => void handleRefresh()} type="button" disabled={refreshing}>
+            <RefreshCw size={16} className={refreshing ? "spin-icon" : ""} />
+            {refreshing ? "Refreshing" : "Refresh"}
+          </button>
         </div>
       </div>
 
@@ -1694,17 +1945,83 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
         ))}
       </section>
 
-      <section className="enterprise-panel queue-table-shell">
+      <section className="enterprise-panel queue-table-shell review-queue-content">
+        <div className="queue-filter-toolbar" id="review-queue-filters">
+          <label className="queue-search-box" htmlFor="queue-search">
+            <Search size={16} />
+            <input
+              id="queue-search"
+              value={searchTerm}
+              onChange={(event) => setSearchTerm(event.target.value)}
+              placeholder="Search candidate, email, attempt, assessment, or case ID"
+            />
+          </label>
+
+          <div className="queue-filter-group">
+            <label className="queue-select-filter">
+              <span>Status</span>
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+                <option value="all">All Statuses</option>
+                <option value="NEW">New</option>
+                <option value="TRIAGED">Triaged</option>
+                <option value="UNDER_INVESTIGATION">Under Investigation</option>
+                <option value="ESCALATED">Escalated</option>
+                <option value="CLEARED">Cleared</option>
+                <option value="CONFIRMED_RISK">Confirmed Risk</option>
+                <option value="FALSE_POSITIVE">False Positive</option>
+                <option value="CLOSED">Closed</option>
+                <option value="COMPLETED">Completed</option>
+              </select>
+            </label>
+
+            <label className="queue-select-filter">
+              <span>Risk</span>
+              <select value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)}>
+                <option value="all">All Risks</option>
+                <option value="HIGH">High</option>
+                <option value="MEDIUM">Medium</option>
+                <option value="LOW">Low</option>
+              </select>
+            </label>
+
+            <label className="queue-select-filter">
+              <span>Assigned</span>
+              <select value={assignedFilter} onChange={(event) => setAssignedFilter(event.target.value)}>
+                <option value="all">All Reviewers</option>
+                <option value="unassigned">Unassigned</option>
+                {currentReviewerIdentity ? <option value="me">Me</option> : null}
+                {reviewerOptions.map((option) => (
+                  <option key={option} value={option}>{option}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="queue-select-filter">
+              <span>Sort</span>
+              <select value={sortKey} onChange={(event) => setSortKey(event.target.value)}>
+                <option value="priority_desc">Priority: High to Low</option>
+                <option value="score_desc">Risk Score: High to Low</option>
+                <option value="score_asc">Risk Score: Low to High</option>
+                <option value="last_newest">Last Activity: Newest</option>
+                <option value="last_oldest">Last Activity: Oldest</option>
+                <option value="status">Status</option>
+                <option value="candidate_name">Candidate Name</option>
+              </select>
+            </label>
+
+            <button className="toolbar-button secondary" onClick={clearFilters} type="button">
+              Clear Filters
+            </button>
+          </div>
+        </div>
+
         <div className="queue-tabs-row">
           <div className="queue-tabs">
             {tabs.map((tab) => (
               <button
                 className={`queue-tab ${activeTab === tab.key ? "active" : ""}`}
                 key={tab.key}
-                onClick={() => {
-                  setActiveTab(tab.key);
-                  setPageIndex(0);
-                }}
+                onClick={() => setActiveTab(tab.key)}
                 type="button"
               >
                 {tab.label}
@@ -1712,68 +2029,72 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
               </button>
             ))}
           </div>
-          <div className="queue-sort-control">Sort by: <button className="toolbar-button small" type="button">Priority (High to Low) <ChevronDown size={14} /></button></div>
+          <div className="queue-sort-control">{sortLabel(sortKey)}</div>
         </div>
 
         {caseAccessError ? <div className="workflow-message workflow-message-warning">{caseAccessError}</div> : null}
 
-        <div className="queue-enterprise-table">
-          <div className="queue-enterprise-head">
-            <span></span>
-            <span>Priority</span>
-            <span>Candidate / Attempt</span>
-            <span>Assessment</span>
-            <span>Risk Score</span>
-            <span>Risk Level</span>
-            <span>Status</span>
-            <span>Assigned To</span>
-            <span>Last Activity</span>
-            <span>Action</span>
-            <span></span>
-          </div>
+        <div className="queue-table-scroll">
+          <div className="queue-enterprise-table">
+            <div className="queue-enterprise-head">
+              <span></span>
+              <span>Priority</span>
+              <span>Candidate / Attempt</span>
+              <span>Assessment</span>
+              <span>Risk Score</span>
+              <span>Risk Level</span>
+              <span>Status</span>
+              <span>Assigned To</span>
+              <span>Last Activity</span>
+              <span>Action</span>
+              <span></span>
+            </div>
 
-          {pageRows.length === 0 ? (
-            <EmptyState text="No cases match the selected queue tab." />
-          ) : (
-            pageRows.map((row, index) => (
-              <div className="queue-enterprise-row" key={row.attemptId}>
-                <span><input type="checkbox" /></span>
-                <span className={`priority-index tone-${riskTone(row.risk)}`}>{row.priorityRank || currentPage * rowsPerPage + index + 1}</span>
-                <span className="queue-candidate-block">
-                  <span className="queue-candidate-avatar">{getInitials(row.candidateName)}</span>
-                  <span>
-                    <strong>{row.candidateName}</strong>
-                    <small>{row.attemptId}</small>
-                  </span>
-                </span>
-                <span className="queue-assessment-cell">{row.assessmentName}</span>
-                <span className="queue-score-cell">
-                  <strong>{formatNumber(row.score)}</strong>
-                  <MiniSparkline tone={riskTone(row.risk)} seed={`${row.attemptId}-${row.score}`} />
-                </span>
-                <span className={riskClass(row.risk)}>{row.risk}</span>
-                <span className={caseStatusClass(row.queueStatus)}>{row.queueStatus}</span>
-                <span>{row.assignedTo}</span>
-                <span className="queue-last-activity">
-                  <strong>{formatDateTime(row.lastActivity)}</strong>
-                  <small>{formatRelativeTime(row.lastActivity)}</small>
-                </span>
-                <span>
-                  <button
-                    className="action-link-button"
-                    onClick={() => {
-                      setSelected(row.item || logs.find((item) => item.attempt_id === row.attemptId) || null);
-                      setPage("report");
-                    }}
-                    type="button"
-                  >
-                    View
-                  </button>
-                </span>
-                <span><MoreVertical size={16} /></span>
+            {pageRows.length === 0 ? (
+              <div className="queue-empty-shell">
+                <EmptyState text={reviewRows.length ? "No cases found for this search/filter. Try clearing filters." : "No review cases yet."} />
               </div>
-            ))
-          )}
+            ) : (
+              pageRows.map((row, index) => (
+                <div className="queue-enterprise-row" key={row.caseId || row.attemptId}>
+                  <span><input type="checkbox" aria-label={`Select ${row.attemptId}`} /></span>
+                  <span className={`priority-index tone-${riskTone(row.risk)}`}>{row.priorityRank || currentPage * rowsPerPage + index + 1}</span>
+                  <span className="queue-candidate-block">
+                    <span className="queue-candidate-avatar">{getInitials(row.candidateName || row.attemptId)}</span>
+                    <span>
+                      <strong>{row.candidateName || row.attemptId}</strong>
+                      <small>{row.attemptId}</small>
+                    </span>
+                  </span>
+                  <span className="queue-assessment-cell">{row.assessmentName || "Unknown Assessment"}</span>
+                  <span className="queue-score-cell">
+                    <strong>{Number.isFinite(Number(row.score)) ? formatNumber(row.score) : "—"}</strong>
+                    <MiniSparkline tone={riskTone(row.risk)} seed={`${row.attemptId}-${row.score}`} />
+                  </span>
+                  <span className={riskClass(normalizeQueueRisk(row.risk))}>{normalizeQueueRisk(row.risk)}</span>
+                  <span className={caseStatusClass(normalizeQueueStatus(row.queueStatus))}>{normalizeQueueStatus(row.queueStatus)}</span>
+                  <span>{row.assignedTo || "Unassigned"}</span>
+                  <span className="queue-last-activity">
+                    <strong>{row.lastActivity ? formatDateTime(row.lastActivity) : "—"}</strong>
+                    <small>{row.lastActivity ? formatRelativeTime(row.lastActivity) : "No activity"}</small>
+                  </span>
+                  <span>
+                    <button
+                      className="action-link-button"
+                      onClick={() => {
+                        setSelected(row.item || logs.find((item) => item.attempt_id === row.attemptId) || null);
+                        setPage("report");
+                      }}
+                      type="button"
+                    >
+                      View
+                    </button>
+                  </span>
+                  <span><MoreVertical size={16} /></span>
+                </div>
+              ))
+            )}
+          </div>
         </div>
 
         <div className="queue-pagination-row">
@@ -1786,13 +2107,20 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
             {totalPages > 1 ? <button className="pagination-btn" onClick={() => setPageIndex((value) => Math.min(totalPages - 1, value + 1))} type="button">{Math.min(totalPages, currentPage + 2)}</button> : null}
             <button className="pagination-btn" disabled={currentPage >= totalPages - 1} onClick={() => setPageIndex((value) => Math.min(totalPages - 1, value + 1))} type="button">›</button>
           </div>
-          <span className="rows-per-page">Rows per page: <button className="toolbar-button small" type="button">10 <ChevronDown size={14} /></button></span>
+          <label className="rows-per-page">
+            Rows per page:
+            <select value={rowsPerPage} onChange={(event) => setRowsPerPage(Number(event.target.value))}>
+              <option value={10}>10</option>
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+            </select>
+          </label>
         </div>
       </section>
 
-      <section className="queue-bottom-grid">
-        <div className="enterprise-panel">
-          <PanelHeader title="Queue Health" />
+      <section className="enterprise-panel review-analytics-panel">
+        <div className="review-analytics-section">
+          <div className="review-analytics-title">Queue Health</div>
           <div className="distribution-panel">
             <div className="distribution-donut-wrap">
               <div
@@ -1812,21 +2140,23 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
           <div className="panel-caption">Total {summary.total}</div>
         </div>
 
-        <div className="enterprise-panel">
-          <PanelHeader title="SLA Compliance" />
+        <div className="review-analytics-section">
+          <div className="review-analytics-title">SLA Compliance</div>
           <div className="sla-card">
             <div className="sla-ring" style={buildDonutStyle([{ value: slaPercent, color: "#65d46e" }, { value: Math.max(0, 100 - slaPercent), color: "rgba(255,255,255,0.08)" }])}>
               <span>{slaPercent}%</span>
             </div>
             <div className="sla-copy">
-              <strong>Within SLA {withinSla}</strong>
+              <strong>On Track</strong>
+              <small>Within SLA {withinSla}</small>
               <small>Breached SLA {Math.max(0, reviewRows.length - withinSla)}</small>
+              <small>Target: 90%</small>
             </div>
           </div>
         </div>
 
-        <div className="enterprise-panel">
-          <PanelHeader title="Average Review Time" />
+        <div className="review-analytics-section">
+          <div className="review-analytics-title">Average Review Time</div>
           <div className="avg-time-card">
             <div className="avg-time-circle"><Clock3 size={22} /></div>
             <div>
@@ -1836,8 +2166,8 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
           </div>
         </div>
 
-        <div className="enterprise-panel">
-          <PanelHeader title="Top Reviewers" />
+        <div className="review-analytics-section">
+          <div className="review-analytics-title">Top Reviewers</div>
           <div className="top-reviewer-list">
             {topReviewers.map(([name, count]) => (
               <div className="top-reviewer-row" key={name}>
@@ -2002,6 +2332,12 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
     lastEvent,
     durationSeconds,
   });
+  const headerMetadata = [
+    { label: "Assessment", value: getAssessmentName(reportAttempt) },
+    { label: "Attempt ID", value: reportAttempt?.attempt_id || "—" },
+    { label: "Started", value: formatDateTime(firstEvent) },
+    { label: "Duration", value: formatDuration(durationSeconds) },
+  ];
   const chartData = riskHistory.map((item) => ({
     ...item,
     label: formatTime(item.timestamp).slice(0, 5),
@@ -2010,118 +2346,268 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
   }));
 
   return (
-    <section className={`investigation-report-shell report-${riskTone(displayRisk)}`}>
-      <div className="report-toolbar">
-        <button className="back-link-btn" onClick={onBack} type="button">
-          <ArrowLeft size={16} />
-          Back to Review Queue
-        </button>
-      </div>
+    <div className="report-scroll-container">
+      <section className={`investigation-page investigation-report-shell report-${riskTone(displayRisk)}`}>
+        <div className="report-toolbar">
+          <button className="back-link-btn" onClick={onBack} type="button">
+            <ArrowLeft size={16} />
+            Back to Review Queue
+          </button>
+        </div>
 
-      <InvestigationHeader
-        candidateName={candidateName}
-        candidateEmail={candidateEmail}
-        initials={getInitials(candidateName)}
-        risk={displayRisk}
-        status={status}
-        finalDecision={finalDecision}
-        summaryText={summaryText}
-        strongestReason={strongestReason}
-        explanation={whyScoreText}
-        score={formatNumber(displayScore)}
-        confidence={formatNumber(displayConfidence)}
-        confidenceLabel={getConfidenceLabel(displayConfidence)}
-      />
-
-      <ViolationOverview items={overviewItems} />
-
-      <div className="investigation-main-grid">
-        <EvidenceTable rows={evidenceRows} />
-        <ReviewerWorkflow
-          caseStatus={caseStatus}
-          assignedReviewer={assignedReviewer}
-          caseId={activeCase?.id}
-          workflowNote={workflowNote}
-          onWorkflowNoteChange={setWorkflowNote}
-          workflowBusy={workflowBusy}
-          workflowMessage={workflowMessage}
-          caseAccessError={caseAccessError}
-          actionHistory={actionHistory}
-          onAssign={() => void runCaseAction("assign", {})}
-          onAddNote={() => void runCaseAction("notes", { comment: workflowNote })}
-          onEscalate={() => void runCaseAction("transition", { new_status: "ESCALATED", comment: "Escalated from investigation console" })}
-          onConfirmRisk={() => void runCaseAction("transition", { new_status: "CONFIRMED_RISK", comment: "Confirmed risk from investigation console" })}
-          onFalsePositive={() => void runCaseAction("transition", { new_status: "FALSE_POSITIVE", comment: "Marked false positive from investigation console" })}
+        <InvestigationHeader
+          candidateName={candidateName}
+          candidateEmail={candidateEmail}
+          initials={getInitials(candidateName)}
+          risk={displayRisk}
+          status={status}
+          finalDecision={finalDecision}
+          summaryText={summaryText}
+          strongestReason={strongestReason}
+          explanation={whyScoreText}
+          score={formatNumber(displayScore)}
+          confidence={formatNumber(displayConfidence)}
+          confidenceLabel={getConfidenceLabel(displayConfidence)}
+          metadataItems={headerMetadata}
         />
-      </div>
 
-      <div className="investigation-footer-grid">
-        <RiskHistoryChart data={chartData} loading={reportLoading} />
-        <TechnicalDetails items={technicalDetails} />
-      </div>
-    </section>
+        <ViolationOverview items={overviewItems} />
+
+        <div className="report-main-row investigation-main-grid">
+          <EvidenceTable rows={[...evidenceRows].sort((a, b) => {
+            const severityDelta = severityRank(b.severity) - severityRank(a.severity);
+            if (severityDelta !== 0) return severityDelta;
+            const priorityDelta = evidencePriority(b) - evidencePriority(a);
+            if (priorityDelta !== 0) return priorityDelta;
+            const countDelta = Number(b.count || 0) - Number(a.count || 0);
+            if (countDelta !== 0) return countDelta;
+            const impactDelta = Number(b.relatedEventCount || 0) - Number(a.relatedEventCount || 0);
+            if (impactDelta !== 0) return impactDelta;
+            const aTime = a.lastSeen ? new Date(a.lastSeen).getTime() : 0;
+            const bTime = b.lastSeen ? new Date(b.lastSeen).getTime() : 0;
+            return bTime - aTime;
+          })} />
+          <ReviewerWorkflow
+            caseStatus={caseStatus}
+            assignedReviewer={assignedReviewer}
+            caseId={activeCase?.id}
+            workflowNote={workflowNote}
+            onWorkflowNoteChange={setWorkflowNote}
+            workflowBusy={workflowBusy}
+            workflowMessage={workflowMessage}
+            caseAccessError={caseAccessError}
+            actionHistory={actionHistory}
+            onAssign={() => void runCaseAction("assign", {})}
+            onAddNote={() => void runCaseAction("notes", { comment: workflowNote })}
+            onEscalate={() => void runCaseAction("transition", { new_status: "ESCALATED", comment: "Escalated from investigation console" })}
+            onConfirmRisk={() => void runCaseAction("transition", { new_status: "CONFIRMED_RISK", comment: "Confirmed risk from investigation console" })}
+            onFalsePositive={() => void runCaseAction("transition", { new_status: "FALSE_POSITIVE", comment: "Marked false positive from investigation console" })}
+          />
+        </div>
+
+        <div className="report-bottom-row investigation-footer-grid">
+          <RiskHistoryChart data={chartData} loading={reportLoading} />
+          <TechnicalDetails items={technicalDetails} />
+        </div>
+      </section>
+    </div>
   );
 }
 
-function SettingsPage({ currentUser, apiBaseUrl, wsConnected }) {
+function SettingsPage({
+  currentUser,
+  apiBaseUrl,
+  wsConnected,
+  themeMode,
+  onThemeModeChange,
+  autoRefreshInterval,
+  onAutoRefreshIntervalChange,
+  liveUpdatesEnabled,
+  onLiveUpdatesEnabledChange,
+  notificationsEnabled,
+  onNotificationsEnabledChange,
+}) {
+  const sessionState = currentUser ? "Authenticated" : "Signed out";
+  const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "System default";
+  const appVersion = import.meta.env.VITE_APP_VERSION || "Demo Build";
+  const wsStatus = wsConnected ? "Connected" : liveUpdatesEnabled ? "Reconnecting" : "Paused";
+
   return (
     <div className="settings-page">
       <div className="page-title-block">
         <span className="page-kicker">DEMO ENVIRONMENT</span>
         <h1>Settings</h1>
-        <p>Review account, environment, privacy, and upcoming administration controls.</p>
+        <p>Manage your account, environment, and platform preferences.</p>
       </div>
 
-      <section className="settings-grid">
-        <div className="enterprise-panel settings-card">
-          <PanelHeader title="Profile / Account" />
-          <div className="settings-profile">
+      <section className="settings-dashboard-grid">
+        <SettingsDashboardCard
+          title="Profile & Account"
+          subtitle="Authenticated operator profile and current session details."
+          className="settings-profile-card"
+        >
+          <div className="settings-profile-hero">
             <span className="settings-avatar">{getInitials(currentUser?.full_name || currentUser?.email)}</span>
-            <div>
+            <div className="settings-profile-copy">
               <strong>{currentUser?.full_name || currentUser?.email || "Reviewer"}</strong>
               <p>{currentUser?.email || "No email available"}</p>
-              <small>Role: {currentUser?.role || "reviewer"}</small>
+              <small>{currentUser?.role || "reviewer"}</small>
             </div>
+            <span className="settings-role-badge">{(currentUser?.role || "reviewer").toUpperCase()}</span>
           </div>
-        </div>
 
-        <div className="enterprise-panel settings-card">
-          <PanelHeader title="Environment" />
           <div className="settings-list">
-            <SettingsRow label="System Mode" value="Local Demo" />
+            <SettingsRow label="Session State" value={sessionState} />
+            <SettingsRow label="Authenticated" value={currentUser ? "Yes" : "No"} />
+            <SettingsRow label="Last Login" value="Today, current session" />
+          </div>
+
+          <div className="settings-card-footer">
+            <button className="settings-secondary-btn" type="button" disabled>
+              <User size={14} /> Manage Profile
+            </button>
+          </div>
+        </SettingsDashboardCard>
+
+        <SettingsDashboardCard
+          title="Environment"
+          subtitle="Local runtime diagnostics and operator context."
+        >
+          <div className="settings-list">
             <SettingsRow label="API Base URL" value={apiBaseUrl} />
-            <SettingsRow label="WebSocket Stream" value={wsConnected ? "Connected" : "Disconnected"} />
-            <SettingsRow label="Reviewer Workflow" value="Enabled" />
+            <SettingsRow label="App Version" value={appVersion} />
+            <SettingsRow label="Mode" value="Local Demo" />
+            <SettingsRow label="WebSocket" value={wsStatus} />
+            <SettingsRow label="Current Role" value={currentUser?.role || "reviewer"} />
           </div>
-        </div>
 
-        <div className="enterprise-panel settings-card">
-          <PanelHeader title="Privacy Summary" />
-          <div className="settings-list">
-            <SettingsRow label="Webcam" value="Not used" />
-            <SettingsRow label="Audio" value="Not recorded" />
-            <SettingsRow label="Screen Recording" value="Disabled" />
-            <SettingsRow label="Clipboard Content" value="Content not stored" />
+          <div className="settings-card-footer">
+            <button className="settings-secondary-btn" type="button" disabled>
+              <ClipboardList size={14} /> Copy Diagnostics
+            </button>
           </div>
-        </div>
+        </SettingsDashboardCard>
 
-        <div className="enterprise-panel settings-card">
-          <PanelHeader title="Coming Soon" />
-          <div className="coming-soon-grid">
+        <SettingsDashboardCard
+          title="Privacy & Data"
+          subtitle="Privacy-first protections enforced in this demo environment."
+        >
+          <div className="settings-status-list">
             {[
-              "Organization settings",
-              "Reviewer management",
-              "WebSocket auth controls",
-              "Report export configuration",
+              "No webcam access",
+              "No audio recording",
+              "No screen recording",
+              "Clipboard content not stored",
+              "Only behavioral signals analyzed",
+              "All data stays local for demo",
             ].map((item) => (
-              <div className="coming-soon-item" key={item}>
-                <Settings size={16} />
+              <div className="settings-status-item" key={item}>
+                <span className="settings-status-icon"><CheckCircle2 size={14} /></span>
                 <span>{item}</span>
-                <small>Future work</small>
               </div>
             ))}
           </div>
-        </div>
+        </SettingsDashboardCard>
+
+        <SettingsDashboardCard
+          title="System Preferences"
+          subtitle="Control how the console behaves in this browser."
+        >
+          <div className="settings-controls">
+            <SettingsControl
+              label="Theme"
+              help="Persisted locally for this browser."
+              control={(
+                <select value={themeMode} onChange={(event) => onThemeModeChange(event.target.value)}>
+                  <option value="dark">Dark</option>
+                  <option value="midnight">Midnight</option>
+                </select>
+              )}
+            />
+            <SettingsControl
+              label="Live Updates"
+              help="Enable or pause websocket-driven updates."
+              control={(
+                <button
+                  className={`settings-toggle ${liveUpdatesEnabled ? "enabled" : ""}`}
+                  onClick={() => onLiveUpdatesEnabledChange(!liveUpdatesEnabled)}
+                  type="button"
+                >
+                  <span></span>
+                  {liveUpdatesEnabled ? "On" : "Off"}
+                </button>
+              )}
+            />
+            <SettingsControl
+              label="Notifications"
+              help="Stored locally for this device."
+              control={(
+                <button
+                  className={`settings-toggle ${notificationsEnabled ? "enabled" : ""}`}
+                  onClick={() => onNotificationsEnabledChange(!notificationsEnabled)}
+                  type="button"
+                >
+                  <span></span>
+                  {notificationsEnabled ? "On" : "Off"}
+                </button>
+              )}
+            />
+            <SettingsControl
+              label="Auto Refresh"
+              help="Choose how often data refreshes automatically."
+              control={(
+                <select value={autoRefreshInterval} onChange={(event) => onAutoRefreshIntervalChange(event.target.value)}>
+                  <option value="0">Off</option>
+                  <option value="15">15s</option>
+                  <option value="30">30s</option>
+                  <option value="60">60s</option>
+                </select>
+              )}
+            />
+            <SettingsControl label="Time Zone" help="Detected from your browser." control={<div className="settings-static-value">{browserTimeZone}</div>} />
+          </div>
+        </SettingsDashboardCard>
+
+        <SettingsDashboardCard
+          title="Reviewer Tools"
+          subtitle="Operational defaults and shortcuts for future workflow tooling."
+        >
+          <div className="settings-placeholder-list">
+            {[
+              ["Queue View Defaults", "Saved case filters and sort presets"],
+              ["Investigation Defaults", "Preferred evidence, chart, and history defaults"],
+              ["Action Shortcuts", "Quick reviewer actions and keyboard mapping"],
+              ["Export Settings", "Report packaging and redaction controls"],
+            ].map(([title, text]) => (
+              <div className="settings-placeholder-item" key={title}>
+                <div>
+                  <strong>{title}</strong>
+                  <small>{text}</small>
+                </div>
+                <span className="settings-soon-tag">Coming soon</span>
+              </div>
+            ))}
+          </div>
+        </SettingsDashboardCard>
+
+        <SettingsDashboardCard
+          title="About"
+          subtitle="Platform identity and operating posture."
+        >
+          <div className="settings-list">
+            <SettingsRow label="Platform" value="ProctorIQ Platform" />
+            <SettingsRow label="Capability" value="Real-Time Risk Intelligence" />
+            <SettingsRow label="Purpose" value="Assessment Integrity Monitoring" />
+            <SettingsRow label="Compliance" value="Privacy-first, no content capture" />
+            <SettingsRow label="Support" value="Contact administrator" />
+          </div>
+
+          <div className="settings-card-footer">
+            <button className="settings-secondary-btn" type="button" disabled>
+              <RefreshCw size={14} /> Check for Updates
+            </button>
+          </div>
+        </SettingsDashboardCard>
       </section>
     </div>
   );
@@ -2149,14 +2635,18 @@ function MiniSparkline({ tone = "low", seed }) {
   );
 }
 
-function PanelHeader({ title, subtitle, actionLabel }) {
+function PanelHeader({ title, subtitle, actionLabel, onActionClick, actionDisabled = false }) {
   return (
     <div className="panel-header-row">
       <div>
         <h3>{title}</h3>
         {subtitle ? <p>{subtitle}</p> : null}
       </div>
-      {actionLabel ? <button className="panel-header-action" type="button">{actionLabel}</button> : null}
+      {actionLabel ? (
+        <button className="panel-header-action" disabled={actionDisabled} onClick={onActionClick} type="button">
+          {actionLabel}
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -2189,6 +2679,85 @@ function SettingsRow({ label, value }) {
   );
 }
 
+function SettingsControl({ label, help, control }) {
+  return (
+    <div className="settings-control-row">
+      <div>
+        <strong>{label}</strong>
+        <p>{help}</p>
+      </div>
+      <div className="settings-control-slot">{control}</div>
+    </div>
+  );
+}
+
+function SettingsDashboardCard({ title, subtitle, className = "", children }) {
+  return (
+    <div className={`enterprise-panel settings-card settings-dashboard-card ${className}`.trim()}>
+      <div className="panel-header-row settings-panel-header">
+        <div>
+          <h3>{title}</h3>
+          {subtitle ? <p>{subtitle}</p> : null}
+        </div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function ProctorIQLogo({ className = "" }) {
+  return (
+    <svg className={className} viewBox="0 0 64 64" aria-hidden="true">
+      <defs>
+        <linearGradient id="proctoriq-shield-gradient" x1="12%" y1="10%" x2="88%" y2="92%">
+          <stop offset="0%" stopColor="#6d5dfc" />
+          <stop offset="100%" stopColor="#60a5fa" />
+        </linearGradient>
+        <radialGradient id="proctoriq-glow-gradient" cx="38%" cy="30%" r="76%">
+          <stop offset="0%" stopColor="rgba(255,255,255,0.38)" />
+          <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+        </radialGradient>
+      </defs>
+      <rect x="4" y="4" width="56" height="56" rx="18" fill="url(#proctoriq-glow-gradient)" opacity="0.28" />
+      <path
+        d="M32 8 49 13.5v15.7c0 11.4-6.2 20.8-17 27.4C21.2 50 15 40.6 15 29.2V13.5L32 8Z"
+        fill="rgba(10,16,31,0.18)"
+        stroke="url(#proctoriq-shield-gradient)"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M32 16 43 19.6v10.2c0 7.7-4.1 14.2-11 19.1-6.9-4.9-11-11.4-11-19.1V19.6L32 16Z"
+        fill="url(#proctoriq-shield-gradient)"
+        opacity="0.95"
+      />
+      <path
+        d="m25.2 31.9 5.1 5.2 10.6-12"
+        fill="none"
+        stroke="#f8fbff"
+        strokeWidth="3.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M41.5 18.5c4.8 1.2 8.7 4.8 10 9.5"
+        fill="none"
+        stroke="#a5b4fc"
+        strokeWidth="2"
+        strokeLinecap="round"
+        opacity="0.72"
+      />
+      <path
+        d="M41.8 24c2.4.8 4.2 2.5 5 4.8"
+        fill="none"
+        stroke="#c4b5fd"
+        strokeWidth="2"
+        strokeLinecap="round"
+        opacity="0.9"
+      />
+    </svg>
+  );
+}
+
 function LoginPage({ onLogin, loading, error }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -2196,8 +2765,9 @@ function LoginPage({ onLogin, loading, error }) {
   return (
     <div className="login-page">
       <div className="login-card">
-        <div className="brand-mark"><ShieldAlert size={24} /></div>
-        <h1>RiskIntel Console</h1>
+        <ProctorIQLogo className="brand-mark brand-mark-proctoriq" />
+        <h1>ProctorIQ</h1>
+        <p className="login-subtitle">Assessment Integrity Console</p>
         <p className="muted">Sign in to access the review queue and investigation reports.</p>
 
         <div className="login-form">

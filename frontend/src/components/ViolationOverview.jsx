@@ -23,7 +23,7 @@ const ICONS = {
 
 export default function ViolationOverview({ items }) {
   return (
-    <section className="investigation-card">
+    <section className="investigation-card violation-overview-section">
       <div className="report-card-head">
         <h3>Violation Overview</h3>
       </div>
