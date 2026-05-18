@@ -33,6 +33,7 @@ import {
   Radio,
   ChevronDown,
   ArrowUpRight,
+  FileDown,
 } from "lucide-react";
 
 import "./App.css";
@@ -945,6 +946,66 @@ function sortLabel(sortKey) {
   return "Priority: High to Low";
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatWorkflowStatus(value) {
+  return String(value || "—")
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function buildRiskHistorySvg(points = []) {
+  if (!points.length) {
+    return `<div class="pdf-empty">No risk history points are available for this attempt yet.</div>`;
+  }
+
+  const width = 700;
+  const height = 220;
+  const padLeft = 42;
+  const padRight = 18;
+  const padTop = 18;
+  const padBottom = 36;
+  const plotWidth = width - padLeft - padRight;
+  const plotHeight = height - padTop - padBottom;
+  const maxIndex = Math.max(1, points.length - 1);
+  const toX = (index) => padLeft + (plotWidth * index) / maxIndex;
+  const toY = (score) => padTop + plotHeight - plotHeight * Math.max(0, Math.min(1, Number(score || 0)));
+  const path = points.map((point, index) => `${index === 0 ? "M" : "L"} ${toX(index)} ${toY(point.score)}`).join(" ");
+  const markers = points.map((point, index) => `<circle cx="${toX(index)}" cy="${toY(point.score)}" r="4.5" fill="#ff7b57" stroke="#fff7f1" stroke-width="1.4" />`).join("");
+  const labels = points.map((point, index) => {
+    if (!(index === 0 || index === points.length - 1 || index === Math.floor((points.length - 1) / 2))) return "";
+    return `<text x="${toX(index)}" y="${height - 12}" text-anchor="middle" font-size="11" fill="#475569">${escapeHtml(point.label || formatChartTime(point.timestamp, "Time"))}</text>`;
+  }).join("");
+
+  return `
+    <svg width="100%" viewBox="0 0 ${width} ${height}" role="img" aria-label="Risk history chart">
+      <rect x="${padLeft}" y="${padTop}" width="${plotWidth}" height="${plotHeight * 0.3}" fill="rgba(255,77,109,0.08)" />
+      <rect x="${padLeft}" y="${padTop + plotHeight * 0.3}" width="${plotWidth}" height="${plotHeight * 0.3}" fill="rgba(255,183,3,0.08)" />
+      <rect x="${padLeft}" y="${padTop + plotHeight * 0.6}" width="${plotWidth}" height="${plotHeight * 0.4}" fill="rgba(34,197,94,0.07)" />
+      <line x1="${padLeft}" y1="${padTop}" x2="${padLeft}" y2="${padTop + plotHeight}" stroke="#cbd5e1" stroke-width="1" />
+      <line x1="${padLeft}" y1="${padTop + plotHeight}" x2="${padLeft + plotWidth}" y2="${padTop + plotHeight}" stroke="#cbd5e1" stroke-width="1" />
+      <line x1="${padLeft}" y1="${padTop + plotHeight * 0.3}" x2="${padLeft + plotWidth}" y2="${padTop + plotHeight * 0.3}" stroke="#e2e8f0" stroke-dasharray="4 4" stroke-width="0.8" />
+      <line x1="${padLeft}" y1="${padTop + plotHeight * 0.6}" x2="${padLeft + plotWidth}" y2="${padTop + plotHeight * 0.6}" stroke="#e2e8f0" stroke-dasharray="4 4" stroke-width="0.8" />
+      <path d="${path}" fill="none" stroke="#ff7b57" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+      ${markers}
+      <text x="8" y="${padTop + 6}" font-size="11" fill="#475569">1.00</text>
+      <text x="8" y="${padTop + plotHeight * 0.32}" font-size="11" fill="#475569">0.70</text>
+      <text x="8" y="${padTop + plotHeight * 0.62}" font-size="11" fill="#475569">0.40</text>
+      <text x="8" y="${padTop + plotHeight + 4}" font-size="11" fill="#475569">0.00</text>
+      ${labels}
+    </svg>
+  `;
+}
+
 function buildDonutStyle(segments) {
   let cursor = 0;
   const stops = segments.map((segment) => {
@@ -1482,6 +1543,7 @@ export default function App() {
             selectedCase={selectedCase}
             caseAccessError={caseAccessError}
             token={token}
+            currentUser={currentUser}
             onUnauthorized={logout}
             onCaseAction={performCaseAction}
             onBack={() => setPage("queue")}
@@ -2184,7 +2246,7 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
     </div>
   );
 }
-function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthorized, onCaseAction, onBack }) {
+function ReportPage({ selected, selectedCase, caseAccessError, token, currentUser, onUnauthorized, onCaseAction, onBack }) {
   const [events, setEvents] = useState([]);
   const [riskHistory, setRiskHistory] = useState([]);
   const [liveRisk, setLiveRisk] = useState(null);
@@ -2194,6 +2256,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
   const [workflowNote, setWorkflowNote] = useState("");
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [workflowMessage, setWorkflowMessage] = useState("");
+  const [exportingPdf, setExportingPdf] = useState(false);
 
   useEffect(() => {
     async function fetchReportData() {
@@ -2344,6 +2407,320 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
     score: item.score ?? item.combined_score,
     risk_level: item.risk_level || item.risk,
   }));
+  const sortedEvidenceRows = [...evidenceRows].sort((a, b) => {
+    const severityDelta = severityRank(b.severity) - severityRank(a.severity);
+    if (severityDelta !== 0) return severityDelta;
+    const priorityDelta = evidencePriority(b) - evidencePriority(a);
+    if (priorityDelta !== 0) return priorityDelta;
+    const countDelta = Number(b.count || 0) - Number(a.count || 0);
+    if (countDelta !== 0) return countDelta;
+    const impactDelta = Number(b.relatedEventCount || 0) - Number(a.relatedEventCount || 0);
+    if (impactDelta !== 0) return impactDelta;
+    const aTime = a.lastSeen ? new Date(a.lastSeen).getTime() : 0;
+    const bTime = b.lastSeen ? new Date(b.lastSeen).getTime() : 0;
+    return bTime - aTime;
+  });
+  const topEvidenceRows = sortedEvidenceRows.slice(0, 5);
+  const canExportPdf = ["ADMIN", "REVIEWER"].includes(String(currentUser?.role || "").toUpperCase());
+
+  const handleExportPdf = useCallback(async () => {
+    if (!canExportPdf) return;
+    if (!selected?.attempt_id) {
+      console.warn("[Investigation PDF Export] No attempt is selected for export.");
+      setWorkflowMessage("Select a case before exporting the investigation report.");
+      return;
+    }
+    if (reportLoading) {
+      console.warn("[Investigation PDF Export] Report data is still loading.");
+      setWorkflowMessage("Report data is still loading. Please wait and try again.");
+      return;
+    }
+    if (!liveRisk && !reportData) {
+      console.warn("[Investigation PDF Export] Report data is unavailable for export.");
+      setWorkflowMessage("Unable to export yet because the investigation report data is unavailable.");
+      return;
+    }
+
+    try {
+      setExportingPdf(true);
+      setWorkflowMessage("");
+      const fileName = `investigation_${selected.attempt_id}.pdf`;
+      const generatedAt = new Date().toLocaleString();
+      const violationOverviewHtml = overviewItems.map((item) => `
+        <div class="pdf-mini-card">
+          <div class="pdf-mini-label">${escapeHtml(item.title)}</div>
+          <div class="pdf-mini-value">${escapeHtml(item.value)}</div>
+          <div class="pdf-mini-subtle">${escapeHtml(item.severityLabel || severityLabel(item.severity))}</div>
+        </div>
+      `).join("");
+      const evidenceHtml = topEvidenceRows.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.title)}</td>
+          <td>${escapeHtml(row.severity)}</td>
+          <td>${escapeHtml(row.countDisplay ?? row.count ?? "—")}</td>
+          <td>${escapeHtml(row.impactLabel || "—")}</td>
+          <td>${escapeHtml(row.subtitle || row.details || "—")}</td>
+        </tr>
+      `).join("");
+      const historyHtml = actionHistory.length
+        ? actionHistory.map((action) => `
+            <div class="pdf-history-item">
+              <strong>${escapeHtml(action.action_type || "Action")}</strong>
+              <div>${escapeHtml(formatWorkflowStatus(action.previous_status))} → ${escapeHtml(formatWorkflowStatus(action.new_status || action.previous_status))}</div>
+              <p>${escapeHtml(action.comment || "No reviewer comment provided.")}</p>
+              <small>${escapeHtml(action.reviewer_name || action.reviewer_email || `Reviewer ${action.reviewer_id}`)} • ${escapeHtml(formatDateTime(action.created_at))}</small>
+            </div>
+          `).join("")
+        : `<div class="pdf-empty">No reviewer workflow actions recorded yet.</div>`;
+      const technicalHtml = technicalDetails.map((item) => `
+        <div class="pdf-detail-row">
+          <span>${escapeHtml(item.label)}</span>
+          <strong>${escapeHtml(item.value)}</strong>
+        </div>
+      `).join("");
+      const chartSvg = buildRiskHistorySvg(chartData);
+      const printWindow = window.open("", `investigation-export-${selected.attempt_id}`, "width=1100,height=900");
+      if (!printWindow) {
+        setWorkflowMessage("Export popup was blocked by the browser. Please allow popups and try again.");
+        return;
+      }
+
+      printWindow.document.open();
+      printWindow.document.write(`
+        <!doctype html>
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>${escapeHtml(fileName)}</title>
+            <style>
+              body {
+                margin: 0;
+                min-height: 100vh;
+                display: grid;
+                place-items: center;
+                background: #f8fafc;
+                color: #0f172a;
+                font-family: "Segoe UI", Arial, sans-serif;
+              }
+              .pdf-loading {
+                padding: 24px 28px;
+                border: 1px solid #dbe3f1;
+                border-radius: 18px;
+                background: #ffffff;
+                box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+                text-align: center;
+              }
+              .pdf-loading strong {
+                display: block;
+                margin-bottom: 8px;
+                font-size: 18px;
+              }
+              .pdf-loading span {
+                color: #475569;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="pdf-loading">
+              <strong>Preparing Investigation Report</strong>
+              <span>Rendering the printable export for ${escapeHtml(selected.attempt_id)}...</span>
+            </div>
+          </body>
+        </html>
+      `);
+      printWindow.document.close();
+
+      const html = `
+        <!doctype html>
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>${escapeHtml(fileName)}</title>
+            <style>
+              @page { size: A4; margin: 18mm 14mm; }
+              * { box-sizing: border-box; }
+              body { margin: 0; font-family: "Segoe UI", Arial, sans-serif; color: #0f172a; background: #ffffff; }
+              .pdf-shell { padding: 8px 0 18px; }
+              .pdf-header { display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; margin-bottom: 18px; }
+              .pdf-brand { color: #6366f1; font-size: 12px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
+              .pdf-title { margin: 6px 0 4px; font-size: 28px; color: #0f172a; }
+              .pdf-subtitle { margin: 0; color: #475569; line-height: 1.45; }
+              .pdf-summary-card, .pdf-section { border: 1px solid #dbe3f1; border-radius: 16px; background: #fff; }
+              .pdf-summary-card { padding: 18px; }
+              .pdf-badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+              .pdf-badge { display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border-radius: 999px; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+              .pdf-badge.risk { background: #eef2ff; color: #4f46e5; }
+              .pdf-badge.status { background: #ecfeff; color: #0f766e; }
+              .pdf-meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; margin-top: 14px; }
+              .pdf-meta div span, .pdf-detail-row span { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+              .pdf-meta div strong, .pdf-detail-row strong { display: block; font-size: 14px; color: #0f172a; line-height: 1.35; }
+              .pdf-scoreboard { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+              .pdf-score-item { padding: 14px; border-radius: 14px; background: #f8fafc; border: 1px solid #e2e8f0; }
+              .pdf-score-item span { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
+              .pdf-score-item strong { display: block; margin-top: 8px; font-size: 20px; color: #0f172a; }
+              .pdf-section { padding: 16px 18px; margin-top: 16px; page-break-inside: avoid; }
+              .pdf-section h2 { margin: 0 0 14px; font-size: 18px; color: #0f172a; }
+              .pdf-section h3 { margin: 0 0 10px; font-size: 15px; color: #0f172a; }
+              .pdf-grid-two { display: grid; grid-template-columns: 1.35fr 1fr; gap: 16px; }
+              .pdf-grid-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+              .pdf-mini-card { padding: 12px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; }
+              .pdf-mini-label { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
+              .pdf-mini-value { margin-top: 8px; font-size: 18px; font-weight: 800; color: #0f172a; }
+              .pdf-mini-subtle { margin-top: 4px; font-size: 12px; color: #475569; }
+              .pdf-table { width: 100%; border-collapse: collapse; }
+              .pdf-table th, .pdf-table td { border-top: 1px solid #e2e8f0; padding: 10px 8px; text-align: left; vertical-align: top; font-size: 13px; }
+              .pdf-table th { border-top: 0; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
+              .pdf-history-item { padding: 12px 0; border-top: 1px solid #e2e8f0; }
+              .pdf-history-item:first-child { border-top: 0; padding-top: 0; }
+              .pdf-history-item p { margin: 8px 0; color: #334155; line-height: 1.45; }
+              .pdf-history-item small { color: #64748b; }
+              .pdf-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
+              .pdf-empty { padding: 12px 0; color: #64748b; }
+              .pdf-generated { margin-top: 18px; color: #64748b; font-size: 12px; }
+            </style>
+          </head>
+          <body>
+            <div class="pdf-shell">
+              <div class="pdf-brand">ProctorIQ • Assessment Integrity Console</div>
+              <div class="pdf-header">
+                <div class="pdf-summary-card">
+                  <div class="pdf-badges">
+                    <span class="pdf-badge risk">${escapeHtml(displayRisk)} Risk</span>
+                    <span class="pdf-badge status">${escapeHtml(status)}</span>
+                  </div>
+                  <div class="pdf-title">${escapeHtml(candidateName)}</div>
+                  <p class="pdf-subtitle">${escapeHtml(candidateEmail)}</p>
+                  <div class="pdf-meta">
+                    ${headerMetadata.map((item) => `<div><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(item.value)}</strong></div>`).join("")}
+                  </div>
+                </div>
+                <div class="pdf-scoreboard">
+                  <div class="pdf-score-item"><span>Risk Level</span><strong>${escapeHtml(displayRisk)}</strong></div>
+                  <div class="pdf-score-item"><span>Risk Score</span><strong>${escapeHtml(formatNumber(displayScore))}</strong></div>
+                  <div class="pdf-score-item"><span>Confidence</span><strong>${escapeHtml(formatNumber(displayConfidence))}</strong></div>
+                </div>
+              </div>
+
+              <section class="pdf-section">
+                <h2>Final Decision Summary</h2>
+                <h3>${escapeHtml(finalDecision)}</h3>
+                <p>${escapeHtml(summaryText)}</p>
+                <p><strong>Strongest reason:</strong> ${escapeHtml(strongestReason)}</p>
+                <p><strong>Why this score:</strong> ${escapeHtml(whyScoreText)}</p>
+              </section>
+
+              <section class="pdf-section">
+                <h2>Violation Overview</h2>
+                <div class="pdf-grid-overview">${violationOverviewHtml}</div>
+              </section>
+
+              <section class="pdf-section">
+                <h2>Top Evidence</h2>
+                <table class="pdf-table">
+                  <thead>
+                    <tr><th>Type</th><th>Severity</th><th>Count</th><th>Impact</th><th>Details</th></tr>
+                  </thead>
+                  <tbody>${evidenceHtml}</tbody>
+                </table>
+              </section>
+
+              <section class="pdf-section">
+                <h2>Reviewer Workflow History</h2>
+                ${historyHtml}
+              </section>
+
+              <section class="pdf-section">
+                <h2>Risk History Snapshot</h2>
+                ${chartSvg}
+              </section>
+
+              <section class="pdf-section">
+                <h2>Technical Details</h2>
+                <div class="pdf-detail-grid">${technicalHtml}</div>
+              </section>
+
+              <div class="pdf-generated">Generated ${escapeHtml(generatedAt)}</div>
+            </div>
+          </body>
+        </html>
+      `;
+
+      printWindow.document.open();
+      printWindow.document.write(html);
+      printWindow.document.close();
+
+      await new Promise((resolve) => {
+        const completeRender = async () => {
+          try {
+            if (printWindow.document?.fonts?.ready) {
+              await printWindow.document.fonts.ready;
+            }
+          } catch {
+            // Ignore font readiness failures and continue with printing.
+          }
+
+          printWindow.focus();
+
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            try {
+              printWindow.close();
+            } catch {
+              // Ignore close failures.
+            }
+            resolve();
+          };
+
+          printWindow.onafterprint = finish;
+          window.setTimeout(finish, 1500);
+          window.setTimeout(() => {
+            try {
+              printWindow.print();
+            } catch (error) {
+              console.warn("[Investigation PDF Export] Failed to launch print dialog.", error);
+              finish();
+            }
+          }, 200);
+        };
+
+        if (printWindow.document.readyState === "complete") {
+          void completeRender();
+          return;
+        }
+
+        printWindow.onload = () => {
+          void completeRender();
+        };
+      });
+    } catch (error) {
+      console.warn("[Investigation PDF Export] Export failed.", error);
+      setWorkflowMessage("Unable to generate the PDF export. Please try again.");
+    } finally {
+      setExportingPdf(false);
+    }
+  }, [
+    actionHistory,
+    canExportPdf,
+    chartData,
+    displayConfidence,
+    displayRisk,
+    displayScore,
+    evidenceRows,
+    finalDecision,
+    headerMetadata,
+    liveRisk,
+    overviewItems,
+    reportData,
+    reportLoading,
+    selected?.attempt_id,
+    status,
+    strongestReason,
+    summaryText,
+    technicalDetails,
+    whyScoreText,
+  ]);
 
   return (
     <div className="report-scroll-container">
@@ -2353,6 +2730,18 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
             <ArrowLeft size={16} />
             Back to Review Queue
           </button>
+          <div className="report-toolbar-actions">
+            <button
+              className="panel-header-action"
+              disabled={!canExportPdf || exportingPdf || reportLoading}
+              onClick={() => void handleExportPdf()}
+              type="button"
+              title={canExportPdf ? "Export the current investigation report as a PDF" : "Only reviewer and admin roles can export reports"}
+            >
+              <FileDown size={16} />
+              {exportingPdf ? "Exporting..." : "Export PDF"}
+            </button>
+          </div>
         </div>
 
         <InvestigationHeader
@@ -2374,19 +2763,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, onUnauthor
         <ViolationOverview items={overviewItems} />
 
         <div className="report-main-row investigation-main-grid">
-          <EvidenceTable rows={[...evidenceRows].sort((a, b) => {
-            const severityDelta = severityRank(b.severity) - severityRank(a.severity);
-            if (severityDelta !== 0) return severityDelta;
-            const priorityDelta = evidencePriority(b) - evidencePriority(a);
-            if (priorityDelta !== 0) return priorityDelta;
-            const countDelta = Number(b.count || 0) - Number(a.count || 0);
-            if (countDelta !== 0) return countDelta;
-            const impactDelta = Number(b.relatedEventCount || 0) - Number(a.relatedEventCount || 0);
-            if (impactDelta !== 0) return impactDelta;
-            const aTime = a.lastSeen ? new Date(a.lastSeen).getTime() : 0;
-            const bTime = b.lastSeen ? new Date(b.lastSeen).getTime() : 0;
-            return bTime - aTime;
-          })} />
+          <EvidenceTable rows={sortedEvidenceRows} />
           <ReviewerWorkflow
             caseStatus={caseStatus}
             assignedReviewer={assignedReviewer}
