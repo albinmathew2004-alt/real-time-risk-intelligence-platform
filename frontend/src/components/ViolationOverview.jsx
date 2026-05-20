@@ -18,6 +18,7 @@ const ICONS = {
   rapid_answer_bursts: Zap,
   suspicious_sequences: ShieldAlert,
   keystroke_anomalies: Keyboard,
+  typing_behavior_anomalies: Keyboard,
   focus_loss_rate: Focus,
 };
 

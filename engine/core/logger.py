@@ -21,6 +21,7 @@ def log_attempt(result, features):
         "combined_score": result.combined_score,
         "features": features,
         "signals": result.signals,
+        "session_intelligence": getattr(result, "session_intelligence", {}),
     }
 
     with open(LOG_FILE, "a") as f:

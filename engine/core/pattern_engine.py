@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
+from .correlation_engine import detect_correlated_sequences
 from .types import Event, Features, Signals
 
 
@@ -298,5 +299,24 @@ def detect_patterns(
                                 break
                     # keep last_enter_by_q; multiple leaves possible but harmless
         
+
+    for correlation in detect_correlated_sequences(events):
+        patterns.append(
+            PatternMatch(
+                pattern_type=str(correlation.sequence_type).lower(),
+                strength=float(min(0.84, correlation.confidence)),
+                evidence={
+                    "sequence_type": correlation.sequence_type,
+                    "count": correlation.count,
+                    "severity": correlation.severity,
+                    "confidence": correlation.confidence,
+                    "first_seen": correlation.first_seen,
+                    "last_seen": correlation.last_seen,
+                    "reviewer_summary": correlation.reviewer_summary,
+                    "related_event_count": correlation.related_event_count,
+                    "involved_event_types": correlation.involved_event_types,
+                },
+            )
+        )
 
     return patterns

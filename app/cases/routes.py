@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -82,9 +82,29 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def _recent_cutoff(recent_hours: Optional[int]) -> Optional[datetime]:
+    if recent_hours is None or recent_hours <= 0:
+        return None
+    return datetime.now(timezone.utc) - timedelta(hours=recent_hours)
+
+
+def _is_recent(value: Optional[str], cutoff: Optional[datetime]) -> bool:
+    if cutoff is None:
+        return True
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return False
+    return parsed >= cutoff
 
 
 def _latest_snapshot(db, attempt_id: str) -> Optional[Dict[str, object]]:
@@ -372,6 +392,7 @@ def _build_review_queue_payload(
     risk_level_filter: Optional[str],
     assigned_to_filter: Optional[str],
     search: Optional[str],
+    recent_hours: Optional[int] = None,
 ) -> Dict[str, object]:
     _sync_cases_from_attempts(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
@@ -381,6 +402,7 @@ def _build_review_queue_payload(
     latest_logs = _latest_attempt_logs_by_attempt(db)
 
     rows = []
+    cutoff = _recent_cutoff(recent_hours)
     for case in cases:
         assigned_user = users.get(case.assigned_reviewer_id) if case.assigned_reviewer_id else None
         risk_score = safe_float(case.current_combined_score, 0.0)
@@ -413,6 +435,14 @@ def _build_review_queue_payload(
                 ),
             }
         )
+
+    if cutoff is not None:
+        recent_rows = [
+            row for row in rows
+            if _is_recent(row.get("last_activity"), cutoff)
+        ]
+        if recent_rows:
+            rows = recent_rows
 
     rows.sort(
         key=lambda row: (
@@ -545,6 +575,7 @@ def review_queue(
     risk_level: Optional[str] = Query(default=None),
     assigned_to: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
+    recent_hours: Optional[int] = Query(default=24),
     _user: User = Depends(require_reviewer),
 ):
     db = SessionLocal()
@@ -555,6 +586,7 @@ def review_queue(
             risk_level_filter=risk_level,
             assigned_to_filter=assigned_to,
             search=search,
+            recent_hours=recent_hours,
         )
     finally:
         db.close()

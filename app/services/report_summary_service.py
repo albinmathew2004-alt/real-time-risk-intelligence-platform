@@ -61,7 +61,10 @@ def _why_this_score(
     risk_level: str,
     risk_score: float,
     evidence_items: List[Dict[str, Any]],
+    session_narrative: str = "",
 ) -> str:
+    if session_narrative:
+        return session_narrative
     if evidence_items:
         lead_items = evidence_items[:3]
         parts = []
@@ -89,6 +92,7 @@ def build_report_summary(
     risk_score: Any,
     confidence: Any,
     evidence_items: List[Dict[str, Any]],
+    session_narrative: str = "",
 ) -> Dict[str, Any]:
     numeric_score = safe_float(risk_score)
     numeric_confidence = safe_float(confidence)
@@ -102,6 +106,7 @@ def build_report_summary(
             risk_level=risk_level,
             risk_score=numeric_score,
             evidence_items=evidence_items,
+            session_narrative=session_narrative,
         ),
         "recommendation": _recommendation(risk_level),
         "risk_level": risk_level,

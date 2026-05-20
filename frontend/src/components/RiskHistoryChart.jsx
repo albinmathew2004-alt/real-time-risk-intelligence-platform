@@ -11,6 +11,15 @@ import {
   YAxis,
 } from "recharts";
 
+const TRIGGER_PATTERNS = [
+  { label: "Suspicious Sequence", matchers: ["suspicious sequence", "multiple suspicious", "sequence"] },
+  { label: "Clipboard Activity", matchers: ["clipboard", "copy/paste", "copy paste", "paste action"] },
+  { label: "Tab Switching", matchers: ["tab switch", "tab switching", "window switch"] },
+  { label: "Focus Blur", matchers: ["focus blur", "window blur", "blur event", "focus loss"] },
+  { label: "Idle Spike", matchers: ["idle", "inactivity"] },
+  { label: "Rapid Answer Burst", matchers: ["rapid answer", "answer burst", "rapid-response"] },
+];
+
 function formatChartTime(value, fallbackLabel) {
   if (!value) return fallbackLabel || "Time";
   try {
@@ -28,6 +37,14 @@ function normalizeRiskLevel(score, explicitRiskLevel) {
   if (score >= 0.7) return "HIGH";
   if (score >= 0.4) return "MEDIUM";
   return "LOW";
+}
+
+function describeDominantTrigger(summary, explicitTrigger) {
+  if (explicitTrigger) return explicitTrigger;
+  const source = String(summary || "").toLowerCase();
+  if (!source) return "Risk recalculated from behavioral telemetry";
+  const matched = TRIGGER_PATTERNS.find((entry) => entry.matchers.some((matcher) => source.includes(matcher)));
+  return matched?.label || "Behavioral risk change detected";
 }
 
 function compressHistoryPoints(points) {
@@ -73,10 +90,39 @@ function compressHistoryPoints(points) {
     });
 }
 
+function RiskHistoryTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const point = payload[0]?.payload;
+  if (!point) return null;
+
+  return (
+    <div
+      style={{
+        background: "#0f172a",
+        border: "1px solid rgba(255,255,255,0.08)",
+        borderRadius: "14px",
+        color: "#f8fafc",
+        padding: "12px 14px",
+        boxShadow: "0 12px 24px rgba(2, 6, 23, 0.35)",
+        maxWidth: "240px",
+      }}
+    >
+      <div style={{ fontSize: "0.82rem", fontWeight: 700, marginBottom: "6px" }}>{point.label}</div>
+      <div style={{ fontSize: "0.8rem", color: "#e2e8f0", marginBottom: "4px" }}>
+        Risk: <strong style={{ color: "#ffffff" }}>{Number(point.score || 0).toFixed(2)}</strong>
+      </div>
+      <div style={{ fontSize: "0.76rem", color: "#94a3b8", lineHeight: 1.45 }}>
+        Trigger: {point.dominantTrigger || "Behavioral risk change detected"}
+      </div>
+    </div>
+  );
+}
+
 export default function RiskHistoryChart({ data, loading }) {
   const rawPoints = data
     .map((item, index) => {
       const score = Number(item.score ?? item.combined_score ?? 0);
+      const summary = item.summary || item.reason || "";
       return {
         ...item,
         index,
@@ -85,7 +131,8 @@ export default function RiskHistoryChart({ data, loading }) {
         score,
         confidence: Number(item.confidence ?? 0),
         riskLevel: normalizeRiskLevel(score, item.risk_level || item.risk),
-        summary: item.summary || item.reason || "",
+        summary,
+        dominantTrigger: describeDominantTrigger(summary, item.trigger || item.dominant_trigger || item.event_type),
       };
     })
     .sort((a, b) => {
@@ -158,27 +205,17 @@ export default function RiskHistoryChart({ data, loading }) {
                 />
                 <Tooltip
                   cursor={{ stroke: "rgba(79,140,255,0.28)", strokeWidth: 1 }}
-                  contentStyle={{
-                    background: "#0f172a",
-                    border: "1px solid rgba(255,255,255,0.08)",
-                    borderRadius: "14px",
-                    color: "#f8fafc",
-                  }}
-                  formatter={(value, name) => [Number(value).toFixed(2), name === "score" ? "Risk Score" : "Confidence"]}
-                  labelFormatter={(label, payload) => {
-                    const point = payload?.[0]?.payload;
-                    const level = point?.riskLevel ? ` | ${point.riskLevel}` : "";
-                    return `Time ${point?.label || label}${level}`;
-                  }}
+                  content={<RiskHistoryTooltip />}
                 />
                 <Legend wrapperStyle={{ display: "none" }} />
                 <Line
-                  type="monotone"
+                  type="stepAfter"
                   dataKey="score"
                   stroke="#ff7043"
                   strokeWidth={3}
                   dot={false}
-                  activeDot={{ r: 6, fill: "#ff7043" }}
+                  activeDot={{ r: 6, fill: "#ff7043", stroke: "#ffffff", strokeWidth: 1.5 }}
+                  isAnimationActive={false}
                 />
                 <Scatter data={pointMarkers} dataKey="score" fill="#ff8d5b" />
               </LineChart>

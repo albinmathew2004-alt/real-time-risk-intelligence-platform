@@ -8,5 +8,7 @@ def run_scoring(events, attempt_id):
         "risk": result.risk,
         "confidence": result.confidence_score,
         "combined_score": result.combined_score,
-        "explanation": result.explanation_text
+        "explanation": result.explanation_text,
+        "session_intelligence": result.session_intelligence,
+        "timeline_points": result.session_intelligence.get("timeline_points", []),
     }

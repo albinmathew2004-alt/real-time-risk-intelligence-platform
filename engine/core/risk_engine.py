@@ -12,6 +12,7 @@ from .feature_engineering import build_features
 from .pattern_engine import PatternConfig, PatternMatch, detect_patterns
 from .reasoning import combine_signals
 from .risk import assign_risk, compute_confidence
+from .session_intelligence import build_session_intelligence
 from .signal_detection import WeightedSignals, detect_signals
 from .types import Features, RiskLevel, ScoringConfig, Signals
 
@@ -33,6 +34,7 @@ class RiskResult:
     patterns: List[PatternMatch]
     explanation: Dict[str, List[str]]
     explanation_text: str
+    session_intelligence: Dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -162,6 +164,7 @@ def score_event_batch(
         signals=signals,
         cfg=patt_cfg,
     ) or []
+    patterns = sorted(patterns, key=lambda pattern: float(pattern.strength), reverse=True)
 
     # =========================
     # ML PREDICTION
@@ -200,6 +203,16 @@ def score_event_batch(
                 ],
             },
             explanation_text="Insufficient behavioral data for reliable analysis.",
+            session_intelligence={
+                "adjusted_session_score": 0.0,
+                "session_confidence": 0.1,
+                "risk_momentum": 0.0,
+                "risk_decay_applied": 0.0,
+                "correlation_amplification": 0.0,
+                "session_narrative": "Insufficient behavioral data for reliable analysis.",
+                "timeline_points": [],
+                "explanation_factors": [],
+            },
         )
 
         try:
@@ -213,8 +226,28 @@ def score_event_batch(
     # RULE RISK DECISION
     # =========================
 
+    base_combined_score = float(combined.get("combined_score", 0.0))
+    base_rule_risk = assign_risk(
+        base_combined_score,
+        combined,
+        scoring_cfg.risk,
+    )
+    session_intelligence = build_session_intelligence(
+        events=processed.events,
+        features=features,
+        signals=signals,
+        patterns=patterns,
+        current_base_score=base_combined_score,
+        current_base_risk=base_rule_risk,
+    )
+    combined["session_adjusted_score"] = float(session_intelligence.adjusted_session_score)
+    combined["session_confidence"] = float(session_intelligence.session_confidence)
+    combined["risk_momentum"] = float(session_intelligence.risk_momentum)
+    combined["risk_decay_applied"] = float(session_intelligence.risk_decay_applied)
+    combined["correlation_amplification"] = float(session_intelligence.correlation_amplification)
+
     rule_risk = assign_risk(
-        float(combined.get("combined_score", 0.0)),
+        float(session_intelligence.adjusted_session_score),
         combined,
         scoring_cfg.risk,
     )
@@ -279,7 +312,8 @@ def score_event_batch(
     else:
         confidence_score = evidence_confidence_score
 
-    confidence = _clamp01(rule_confidence)
+    confidence = _clamp01(0.65 * rule_confidence + 0.35 * session_intelligence.session_confidence)
+    confidence_score = _clamp01(0.55 * confidence_score + 0.45 * session_intelligence.session_confidence)
 
     # =========================
     # EXPLANATION
@@ -290,6 +324,7 @@ def score_event_batch(
     explanation.setdefault("summary", [])
     explanation.setdefault("reasons", [])
 
+    explanation["summary"].append(session_intelligence.session_narrative)
     explanation["summary"].append(
         f"ML prediction={ml_risk}."
     )
@@ -302,6 +337,7 @@ def score_event_batch(
     explanation["reasons"].append(
         f"Hybrid decision used rule risk={rule_risk} and ML risk={ml_risk}."
     )
+    explanation["reasons"].extend(session_intelligence.explanation_factors)
 
     explanation_text = (
         " ".join(explanation.get("summary", [])) + " "
@@ -319,11 +355,21 @@ def score_event_batch(
         confidence_score=float(confidence_score or 0.0),
         promoted_by_pattern=promoted_by_pattern,
         base_score=float(combined.get("base_score", 0.0)),
-        combined_score=float(combined.get("combined_score", 0.0)),
+        combined_score=float(session_intelligence.adjusted_session_score),
         signals=signals,
         patterns=patterns,
         explanation=explanation,
         explanation_text=explanation_text,
+        session_intelligence={
+            "adjusted_session_score": float(session_intelligence.adjusted_session_score),
+            "session_confidence": float(session_intelligence.session_confidence),
+            "risk_momentum": float(session_intelligence.risk_momentum),
+            "risk_decay_applied": float(session_intelligence.risk_decay_applied),
+            "correlation_amplification": float(session_intelligence.correlation_amplification),
+            "session_narrative": session_intelligence.session_narrative,
+            "timeline_points": session_intelligence.timeline_points,
+            "explanation_factors": session_intelligence.explanation_factors,
+        },
     )
 
     try:

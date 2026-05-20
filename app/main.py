@@ -1,8 +1,8 @@
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import os
@@ -128,7 +128,7 @@ class ExamEventIngest(BaseModel):
 
     event_type: str = Field(..., min_length=1, max_length=120)
     payload: Dict[str, Any] = Field(default_factory=dict)
-    occurred_at: str
+    occurred_at: Optional[str] = None
 
     @field_validator(
         "attempt_id",
@@ -149,12 +149,10 @@ class ExamEventIngest(BaseModel):
             return stripped or None
         return value
 
-    @field_validator("occurred_at")
+    @field_validator("occurred_at", mode="before")
     @classmethod
-    def _validate_occurred_at(cls, value: str) -> str:
-        if parse_timestamp(value) is None:
-            raise ValueError("occurred_at must be a valid ISO-8601 timestamp")
-        return value
+    def _normalize_occurred_at(cls, value: Optional[str]) -> str:
+        return normalize_timestamp_input(value, fallback_to_now=True)
 
     @field_validator("payload")
     @classmethod
@@ -162,6 +160,39 @@ class ExamEventIngest(BaseModel):
         if not isinstance(value, dict):
             raise ValueError("payload must be a JSON object")
         return value
+
+    @model_validator(mode="after")
+    def _validate_privacy_preserving_typing_payload(self):
+        if str(self.event_type or "").lower() not in {
+            "typing_started",
+            "typing_stopped",
+            "typing_pause",
+            "typing_burst",
+            "backspace_activity",
+        }:
+            return self
+
+        forbidden_keys = {
+            "text",
+            "value",
+            "answer",
+            "answer_text",
+            "key",
+            "keys",
+            "character",
+            "characters",
+            "password",
+            "content",
+            "raw_input",
+        }
+        payload_keys = {str(key).lower() for key in (self.payload or {}).keys()}
+        leaked = sorted(payload_keys & forbidden_keys)
+        if leaked:
+            raise ValueError(
+                "Typing telemetry must be metadata-only and cannot include content fields: "
+                + ", ".join(leaked)
+            )
+        return self
 
 
 def utc_now():
@@ -172,19 +203,50 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
     if not value:
         return None
     if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def normalize_timestamp_input(value: Any, *, fallback_to_now: bool = False) -> str:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return utc_now() if fallback_to_now else ""
+    return parsed.isoformat()
+
+
+def _recent_cutoff(recent_hours: Optional[int]) -> Optional[datetime]:
+    if recent_hours is None or recent_hours <= 0:
         return None
+    return datetime.now(timezone.utc) - timedelta(hours=recent_hours)
+
+
+def _is_recent_timestamp(value: Any, cutoff: Optional[datetime]) -> bool:
+    if cutoff is None:
+        return True
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return False
+    return parsed >= cutoff
 
 
 def build_reason(result: Dict[str, Any]) -> str:
     risk = result.get("risk", "LOW")
     explanation = result.get("explanation", "")
+    session_narrative = ((result.get("session_intelligence") or {}).get("session_narrative") or "").strip()
 
     if isinstance(explanation, str) and explanation.strip():
         return explanation[:500]
+    if session_narrative:
+        return session_narrative[:500]
 
     if risk == "HIGH":
         return "Risk escalated to HIGH based on strong behavioral evidence."
@@ -360,12 +422,27 @@ def _latest_event_metadata(db) -> Dict[str, RawExamEvent]:
     return by_attempt
 
 
-def _build_dashboard_summary(db) -> Dict[str, Any]:
+def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[str, Any]:
     _sync_cases_from_attempts(db)
     logs = _load_attempt_logs()
     latest_attempts = _dedupe_latest_attempt_rows(logs)
     latest_event_by_attempt = _latest_event_metadata(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
+    cutoff = _recent_cutoff(recent_hours)
+    if cutoff is not None:
+        filtered_attempts = [
+            row for row in latest_attempts
+            if _is_recent_timestamp(row.get("timestamp"), cutoff)
+        ]
+        if filtered_attempts:
+            latest_attempts = filtered_attempts
+            recent_attempt_ids = {row.get("attempt_id") for row in latest_attempts if row.get("attempt_id")}
+            cases = [
+                case for case in cases
+                if case.attempt_id in recent_attempt_ids
+                or _is_recent_timestamp(getattr(case, "latest_event_at", None), cutoff)
+                or _is_recent_timestamp(getattr(case, "updated_at", None), cutoff)
+            ]
     case_by_attempt = {case.attempt_id: case for case in cases if case.attempt_id}
 
     total_attempts = len(latest_attempts)
@@ -504,10 +581,10 @@ def _build_dashboard_summary(db) -> Dict[str, Any]:
 
 
 @app.get("/v1/dashboard/summary")
-def get_dashboard_summary(_user=Depends(require_reviewer)):
+def get_dashboard_summary(recent_hours: Optional[int] = 24, _user=Depends(require_reviewer)):
     db = SessionLocal()
     try:
-        data = _build_dashboard_summary(db)
+        data = _build_dashboard_summary(db, recent_hours=recent_hours)
         return {
             "status": "success",
             "data": data,
@@ -529,6 +606,7 @@ def get_review_queue(
     risk_level: Optional[str] = None,
     assigned_to: Optional[str] = None,
     search: Optional[str] = None,
+    recent_hours: Optional[int] = 24,
     _user=Depends(require_reviewer),
 ):
     db = SessionLocal()
@@ -539,6 +617,7 @@ def get_review_queue(
             risk_level_filter=risk_level,
             assigned_to_filter=assigned_to,
             search=search,
+            recent_hours=recent_hours,
         )
     finally:
         db.close()
@@ -579,20 +658,21 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
             "combined_score": scoring_result.get("combined_score"),
             "explanation": scoring_result.get("explanation"),
             "event_count": len(scoring_events),
+            "session_intelligence": scoring_result.get("session_intelligence") or {},
         }
 
     latest_history = history[-1] if history else None
     features = getattr(latest_attempt_log, "features", None) or {}
     risk_score = (
-        current_risk.get("combined_score")
-        if current_risk.get("combined_score") is not None
+        runtime_risk.get("combined_score")
+        if runtime_risk.get("combined_score") is not None
         else getattr(latest_history, "combined_score", None)
         if latest_history is not None
         else getattr(latest_attempt_log, "combined_score", None)
     )
     confidence = (
-        current_risk.get("confidence")
-        if current_risk.get("confidence") is not None
+        runtime_risk.get("confidence")
+        if runtime_risk.get("confidence") is not None
         else getattr(latest_history, "confidence", None)
         if latest_history is not None
         else getattr(latest_attempt_log, "confidence", None)
@@ -615,14 +695,18 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         risk_score=risk_score,
         risk_level=risk_level,
     )
+    metadata_source = runtime_risk if runtime_risk else {}
+    session_narrative = (
+        metadata_source.get("session_intelligence", {}) or {}
+    ).get("session_narrative") or runtime_risk.get("explanation") or getattr(latest_history, "reason", None) or ""
     summary = build_report_summary(
         risk_score=risk_score,
         confidence=confidence,
         evidence_items=evidence_items,
+        session_narrative=session_narrative,
     )
     overview_counts = build_violation_overview_counts(events=event_payloads, features=features)
 
-    metadata_source = current_risk if current_risk else {}
     latest_event = events[-1] if events else None
     first_event = events[0] if events else None
 
@@ -704,6 +788,7 @@ async def score(batch: EventBatch):
         confidence_value = safe_float(result.get("confidence"), 0.0)
         risk_level = normalize_risk_level(score_value)
         reason = build_reason(result)
+        snapshot_timestamp = ((result.get("timeline_points") or [])[-1] or {}).get("timestamp") or utc_now()
 
         _record_risk_snapshot_if_needed(
             db,
@@ -717,7 +802,7 @@ async def score(batch: EventBatch):
             confidence=confidence_value,
             score=score_value,
             reason=reason,
-            timestamp=utc_now(),
+            timestamp=snapshot_timestamp,
         )
         db.commit()
 
@@ -801,6 +886,7 @@ async def ingest_event(event: ExamEventIngest):
         confidence_value = safe_float(result.get("confidence"), 0.0)
         risk_level = normalize_risk_level(score_value)
         reason = build_reason(result)
+        snapshot_timestamp = ((result.get("timeline_points") or [])[-1] or {}).get("timestamp") or event.occurred_at or received_at
 
         current_risk_state = {
             "attempt_id": event.attempt_id,
@@ -815,6 +901,7 @@ async def ingest_event(event: ExamEventIngest):
             "explanation": result.get("explanation"),
             "event_count": len(scoring_events),
             "updated_at": received_at,
+            "session_intelligence": result.get("session_intelligence") or {},
         }
 
         set_current_risk(event.attempt_id, current_risk_state)
@@ -831,7 +918,7 @@ async def ingest_event(event: ExamEventIngest):
             confidence=confidence_value,
             score=score_value,
             reason=reason,
-            timestamp=received_at,
+            timestamp=snapshot_timestamp,
         )
         db.commit()
 
@@ -861,7 +948,13 @@ async def ingest_event(event: ExamEventIngest):
                 "risk_level": risk_level,
                 "reason": reason,
                 "summary": reason,
-                "timestamp": received_at,
+                "trigger": (
+                    ((result.get("timeline_points") or [])[-1] or {}).get("trigger")
+                    if result.get("timeline_points")
+                    else reason
+                ),
+                "confidence": confidence_value,
+                "timestamp": snapshot_timestamp,
             },
         }
 
@@ -989,6 +1082,7 @@ def get_risk_history(attempt_id: str, _user=Depends(require_reviewer)):
                 "score": safe_float(h.combined_score, 0.0),
                 "reason": h.reason,
                 "summary": h.reason,
+                "trigger": h.reason,
                 "timestamp": h.timestamp,
             }
             for h in history

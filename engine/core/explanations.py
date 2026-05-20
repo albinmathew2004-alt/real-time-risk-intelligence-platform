@@ -95,6 +95,21 @@ def generate_explanations(
                 idle_ratio = float(comp.get("idle_ratio", 0.0) or 0.0)
                 reasons.append(f"High idle time detected ({_fmt_pct(idle_ratio)}).")
 
+            elif name == "typing":
+                paste_without_typing = int(comp.get("paste_without_typing", 0) or 0)
+                abnormal_pause_recovery = int(comp.get("abnormal_pause_recovery", 0) or 0)
+                rapid_typing_sequences = int(comp.get("rapid_typing_sequences", 0) or 0)
+                consistency = float(comp.get("typing_consistency_score", 1.0) or 1.0)
+
+                if paste_without_typing > 0:
+                    reasons.append("Typing recovery after paste activity appeared unusually limited.")
+                elif abnormal_pause_recovery > 0:
+                    reasons.append("Irregular typing bursts appeared after prolonged pauses.")
+                elif rapid_typing_sequences > 0:
+                    reasons.append(f"{rapid_typing_sequences} rapid typing sequence(s) were observed.")
+                else:
+                    reasons.append(f"Typing consistency score dropped to {consistency:.2f}.")
+
         except Exception:
             continue
 

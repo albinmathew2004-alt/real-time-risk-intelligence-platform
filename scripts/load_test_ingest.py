@@ -17,6 +17,11 @@ EVENT_TYPES = (
     "visibility_change",
     "clipboard",
     "idle_state",
+    "typing_started",
+    "typing_burst",
+    "typing_pause",
+    "backspace_activity",
+    "typing_stopped",
 )
 
 _thread_local = threading.local()
@@ -55,6 +60,28 @@ def build_event(candidate_number: int, event_index: int, started_at: datetime) -
         payload = {"operation": "paste"}
     elif event_type == "idle_state":
         payload = {"duration_s": random.randint(15, 180)}
+    elif event_type == "typing_started":
+        payload = {"question_id": f"Q{(event_index % 20) + 1}", "input_context": "answer_box"}
+    elif event_type == "typing_burst":
+        burst_length = random.randint(5, 15)
+        interval_ms = random.choice([75, 90, 110, 140, 190])
+        payload = {
+            "question_id": f"Q{(event_index % 20) + 1}",
+            "burst_length": burst_length,
+            "duration_ms": burst_length * interval_ms,
+            "interval_ms": interval_ms,
+        }
+    elif event_type == "typing_pause":
+        payload = {"question_id": f"Q{(event_index % 20) + 1}", "pause_duration_s": round(random.uniform(1.2, 8.0), 2)}
+    elif event_type == "backspace_activity":
+        payload = {"question_id": f"Q{(event_index % 20) + 1}", "count": random.randint(1, 5), "burst_window_ms": random.randint(240, 900)}
+    elif event_type == "typing_stopped":
+        payload = {
+            "question_id": f"Q{(event_index % 20) + 1}",
+            "session_duration_ms": random.randint(1800, 14000),
+            "total_bursts": random.randint(1, 4),
+            "pause_count": random.randint(0, 2),
+        }
 
     return {
         "attempt_id": attempt_id,

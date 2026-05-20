@@ -13,7 +13,6 @@ import {
   ListChecks,
   Mail,
   MonitorOff,
-  MoreVertical,
   RefreshCw,
   Search,
   Server,
@@ -68,6 +67,7 @@ const DASHBOARD_SUMMARY_URL = `${API_BASE_URL}/v1/dashboard/summary`;
 const REVIEW_QUEUE_URL = `${API_BASE_URL}/v1/review-queue`;
 const CASES_URL = `${API_BASE_URL}/v1/cases`;
 const AUTH_URL = `${API_BASE_URL}/v1/auth`;
+const RECENT_DEMO_HOURS = 24;
 
 const TOKEN_KEY = "riskintel_access_token";
 
@@ -100,16 +100,26 @@ function formatTime(value) {
 
 function formatDateTime(value) {
   if (!value) return "â€”";
-  try {
-    return new Date(value).toLocaleString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      day: "2-digit",
-      month: "short",
-    });
-  } catch {
-    return value;
-  }
+  const date = parseDateValue(value);
+  if (!date) return "â€”";
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const targetDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const dayDiff = Math.round((today.getTime() - targetDay.getTime()) / 86400000);
+  const timePart = date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  if (dayDiff === 0) return `Today, ${timePart}`;
+  if (dayDiff === 1) return `Yesterday, ${timePart}`;
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatDuration(seconds) {
@@ -398,6 +408,15 @@ function parseDateValue(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function filterRecentItems(items, getTimestamp, hours = RECENT_DEMO_HOURS) {
+  const cutoffMs = Date.now() - hours * 60 * 60 * 1000;
+  const recentItems = (items || []).filter((item) => {
+    const parsed = parseDateValue(getTimestamp(item));
+    return parsed ? parsed.getTime() >= cutoffMs : false;
+  });
+  return recentItems.length ? recentItems : (items || []);
+}
+
 function getSecondsBetween(a, b) {
   const start = parseDateValue(a);
   const end = parseDateValue(b);
@@ -482,13 +501,83 @@ function getSuspiciousSequenceCount(events) {
   return count;
 }
 
-function getKeystrokeAnomalyCount(events) {
-  return events.filter((event) => {
+function getTypingBehaviorAnomalyCount(events, attempt) {
+  const features = getFeatures(attempt);
+  const featureCount = Number(
+    features.typing_behavior_anomaly_count
+    ?? features.keystroke_anomaly_count
+    ?? 0,
+  );
+  if (featureCount > 0) return featureCount;
+
+  let rapidTypingSequences = 0;
+  let abnormalPauseRecovery = 0;
+  let pasteWithoutTyping = 0;
+  let recentPause = null;
+  const pendingPasteIndexes = [];
+
+  for (const event of events) {
     const type = String(event.event_type || "").toLowerCase();
-    if (type.includes("keystroke")) return true;
-    const payloadFlag = findNestedPayloadValue(event.payload, ["keystroke_anomaly", "typing_anomaly", "keyboard_anomaly"]);
-    return payloadFlag === true || Number(payloadFlag || 0) > 0;
-  }).length;
+    const payload = event.payload || {};
+
+    if (type === "clipboard" && String(payload.action || payload.operation || "").toLowerCase() === "paste") {
+      pendingPasteIndexes.push({ recovered: false });
+      continue;
+    }
+
+    if (type === "typing_pause") {
+      const pauseSeconds = Number(
+        findNestedPayloadValue(payload, ["duration_s", "pause_duration_s", "duration_seconds"]) ||
+        (Number(findNestedPayloadValue(payload, ["pause_duration_ms", "duration_ms"]) || 0) / 1000),
+      );
+      if (Number.isFinite(pauseSeconds) && pauseSeconds >= 8) {
+        recentPause = {
+          at: parseDateValue(event.occurred_at),
+          duration: pauseSeconds,
+        };
+      }
+      continue;
+    }
+
+    if (type === "typing_burst") {
+      const burstLength = Number(findNestedPayloadValue(payload, ["burst_length", "keystroke_count", "count"]) || 0);
+      const intervalMs = Number(findNestedPayloadValue(payload, ["interval_ms", "avg_interval_ms", "mean_interval_ms"]) || 0);
+      const durationMs = Number(findNestedPayloadValue(payload, ["duration_ms", "burst_duration_ms"]) || 0);
+      if (
+        burstLength >= 12
+        || (burstLength >= 8 && intervalMs > 0 && intervalMs <= 90)
+        || (burstLength >= 8 && durationMs > 0 && durationMs <= 1500)
+      ) {
+        rapidTypingSequences += 1;
+      }
+      if (burstLength >= 3) {
+        pendingPasteIndexes.forEach((item) => {
+          if (!item.recovered) item.recovered = true;
+        });
+      }
+      if (recentPause?.at) {
+        const delta = getSecondsBetween(recentPause.at, event.occurred_at);
+        if (delta !== null && delta <= 20 && (burstLength >= 10 || (intervalMs > 0 && intervalMs <= 85))) {
+          abnormalPauseRecovery += 1;
+          recentPause = null;
+        }
+      }
+      continue;
+    }
+
+    if (type === "backspace_activity") {
+      const count = Number(findNestedPayloadValue(payload, ["count", "backspace_count"]) || 0);
+      if (count >= 2) {
+        pendingPasteIndexes.forEach((item) => {
+          if (!item.recovered) item.recovered = true;
+        });
+      }
+      continue;
+    }
+  }
+
+  pasteWithoutTyping = pendingPasteIndexes.filter((item) => !item.recovered).length;
+  return rapidTypingSequences + pasteWithoutTyping + abnormalPauseRecovery;
 }
 
 function getBlurEventCount(events) {
@@ -514,7 +603,7 @@ function buildViolationOverview(attempt, events) {
   const idleMaxSeconds = getIdleMaxSeconds(events, attempt);
   const rapidAnswerBursts = getRapidAnswerBurstCount(events);
   const suspiciousSequences = getSuspiciousSequenceCount(events);
-  const keystrokeAnomalies = getKeystrokeAnomalyCount(events);
+  const typingBehaviorAnomalies = getTypingBehaviorAnomalyCount(events, attempt);
   const focusLossRate = getFocusLossRate(events);
 
   return [
@@ -561,11 +650,11 @@ function buildViolationOverview(attempt, events) {
       severity: getSeverityFromCount(suspiciousSequences, 1, 3),
     },
     {
-      key: "keystroke_anomalies",
-      title: "Keystroke Anomalies",
-      subtitle: "Typing Irregularities",
-      value: String(keystrokeAnomalies),
-      severity: getSeverityFromCount(keystrokeAnomalies, 1, 3),
+      key: "typing_behavior_anomalies",
+      title: "Typing Behavior Anomalies",
+      subtitle: "Typing Pattern Irregularities",
+      value: String(typingBehaviorAnomalies),
+      severity: typingBehaviorAnomalies >= 3 ? "MEDIUM" : typingBehaviorAnomalies > 0 ? "LOW" : "LOW",
     },
     {
       key: "focus_loss_rate",
@@ -587,7 +676,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
   const idleMaxSeconds = Number(counts.idle_max_duration_s || 0);
   const rapidAnswerBursts = Number(counts.rapid_answer_burst_count || 0);
   const suspiciousSequences = Number(counts.suspicious_sequence_count || 0);
-  const keystrokeAnomalies = Number(counts.keystroke_anomaly_count || 0);
+  const typingBehaviorAnomalies = Number((counts.typing_behavior_anomaly_count ?? counts.keystroke_anomaly_count) || 0);
   const focusLossRate = Number(counts.focus_loss_rate || 0);
 
   return [
@@ -634,11 +723,11 @@ function buildViolationOverviewFromCounts(counts = {}) {
       severity: getSeverityFromCount(suspiciousSequences, 1, 3),
     },
     {
-      key: "keystroke_anomalies",
-      title: "Keystroke Anomalies",
-      subtitle: "Typing Irregularities",
-      value: String(keystrokeAnomalies),
-      severity: getSeverityFromCount(keystrokeAnomalies, 1, 3),
+      key: "typing_behavior_anomalies",
+      title: "Typing Behavior Anomalies",
+      subtitle: "Typing Pattern Irregularities",
+      value: String(typingBehaviorAnomalies),
+      severity: typingBehaviorAnomalies >= 3 ? "MEDIUM" : typingBehaviorAnomalies > 0 ? "LOW" : "LOW",
     },
     {
       key: "focus_loss_rate",
@@ -674,7 +763,7 @@ function buildEvidenceRows(attempt, overviewItems, eventCount) {
   });
 
   for (const item of overviewItems) {
-    if (item.severity === "LOW" && item.key !== "idle_time") continue;
+    if (item.severity === "LOW" && !["idle_time", "typing_behavior_anomalies"].includes(item.key)) continue;
     if (item.value === "0" || item.value === "00:00" || item.value === "0%") continue;
     rows.push({
       key: item.key,
@@ -740,7 +829,9 @@ function buildTechnicalDetails({ attempt, events, eventCount, firstEvent, lastEv
 function formatRelativeTime(value) {
   const date = parseDateValue(value);
   if (!date) return "No activity";
-  const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60000));
+  const deltaMinutes = Math.round((Date.now() - date.getTime()) / 60000);
+  if (deltaMinutes < -1) return "Future timestamp";
+  const minutes = Math.max(0, deltaMinutes);
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
@@ -1179,7 +1270,7 @@ export default function App() {
 
   const fetchDashboardSummary = useCallback(async () => {
     try {
-      const result = await authJsonFetch(DASHBOARD_SUMMARY_URL, { token });
+      const result = await authJsonFetch(`${DASHBOARD_SUMMARY_URL}?recent_hours=${RECENT_DEMO_HOURS}`, { token });
       if (!result.ok) {
         if (result.status === 401) {
           logout();
@@ -1197,7 +1288,7 @@ export default function App() {
 
   const fetchReviewQueue = useCallback(async () => {
     try {
-      const result = await authJsonFetch(REVIEW_QUEUE_URL, { token });
+      const result = await authJsonFetch(`${REVIEW_QUEUE_URL}?recent_hours=${RECENT_DEMO_HOURS}`, { token });
       if (!result.ok) {
         if (result.status === 401) {
           logout();
@@ -1572,15 +1663,28 @@ export default function App() {
 
 function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setSelected, setPage, loading, wsConnected }) {
   const [feedExpanded, setFeedExpanded] = useState(false);
-  const sortedLogs = [...logs].sort((a, b) => compareIso(b?.timestamp, a?.timestamp));
+  const recentLogs = useMemo(
+    () => filterRecentItems(logs, (item) => item?.timestamp || getLastActivityAt(item)),
+    [logs],
+  );
+  const sortedLogs = [...recentLogs].sort((a, b) => compareIso(b?.timestamp, a?.timestamp));
   const caseByAttemptId = Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
-  const reviewRows = buildReviewQueueItems(logs, caseByAttemptId);
+  const reviewRows = buildReviewQueueItems(recentLogs, caseByAttemptId);
+  const fallbackStats = {
+    total: recentLogs.length,
+    high: recentLogs.filter((x) => x.risk === "HIGH").length,
+    medium: recentLogs.filter((x) => x.risk === "MEDIUM").length,
+    low: recentLogs.filter((x) => x.risk === "LOW").length,
+    ongoing: recentLogs.filter((x) => getExamStatus(x) === "ONGOING").length,
+    completed: recentLogs.filter((x) => getExamStatus(x) === "COMPLETED").length,
+    avgConfidence: recentLogs.reduce((sum, x) => sum + Number(x.confidence || 0), 0) / (recentLogs.length || 1),
+  };
   const fallbackFeedRows = sortedLogs.slice(0, 5);
   const fallbackReviewCases = reviewRows.filter((row) => !isQueueResolvedStatus(row.queueStatus)).slice(0, 5);
-  const unresolvedCases = cases.filter((item) => !isResolvedCaseStatus(item.status) && item.status !== "CLOSED").length;
-  const fallbackSignalSummary = buildAggregateSignals(logs);
-  const fallbackLiveEventRate = getLiveEventRate(logs);
-  const riskTotal = Math.max(1, stats.total);
+  const unresolvedCases = reviewRows.filter((row) => !isQueueResolvedStatus(row.queueStatus)).length;
+  const fallbackSignalSummary = buildAggregateSignals(recentLogs);
+  const fallbackLiveEventRate = getLiveEventRate(recentLogs);
+  const riskTotal = Math.max(1, fallbackStats.total);
   const fallbackLastUpdated = sortedLogs[0]?.timestamp || null;
   const feedRows = Array.isArray(dashboardSummary?.recent_risk_feed) && dashboardSummary.recent_risk_feed.length
     ? dashboardSummary.recent_risk_feed
@@ -1589,6 +1693,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
   const reviewCases = Array.isArray(dashboardSummary?.cases_needing_review) && dashboardSummary.cases_needing_review.length
     ? dashboardSummary.cases_needing_review
     : fallbackReviewCases;
+  const visibleReviewCases = reviewCases.slice(0, 5);
   const signalSummary = dashboardSummary?.recent_evidence_signals
     ? {
         clipboard: Number(dashboardSummary.recent_evidence_signals.clipboard_copy_paste || 0),
@@ -1600,13 +1705,13 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
     : fallbackSignalSummary;
   const liveEventRate = dashboardSummary?.live_event_rate ?? fallbackLiveEventRate;
   const lastUpdated = dashboardSummary?.system_health_basic?.last_updated || fallbackLastUpdated;
-  const metricTotalAttempts = dashboardSummary?.total_attempts ?? stats.total;
-  const metricHighRisk = dashboardSummary?.high_risk_count ?? stats.high;
-  const metricMediumRisk = dashboardSummary?.medium_risk_count ?? stats.medium;
-  const metricLowRisk = dashboardSummary?.low_risk_count ?? stats.low;
-  const metricActiveSessions = dashboardSummary?.active_sessions ?? stats.ongoing;
+  const metricTotalAttempts = dashboardSummary?.total_attempts ?? fallbackStats.total;
+  const metricHighRisk = dashboardSummary?.high_risk_count ?? fallbackStats.high;
+  const metricMediumRisk = dashboardSummary?.medium_risk_count ?? fallbackStats.medium;
+  const metricLowRisk = dashboardSummary?.low_risk_count ?? fallbackStats.low;
+  const metricActiveSessions = dashboardSummary?.active_sessions ?? fallbackStats.ongoing;
   const metricNeedsReview = dashboardSummary?.needs_review_count ?? unresolvedCases;
-  const metricAvgConfidence = dashboardSummary?.avg_confidence ?? stats.avgConfidence;
+  const metricAvgConfidence = dashboardSummary?.avg_confidence ?? fallbackStats.avgConfidence;
 
   const metrics = [
     { title: "Active Sessions", value: metricActiveSessions, subtitle: "Live exams in progress", tone: "blue", icon: <Users size={20} /> },
@@ -1706,20 +1811,19 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
                 <span>Risk</span>
                 <span>Status</span>
                 <span>Score</span>
-                <span>Last Activity</span>
                 <span>Action</span>
               </div>
-              {reviewCases.map((row, index) => (
+              {visibleReviewCases.map((row, index) => (
                 <div className="review-priority-row" key={row.attemptId || row.attempt_id}>
                   <span className={`priority-index tone-${riskTone(row.risk || row.risk_level)}`}>{row.priority || index + 1}</span>
                   <span className="review-priority-candidate">
                     <strong>{row.candidateName || row.candidate_name || "Unknown Candidate"}</strong>
                     <small>{row.attemptId || row.attempt_id}</small>
+                    <small>{formatDateTime(row.lastActivity || row.last_activity)}</small>
                   </span>
                   <span className={riskClass(row.risk || row.risk_level)}>{row.risk || row.risk_level}</span>
                   <span className={caseStatusClass(row.queueStatus || row.status)}>{row.queueStatus || row.status}</span>
                   <span>{formatNumber(row.score)}</span>
-                  <span>{formatDateTime(row.lastActivity || row.last_activity)}</span>
                   <button
                     className="action-link-button"
                     onClick={() => {
@@ -1735,7 +1839,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
             </div>
           )}
           <div className="panel-footer-link">
-            <span>Showing top {reviewCases.length} cases</span>
+            <span>Showing top {visibleReviewCases.length} cases</span>
             <button className="panel-footer-action" onClick={() => setPage("queue")} type="button">
               View All Cases
             </button>
@@ -1794,13 +1898,17 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [riskFilter, setRiskFilter] = useState("all");
-  const [assignedFilter, setAssignedFilter] = useState("all");
   const [sortKey, setSortKey] = useState("priority_desc");
   const [pageIndex, setPageIndex] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(10);
   const [refreshing, setRefreshing] = useState(false);
+  const isAdminDemo = String(currentUser?.role || "").toUpperCase() === "ADMIN";
 
-  const fallbackRows = useMemo(() => buildReviewQueueItems(logs, caseByAttemptId), [logs, caseByAttemptId]);
+  const recentLogs = useMemo(
+    () => filterRecentItems(logs, (item) => item?.timestamp || getLastActivityAt(item)),
+    [logs],
+  );
+  const fallbackRows = useMemo(() => buildReviewQueueItems(recentLogs, caseByAttemptId), [recentLogs, caseByAttemptId]);
   const reviewRows = useMemo(() => {
     if (!Array.isArray(reviewQueuePayload?.data)) {
       return fallbackRows.map((row) => ({
@@ -1810,12 +1918,12 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
         assessmentName: row.assessmentName || "Unknown Assessment",
         risk: normalizeQueueRisk(row.risk),
         queueStatus: normalizeQueueStatus(row.queueStatus),
-        assignedTo: row.assignedTo || "Unassigned",
+        assignedTo: row.assignedTo && row.assignedTo !== "Unassigned" && isAdminDemo ? "Admin" : (row.assignedTo || "Unassigned"),
       }));
     }
 
     return reviewQueuePayload.data.map((row) => ({
-      item: logs.find((item) => item.attempt_id === row.attempt_id) || {
+      item: recentLogs.find((item) => item.attempt_id === row.attempt_id) || {
         attempt_id: row.attempt_id,
         candidate_name: row.candidate_name,
         candidate_email: row.candidate_email,
@@ -1834,7 +1942,7 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
       score: Number(row.risk_score || 0),
       risk: normalizeQueueRisk(row.risk_level || "LOW"),
       queueStatus: normalizeQueueStatus(row.case_status || "NEW"),
-      assignedTo: row.assigned_to || "Unassigned",
+      assignedTo: row.assigned_to ? (isAdminDemo ? "Admin" : row.assigned_to) : "Unassigned",
       lastActivity: row.last_activity,
       eventCount: Number(row.event_count || 0),
       strongestSignal: row.strongest_signal || "No major signal",
@@ -1842,16 +1950,7 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
       caseId: row.case_id,
       confidence: Number(row.confidence || 0),
     }));
-  }, [caseByAttemptId, fallbackRows, logs, reviewQueuePayload]);
-
-  const currentReviewerIdentity = currentUser?.full_name || currentUser?.email || "";
-  const reviewerOptions = useMemo(() => {
-    const unique = new Set();
-    for (const row of reviewRows) {
-      if (row.assignedTo && row.assignedTo !== "Unassigned") unique.add(row.assignedTo);
-    }
-    return Array.from(unique).sort((a, b) => a.localeCompare(b));
-  }, [reviewRows]);
+  }, [caseByAttemptId, fallbackRows, isAdminDemo, recentLogs, reviewQueuePayload]);
 
   const baseFilteredRows = useMemo(() => {
     const query = searchTerm.trim().toLowerCase();
@@ -1866,14 +1965,9 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
 
       const matchesRisk = riskFilter === "all" || normalizeQueueRisk(row.risk) === riskFilter;
       const matchesStatus = statusFilter === "all" || normalizeQueueStatus(row.queueStatus) === statusFilter;
-      const matchesAssigned = assignedFilter === "all"
-        || (assignedFilter === "unassigned" && row.assignedTo === "Unassigned")
-        || (assignedFilter === "me" && currentReviewerIdentity && row.assignedTo === currentReviewerIdentity)
-        || row.assignedTo === assignedFilter;
-
-      return matchesSearch && matchesRisk && matchesStatus && matchesAssigned;
+      return matchesSearch && matchesRisk && matchesStatus;
     });
-  }, [assignedFilter, currentReviewerIdentity, reviewRows, riskFilter, searchTerm, statusFilter]);
+  }, [reviewRows, riskFilter, searchTerm, statusFilter]);
 
   const tabCounts = useMemo(() => buildQueueTabCounts(baseFilteredRows), [baseFilteredRows]);
   const filteredRows = useMemo(() => {
@@ -1910,12 +2004,13 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
     return ageSeconds === null || ageSeconds / 3600 <= 24;
   }).length;
   const slaPercent = reviewRows.length ? Math.round((withinSla / reviewRows.length) * 100) : 100;
-  const topReviewers = reviewerOptions.length
-    ? reviewerOptions
+  const reviewerNames = Array.from(new Set(reviewRows.map((row) => row.assignedTo).filter((value) => value && value !== "Unassigned")));
+  const topReviewers = reviewerNames.length
+    ? reviewerNames
         .map((name) => [name, reviewRows.filter((row) => row.assignedTo === name).length])
         .sort((a, b) => b[1] - a[1])
         .slice(0, 4)
-    : (currentReviewerIdentity ? [[currentReviewerIdentity, 0]] : []);
+    : (isAdminDemo ? [["Admin", 0]] : []);
 
   const summaryCards = [
     { title: "High Priority", value: summary.highPriority, subtitle: "Requires immediate attention", tone: "high", icon: <AlertTriangle size={20} /> },
@@ -1937,13 +2032,12 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
 
   useEffect(() => {
     setPageIndex(0);
-  }, [activeTab, assignedFilter, riskFilter, rowsPerPage, searchTerm, sortKey, statusFilter]);
+  }, [activeTab, riskFilter, rowsPerPage, searchTerm, sortKey, statusFilter]);
 
   const clearFilters = () => {
     setSearchTerm("");
     setStatusFilter("all");
     setRiskFilter("all");
-    setAssignedFilter("all");
     setSortKey("priority_desc");
     setActiveTab("all");
     setPageIndex(0);
@@ -1971,18 +2065,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
           <p>Prioritized investigation queue</p>
         </div>
         <div className="page-inline-actions">
-          <label className="toolbar-select" htmlFor="queue-header-assigned">
-            <User size={16} />
-            <select id="queue-header-assigned" value={assignedFilter} onChange={(event) => setAssignedFilter(event.target.value)}>
-              <option value="all">All Reviewers</option>
-              <option value="unassigned">Unassigned</option>
-              {currentReviewerIdentity ? <option value="me">Me</option> : null}
-              {reviewerOptions.map((option) => (
-                <option key={option} value={option}>{option}</option>
-              ))}
-            </select>
-            <ChevronDown size={14} />
-          </label>
           <button className="toolbar-button" onClick={handleScrollToFilters} type="button">
             <SlidersHorizontal size={16} /> Filters
           </button>
@@ -2047,18 +2129,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
             </label>
 
             <label className="queue-select-filter">
-              <span>Assigned</span>
-              <select value={assignedFilter} onChange={(event) => setAssignedFilter(event.target.value)}>
-                <option value="all">All Reviewers</option>
-                <option value="unassigned">Unassigned</option>
-                {currentReviewerIdentity ? <option value="me">Me</option> : null}
-                {reviewerOptions.map((option) => (
-                  <option key={option} value={option}>{option}</option>
-                ))}
-              </select>
-            </label>
-
-            <label className="queue-select-filter">
               <span>Sort</span>
               <select value={sortKey} onChange={(event) => setSortKey(event.target.value)}>
                 <option value="priority_desc">Priority: High to Low</option>
@@ -2109,7 +2179,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
               <span>Assigned To</span>
               <span>Last Activity</span>
               <span>Action</span>
-              <span></span>
             </div>
 
             {pageRows.length === 0 ? (
@@ -2152,7 +2221,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
                       View
                     </button>
                   </span>
-                  <span><MoreVertical size={16} /></span>
                 </div>
               ))
             )}

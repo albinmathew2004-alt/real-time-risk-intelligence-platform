@@ -133,8 +133,86 @@ def _paste_event(out: List[BehaviorEvent], *, offset_s: float, size: str, source
     out.append(BehaviorEvent(offset_s=offset_s, event_type="clipboard", payload=payload))
 
 
+def _typing_activity(out: List[BehaviorEvent], *, offset_s: float, dwell_s: float, qid: str) -> None:
+    if dwell_s < 4:
+        return
+
+    session_start = offset_s + min(0.8, max(0.2, dwell_s * 0.08))
+    session_end = max(session_start + 0.6, offset_s + dwell_s - 0.6)
+    if session_end <= session_start:
+        return
+
+    out.append(
+        BehaviorEvent(
+            offset_s=session_start,
+            event_type="typing_started",
+            payload={"question_id": qid, "input_context": "answer_box"},
+        )
+    )
+
+    cursor = session_start + min(1.0, max(0.35, dwell_s * 0.05))
+    pause_count = 0
+    burst_count = 0
+
+    while cursor < session_end - 0.45:
+        burst_length = random.randint(4, 16)
+        interval_ms = random.choice([70, 85, 95, 110, 140, 180, 220])
+        duration_ms = int(max(500, min(2400, burst_length * interval_ms * random.uniform(0.85, 1.25))))
+        out.append(
+            BehaviorEvent(
+                offset_s=cursor,
+                event_type="typing_burst",
+                payload={
+                    "question_id": qid,
+                    "burst_length": burst_length,
+                    "duration_ms": duration_ms,
+                    "interval_ms": interval_ms,
+                },
+            )
+        )
+        burst_count += 1
+
+        if random.random() < 0.35:
+            backspace_count = random.randint(1, 4)
+            out.append(
+                BehaviorEvent(
+                    offset_s=min(session_end - 0.15, cursor + random.uniform(0.12, 0.35)),
+                    event_type="backspace_activity",
+                    payload={"question_id": qid, "count": backspace_count, "burst_window_ms": random.randint(250, 900)},
+                )
+            )
+
+        if random.random() < 0.45 and cursor + 1.2 < session_end - 0.2:
+            pause_s = random.uniform(1.2, min(8.5, max(1.4, dwell_s * 0.18)))
+            out.append(
+                BehaviorEvent(
+                    offset_s=min(session_end - 0.2, cursor + random.uniform(0.25, 0.75)),
+                    event_type="typing_pause",
+                    payload={"question_id": qid, "pause_duration_s": round(pause_s, 2)},
+                )
+            )
+            pause_count += 1
+            cursor += pause_s
+
+        cursor += random.uniform(1.2, 4.4)
+
+    out.append(
+        BehaviorEvent(
+            offset_s=session_end,
+            event_type="typing_stopped",
+            payload={
+                "question_id": qid,
+                "session_duration_ms": int(max(400, (session_end - session_start) * 1000)),
+                "total_bursts": burst_count,
+                "pause_count": pause_count,
+            },
+        )
+    )
+
+
 def _question_view_pair(out: List[BehaviorEvent], *, offset_s: float, qid: str, dwell_s: float) -> float:
     out.append(BehaviorEvent(offset_s=offset_s, event_type="question_view", payload={"question_id": qid, "action": "enter"}))
+    _typing_activity(out, offset_s=offset_s, dwell_s=dwell_s, qid=qid)
     out.append(BehaviorEvent(offset_s=offset_s + max(0.3, dwell_s), event_type="question_view", payload={"question_id": qid, "action": "leave"}))
     return offset_s + max(0.3, dwell_s)
 

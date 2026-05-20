@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
+from engine.core.correlation_engine import detect_correlated_sequences
+
 
 LOW_RISK_MAX = 0.40
 HIGH_RISK_MIN = 0.70
@@ -17,6 +19,8 @@ FOCUS_BLUR = "FOCUS_BLUR"
 IDLE_SPIKE = "IDLE_SPIKE"
 RAPID_ANSWER_BURST = "RAPID_ANSWER_BURST"
 SUSPICIOUS_SEQUENCE = "SUSPICIOUS_SEQUENCE"
+TYPING_BEHAVIOR = "TYPING_BEHAVIOR"
+CORRELATED_PATTERN = "CORRELATED_PATTERN"
 HIGH_RISK_SCORE = "HIGH_RISK_SCORE"
 
 
@@ -180,6 +184,49 @@ def _suspicious_sequence_metrics(events: List[Dict[str, Any]]) -> Dict[str, Any]
     }
 
 
+def _correlation_items(events: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    patterns = detect_correlated_sequences(events)
+    items: List[Dict[str, Any]] = []
+    total_count = 0
+    total_related_events = 0
+    first_seen = None
+    last_seen = None
+
+    for pattern in patterns:
+        total_count += int(pattern.count)
+        total_related_events += int(pattern.related_event_count)
+        if first_seen is None and pattern.first_seen:
+            first_seen = pattern.first_seen
+        if pattern.last_seen:
+            last_seen = pattern.last_seen
+
+        items.append(
+            {
+                "signal_type": pattern.sequence_type,
+                "title": pattern.sequence_type.replace("_", " ").title(),
+                "severity": pattern.severity,
+                "count": int(pattern.count),
+                "explanation": pattern.explanation,
+                "first_seen": pattern.first_seen,
+                "last_seen": pattern.last_seen,
+                "related_event_count": int(pattern.related_event_count),
+                "correlation_confidence": pattern.confidence,
+                "reviewer_summary": pattern.reviewer_summary,
+                "involved_event_types": list(pattern.involved_event_types),
+                "evidence_category": CORRELATED_PATTERN,
+            }
+        )
+
+    aggregate = {
+        "count": total_count,
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+        "related_event_count": total_related_events,
+        "pattern_count": len(patterns),
+    }
+    return items, aggregate
+
+
 def _build_item(
     *,
     signal_type: str,
@@ -203,6 +250,74 @@ def _build_item(
     }
 
 
+def _typing_event(event: Dict[str, Any]) -> bool:
+    return str(event.get("event_type") or "").lower() in {
+        "typing_started",
+        "typing_stopped",
+        "typing_pause",
+        "typing_burst",
+        "backspace_activity",
+    }
+
+
+def _typing_pause_duration(event: Dict[str, Any]) -> float:
+    payload = event.get("payload") or {}
+    seconds = safe_float(find_nested_value(payload, ["duration_s", "pause_duration_s", "duration_seconds"]), 0.0)
+    if seconds > 0:
+        return seconds
+    return safe_float(find_nested_value(payload, ["pause_duration_ms", "duration_ms"]), 0.0) / 1000.0
+
+
+def _typing_burst_metrics(events: List[Dict[str, Any]], features: Dict[str, Any]) -> Dict[str, Any]:
+    typing_events = [event for event in events if _typing_event(event)]
+    typing_times = [str(event.get("occurred_at")) for event in typing_events if event.get("occurred_at")]
+    typing_bursts = [event for event in events if str(event.get("event_type") or "").lower() == "typing_burst"]
+    backspace_events = [event for event in events if str(event.get("event_type") or "").lower() == "backspace_activity"]
+
+    rapid_typing_sequences = int(safe_float(features.get("rapid_typing_sequences"), 0.0))
+    if rapid_typing_sequences <= 0:
+        for event in typing_bursts:
+            payload = event.get("payload") or {}
+            burst_length = safe_float(find_nested_value(payload, ["burst_length", "keystroke_count", "count"]), 0.0)
+            interval_ms = safe_float(find_nested_value(payload, ["interval_ms", "avg_interval_ms", "mean_interval_ms"]), 0.0)
+            duration_ms = safe_float(find_nested_value(payload, ["duration_ms", "burst_duration_ms"]), 0.0)
+            if burst_length >= 12 or (burst_length >= 8 and 0 < interval_ms <= 90) or (burst_length >= 8 and 0 < duration_ms <= 1500):
+                rapid_typing_sequences += 1
+
+    avg_pause_duration = safe_float(features.get("avg_pause_duration"), 0.0)
+    if avg_pause_duration <= 0:
+        pauses = [_typing_pause_duration(event) for event in events if str(event.get("event_type") or "").lower() == "typing_pause"]
+        pauses = [value for value in pauses if value > 0]
+        avg_pause_duration = sum(pauses) / len(pauses) if pauses else 0.0
+
+    paste_without_typing = int(safe_float(features.get("paste_without_typing"), 0.0))
+    abnormal_pause_recovery = int(safe_float(features.get("abnormal_pause_recovery"), 0.0))
+    consistency = safe_float(features.get("typing_consistency_score"), 1.0 if typing_events else 0.0)
+    burst_count = int(safe_float(features.get("typing_burst_count"), len(typing_bursts)))
+    backspace_count = int(safe_float(features.get("backspace_activity_count"), sum(int(safe_float((event.get("payload") or {}).get("count"), 1.0)) for event in backspace_events)))
+    anomaly_count = int(
+        safe_float(
+            features.get("typing_behavior_anomaly_count"),
+            rapid_typing_sequences + paste_without_typing + abnormal_pause_recovery + (1 if typing_events and consistency < 0.55 else 0),
+        )
+    )
+    first_seen, last_seen = _first_last(typing_times)
+
+    return {
+        "typing_events": typing_events,
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+        "typing_burst_count": burst_count,
+        "avg_pause_duration": avg_pause_duration,
+        "rapid_typing_sequences": rapid_typing_sequences,
+        "paste_without_typing": paste_without_typing,
+        "abnormal_pause_recovery": abnormal_pause_recovery,
+        "typing_consistency_score": consistency,
+        "typing_behavior_anomaly_count": anomaly_count,
+        "backspace_activity_count": backspace_count,
+    }
+
+
 def normalize_evidence(
     *,
     events: List[Dict[str, Any]],
@@ -214,6 +329,7 @@ def normalize_evidence(
     event_count = len(events)
     normalized_risk = risk_level or normalize_risk_level(risk_score)
     items: List[Dict[str, Any]] = []
+    correlation_items, correlation_aggregate = _correlation_items(events)
 
     clipboard_count = int(safe_float(features.get("paste_count"), _count_event_type(events, "clipboard")))
     clipboard_times = _matching_event_times(events, lambda event: event.get("event_type") == "clipboard")
@@ -311,8 +427,8 @@ def normalize_evidence(
             )
         )
 
-    sequence_metrics = _suspicious_sequence_metrics(events)
-    if sequence_metrics["count"] > 0:
+    sequence_metrics = correlation_aggregate if correlation_aggregate["count"] > 0 else _suspicious_sequence_metrics(events)
+    if sequence_metrics["count"] > 0 and not correlation_items:
         severity = _severity_from_count(int(sequence_metrics["count"]), medium_threshold=1, high_threshold=3)
         items.append(
             _build_item(
@@ -327,6 +443,42 @@ def normalize_evidence(
                 first_seen=sequence_metrics["first_seen"],
                 last_seen=sequence_metrics["last_seen"],
                 related_event_count=int(sequence_metrics["related_event_count"]),
+            )
+        )
+
+    items.extend(correlation_items)
+
+    typing_metrics = _typing_burst_metrics(events, features)
+    if typing_metrics["typing_behavior_anomaly_count"] > 0:
+        severity = MEDIUM if (
+            typing_metrics["paste_without_typing"] > 0
+            or typing_metrics["abnormal_pause_recovery"] > 0
+            or typing_metrics["typing_behavior_anomaly_count"] >= 3
+        ) else LOW
+        explanations: List[str] = []
+        if typing_metrics["paste_without_typing"] > 0:
+            explanations.append("Large paste activity occurred with minimal typing recovery.")
+        if typing_metrics["abnormal_pause_recovery"] > 0:
+            explanations.append("Irregular typing bursts were observed after prolonged pauses.")
+        if typing_metrics["rapid_typing_sequences"] > 0:
+            explanations.append(
+                f"Rapid typing bursts were detected {typing_metrics['rapid_typing_sequences']} time"
+                f"{'s' if typing_metrics['rapid_typing_sequences'] != 1 else ''}."
+            )
+        if not explanations:
+            explanations.append(
+                f"Typing consistency dropped to {typing_metrics['typing_consistency_score']:.2f} based on metadata-only timing patterns."
+            )
+        items.append(
+            _build_item(
+                signal_type=TYPING_BEHAVIOR,
+                title="Typing Behavior Anomalies",
+                severity=severity,
+                count=int(typing_metrics["typing_behavior_anomaly_count"]),
+                explanation=" ".join(explanations),
+                first_seen=typing_metrics["first_seen"],
+                last_seen=typing_metrics["last_seen"],
+                related_event_count=len(typing_metrics["typing_events"]),
             )
         )
 
@@ -375,12 +527,11 @@ def build_violation_overview_counts(
     )
     rapid_answer_burst_count = int(_rapid_answer_burst_metrics(events)["count"])
     suspicious_sequence_count = int(_suspicious_sequence_metrics(events)["count"])
-    keystroke_anomaly_count = sum(
-        1
-        for event in events
-        if "keystroke" in str(event.get("event_type") or "").lower()
-        or find_nested_value(event.get("payload"), ["keystroke_anomaly", "typing_anomaly", "keyboard_anomaly"]) in (True, 1, "1")
-    )
+    _, correlation_aggregate = _correlation_items(events)
+    if correlation_aggregate["count"] > 0:
+        suspicious_sequence_count = int(correlation_aggregate["count"])
+    typing_metrics = _typing_burst_metrics(events, features)
+    typing_behavior_anomaly_count = int(typing_metrics["typing_behavior_anomaly_count"])
     focus_loss_rate = round((focus_blur_count / len(events)) * 100) if events else 0
 
     return {
@@ -391,6 +542,9 @@ def build_violation_overview_counts(
         "idle_max_duration_s": int(idle_max_seconds),
         "rapid_answer_burst_count": rapid_answer_burst_count,
         "suspicious_sequence_count": suspicious_sequence_count,
-        "keystroke_anomaly_count": keystroke_anomaly_count,
+        "correlated_pattern_count": int(correlation_aggregate["pattern_count"]),
+        "typing_behavior_anomaly_count": typing_behavior_anomaly_count,
+        "typing_consistency_score": round(safe_float(typing_metrics["typing_consistency_score"]), 4),
+        "keystroke_anomaly_count": typing_behavior_anomaly_count,
         "focus_loss_rate": focus_loss_rate,
     }
