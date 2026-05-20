@@ -43,6 +43,26 @@ def _get_redis() -> Optional[redis.Redis]:
         return None
 
 
+def redis_health() -> Dict[str, Any]:
+    client = _get_redis()
+    if client is not None:
+        try:
+            client.ping()
+            return {
+                "reachable": True,
+                "mode": "redis",
+                "url": REDIS_URL,
+            }
+        except Exception:
+            pass
+
+    return {
+        "reachable": False,
+        "mode": "in-memory-fallback" if _redis_unavailable else "unavailable",
+        "url": REDIS_URL,
+    }
+
+
 # =========================
 # ACTIVE SESSION EVENTS
 # =========================

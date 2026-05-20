@@ -87,9 +87,45 @@ DEFAULT_VIEWER_NAME=Default Viewer
 
 Notes:
 - If `DATABASE_URL` is not set, local development falls back to `sqlite:///./risk_intel.db`.
+- If `DATABASE_URL` is set to a PostgreSQL URL, the backend uses PostgreSQL as the primary runtime database.
+- `REDIS_URL` defaults to `redis://localhost:6379/0` for local development and Docker Compose runs.
+- `APP_MODE` defaults to `local-demo` and is surfaced in `/health` and `/health/deep`.
 - Local demo schema changes are handled with `create_all` plus a lightweight compatibility patch.
 - Alembic is future work and is intentionally not introduced in this sprint.
 - `CORS_ALLOW_ORIGINS` is optional and is used when you need to allow a public frontend or SDK origin during a tunnel-based demo.
+
+### Runtime modes
+
+#### SQLite mode (quick local development)
+
+Do not set `DATABASE_URL`.
+
+The backend will use:
+
+```env
+DATABASE_URL=sqlite:///./risk_intel.db
+```
+
+This mode is convenient for local UI iteration and demo data seeding, but it is not the recommended mode for higher candidate counts.
+
+#### PostgreSQL + Redis mode (scalability foundation)
+
+Set:
+
+```env
+DATABASE_URL=postgresql://risk_user:risk_password@localhost:5432/risk_db
+REDIS_URL=redis://localhost:6379/0
+APP_MODE=local-postgres-redis
+DB_POOL_SIZE=10
+DB_MAX_OVERFLOW=20
+DB_POOL_RECYCLE_SECONDS=1800
+```
+
+This mode is the recommended local foundation for:
+- higher ingest concurrency
+- more realistic database behavior
+- Redis-backed live attempt state
+- load testing
 
 ## Start The Platform
 
@@ -103,6 +139,13 @@ API docs:
 
 ```text
 http://127.0.0.1:8000/docs
+```
+
+Health endpoints:
+
+```text
+http://127.0.0.1:8000/health
+http://127.0.0.1:8000/health/deep
 ```
 
 ### Frontend
@@ -130,6 +173,39 @@ Frontend URL:
 ```text
 http://127.0.0.1:5173
 ```
+
+## Docker Compose
+
+Docker Compose includes:
+- `db` (PostgreSQL 16)
+- `redis` (Redis 7)
+- `api` (FastAPI backend)
+- `frontend` (Vite dev server)
+
+Start the local scalable stack:
+
+```bash
+docker compose up --build
+```
+
+Default local ports:
+- Backend: `http://127.0.0.1:8000`
+- Frontend: `http://127.0.0.1:5173`
+- PostgreSQL: `localhost:5432`
+- Redis: `localhost:6379`
+
+The compose file uses sane local defaults and environment-variable overrides for:
+- `DATABASE_URL`
+- `REDIS_URL`
+- `JWT_SECRET_KEY`
+- `CORS_ALLOW_ORIGINS`
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_DB`
+- `API_PORT`
+- `FRONTEND_PORT`
+- `POSTGRES_PORT`
+- `REDIS_PORT`
 
 ## Seed Demo Users
 
@@ -175,11 +251,64 @@ Protected for logged-in reviewers and admins:
 - `GET /v1/live-risk/{attempt_id}`
 - `GET /v1/events/{attempt_id}`
 - `GET /v1/risk-history/{attempt_id}`
+- `GET /v1/reports/{attempt_id}`
+- `GET /v1/dashboard/summary`
+- `GET /v1/review-queue`
 
 Intentionally unauthenticated:
 - `POST /v1/events/ingest`
 - `GET /`
+- `GET /health`
+- `GET /health/deep`
 - `WS /ws/risk`
+
+## Ingest runtime notes
+
+`POST /v1/events/ingest` now:
+- validates required fields and timestamp shape through the request model
+- writes the raw event and risk snapshot in a single database transaction
+- uses Redis-backed live event state when available
+- falls back safely when Redis is unavailable
+
+This is still a synchronous request path. Background workers and queue-based ingest are future work.
+
+## Load testing ingest
+
+Use the new script to simulate candidate traffic against `/v1/events/ingest`.
+
+Examples:
+
+Run the default progression:
+
+```bash
+python scripts/load_test_ingest.py --base-url http://127.0.0.1:8000
+```
+
+Run a single scenario:
+
+```bash
+python scripts/load_test_ingest.py --base-url http://127.0.0.1:8000 --candidates 500 --events-per-candidate 12 --concurrency 40
+```
+
+Supported options:
+- `--base-url`
+- `--candidates`
+- `--events-per-candidate`
+- `--concurrency`
+- `--timeout`
+
+The script reports:
+- total events
+- success count
+- failure count
+- events per second
+- average latency
+- p95 latency
+
+Expected capacity note:
+- This branch is now prepared for PostgreSQL + Redis-backed local load testing and small-scale concurrency experiments.
+- It is not yet a horizontally scaled production architecture.
+- Background workers, queueing, observability, and deployment segmentation remain future work.
 
 ## Case Lifecycle
 

@@ -1,6 +1,6 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,12 +9,15 @@ import os
 import traceback
 
 from engine.core.scorer import run_scoring
-from engine.db.database import Base, engine, SessionLocal, ensure_demo_schema
+from sqlalchemy import text
+
+from engine.db.database import Base, engine, SessionLocal, current_database_mode, ensure_demo_schema
 from engine.db.models import AttemptLog, InvestigationCase, RawExamEvent, RiskHistory
 
 from engine.cache.redis_client import (
     append_event,
     get_events,
+    redis_health,
     set_current_risk,
     get_current_risk,
 )
@@ -35,11 +38,11 @@ from app.services.evidence_service import (
 )
 from app.services.report_summary_service import build_report_summary
 
-from fastapi import Depends
-
 RISK_HISTORY_SCORE_EPSILON = 0.01
 RISK_HISTORY_CONFIDENCE_EPSILON = 0.05
 ATTEMPT_LOG_FILE = Path("logs/attempt_logs.jsonl")
+APP_VERSION = "2.2.0"
+APP_MODE = os.getenv("APP_MODE", "local-demo").strip() or "local-demo"
 
 
 def _allowed_origins() -> list[str]:
@@ -64,7 +67,7 @@ def _allowed_origins() -> list[str]:
 
 app = FastAPI(
     title="Real-Time Risk Intelligence Platform",
-    version="2.2.0",
+    version=APP_VERSION,
 )
 
 app.include_router(auth_router)
@@ -90,24 +93,75 @@ def startup_event():
         print("[WARN] Database initialization failed:", e)
 
 
+def _database_health() -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        return {
+            "reachable": True,
+            "mode": current_database_mode(),
+        }
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "mode": current_database_mode(),
+            "error": str(exc),
+        }
+    finally:
+        db.close()
+
+
 class EventBatch(BaseModel):
-    attempt_id: str
+    attempt_id: str = Field(..., min_length=1, max_length=255)
     events: List[Dict[str, Any]]
 
 
 class ExamEventIngest(BaseModel):
-    attempt_id: str
+    attempt_id: str = Field(..., min_length=1, max_length=255)
 
-    candidate_id: Optional[str] = None
-    candidate_name: Optional[str] = None
-    candidate_email: Optional[str] = None
+    candidate_id: Optional[str] = Field(default=None, max_length=255)
+    candidate_name: Optional[str] = Field(default=None, max_length=255)
+    candidate_email: Optional[str] = Field(default=None, max_length=320)
 
-    assessment_id: Optional[str] = None
-    assessment_name: Optional[str] = None
+    assessment_id: Optional[str] = Field(default=None, max_length=255)
+    assessment_name: Optional[str] = Field(default=None, max_length=255)
 
-    event_type: str
-    payload: Dict[str, Any] = {}
+    event_type: str = Field(..., min_length=1, max_length=120)
+    payload: Dict[str, Any] = Field(default_factory=dict)
     occurred_at: str
+
+    @field_validator(
+        "attempt_id",
+        "candidate_id",
+        "candidate_name",
+        "candidate_email",
+        "assessment_id",
+        "assessment_name",
+        "event_type",
+        mode="before",
+    )
+    @classmethod
+    def _strip_string_fields(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _validate_occurred_at(cls, value: str) -> str:
+        if parse_timestamp(value) is None:
+            raise ValueError("occurred_at must be a valid ISO-8601 timestamp")
+        return value
+
+    @field_validator("payload")
+    @classmethod
+    def _validate_payload(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("payload must be a JSON object")
+        return value
 
 
 def utc_now():
@@ -600,10 +654,44 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
 def home():
     return {
         "message": "Server running",
-        "version": "2.2.0",
+        "version": APP_VERSION,
         "websocket": "/ws/risk",
         "progressive_ingestion": "/v1/events/ingest",
         "live_risk": "/v1/live-risk/{attempt_id}",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "real-time-risk-intelligence-platform",
+        "version": APP_VERSION,
+        "mode": APP_MODE,
+        "timestamp": utc_now(),
+    }
+
+
+@app.get("/health/deep")
+def health_deep():
+    database = _database_health()
+    redis = redis_health()
+    overall = "ok" if database.get("reachable") and redis.get("reachable") else "degraded"
+
+    return {
+        "status": overall,
+        "service": "real-time-risk-intelligence-platform",
+        "version": APP_VERSION,
+        "mode": APP_MODE,
+        "config": {
+            "database_mode": current_database_mode(),
+            "redis_mode": redis.get("mode"),
+        },
+        "checks": {
+            "database": database,
+            "redis": redis,
+        },
+        "timestamp": utc_now(),
     }
 
 
@@ -663,6 +751,9 @@ async def ingest_event(event: ExamEventIngest):
     db = SessionLocal()
 
     try:
+        if not event.event_type:
+            raise HTTPException(status_code=400, detail="event_type is required")
+
         received_at = utc_now()
 
         raw_event = RawExamEvent(
@@ -679,7 +770,7 @@ async def ingest_event(event: ExamEventIngest):
         )
 
         db.add(raw_event)
-        db.commit()
+        db.flush()
 
         redis_event = {
             "event_type": event.event_type,
@@ -691,13 +782,19 @@ async def ingest_event(event: ExamEventIngest):
         scoring_events = get_events(event.attempt_id)
 
         if not scoring_events:
-            all_events = (
-                db.query(RawExamEvent)
-                .filter(RawExamEvent.attempt_id == event.attempt_id)
-                .order_by(RawExamEvent.occurred_at.asc())
-                .all()
-            )
-            scoring_events = db_events_to_scoring_events(all_events)
+            scoring_events = [
+                {
+                    "event_type": item.event_type,
+                    "payload": item.payload or {},
+                    "occurred_at": item.occurred_at,
+                }
+                for item in (
+                    db.query(RawExamEvent.event_type, RawExamEvent.payload, RawExamEvent.occurred_at)
+                    .filter(RawExamEvent.attempt_id == event.attempt_id)
+                    .order_by(RawExamEvent.occurred_at.asc())
+                    .all()
+                )
+            ]
 
         result = run_scoring(scoring_events, event.attempt_id)
         score_value = safe_float(result.get("combined_score"), 0.0)
@@ -786,13 +883,13 @@ async def ingest_event(event: ExamEventIngest):
             },
         }
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         traceback.print_exc()
-        return {
-            "status": "error",
-            "message": str(e),
-        }
+        raise HTTPException(status_code=500, detail=f"Failed to ingest event: {e}") from e
 
     finally:
         db.close()
