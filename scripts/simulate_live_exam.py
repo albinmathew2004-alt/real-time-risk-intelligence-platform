@@ -39,34 +39,31 @@ CANDIDATES = [
 
 DEMO_PROFILES = [
     {
-        "attempt_id": "demo_normal_1001",
-        "candidate_name": "Nina Verma",
-        "candidate_email": "nina.verma@example.com",
-        "profile": "NormalThoughtfulCandidate",
+        "attempt_id": "demo_low_aarav_1001",
+        "candidate_name": "Aarav Menon",
+        "candidate_email": "aarav.menon@example.com",
+        "profile": "DemoLowAaravCandidate",
+        "question_count": 8,
     },
     {
-        "attempt_id": "demo_borderline_1002",
-        "candidate_name": "Rahul Mehta",
-        "candidate_email": "rahul.mehta@example.com",
-        "profile": "BorderlineCandidate",
+        "attempt_id": "demo_medium_neha_1002",
+        "candidate_name": "Neha Kapoor",
+        "candidate_email": "neha.kapoor@example.com",
+        "profile": "DemoMediumNehaCandidate",
+        "question_count": 8,
     },
     {
-        "attempt_id": "demo_cheater_1003",
-        "candidate_name": "Kavya Sen",
-        "candidate_email": "kavya.sen@example.com",
-        "profile": "AggressiveCheater",
-    },
-    {
-        "attempt_id": "demo_template_1004",
-        "candidate_name": "Ishaan Roy",
-        "candidate_email": "ishaan.roy@example.com",
-        "profile": "TemplateCopier",
+        "attempt_id": "demo_high_rohan_1003",
+        "candidate_name": "Rohan Malhotra",
+        "candidate_email": "rohan.malhotra@example.com",
+        "profile": "DemoHighRohanCandidate",
+        "question_count": 9,
     },
 ]
 
 
-def now_iso(offset_seconds=0.0):
-    return (datetime.now(timezone.utc) + timedelta(seconds=float(offset_seconds))).isoformat()
+def timestamp_from_base(base_time: datetime, offset_seconds=0.0):
+    return (base_time + timedelta(seconds=float(offset_seconds))).isoformat()
 
 
 def send_event(event, *, base_url: str):
@@ -90,8 +87,11 @@ def send_event(event, *, base_url: str):
                 f"  -> Risk: {data.get('current_risk')} | "
                 f"Score: {data.get('current_score')}"
             )
+            if response.status_code >= 400:
+                print(f"  -> Error: {data}")
         except Exception:
-            pass
+            if response.status_code >= 400:
+                print(f"  -> Error body: {response.text}")
 
     except Exception as e:
         print("Error:", e)
@@ -101,9 +101,11 @@ def build_event(
     attempt_id,
     candidate_name,
     candidate_email,
+    assessment_id,
     assessment_name,
     event_type,
     payload,
+    base_time,
     offset=0,
 ):
     return {
@@ -111,11 +113,11 @@ def build_event(
         "candidate_id": attempt_id.replace("attempt", "candidate"),
         "candidate_name": candidate_name,
         "candidate_email": candidate_email,
-        "assessment_id": "assessment_python_01",
+        "assessment_id": assessment_id,
         "assessment_name": assessment_name,
         "event_type": event_type,
         "payload": payload,
-        "occurred_at": now_iso(offset),
+        "occurred_at": timestamp_from_base(base_time, offset),
     }
 
 
@@ -125,15 +127,24 @@ def _default_question_ids():
     return [f"q{i+1}" for i in range(n)]
 
 
+def _question_ids_for_count(count: int):
+    return [f"q{i+1}" for i in range(max(1, int(count)))]
+
+
 def _to_built_events(
     *,
     attempt_id: str,
     candidate_name: str,
     candidate_email: str,
+    assessment_id: str,
     assessment_name: str,
     behavior_events: list[BehaviorEvent],
 ) -> list[dict]:
     built: list[dict] = []
+    max_behavior_offset = max((float(e.offset_s) for e in behavior_events), default=60.0)
+    submit_offset = float(max_behavior_offset + random.uniform(8.0, 25.0))
+    session_duration_s = max(submit_offset, 60.0)
+    session_start = datetime.now(timezone.utc) - timedelta(seconds=session_duration_s + 15.0)
 
     # Required bookends.
     built.append(
@@ -141,9 +152,11 @@ def _to_built_events(
             attempt_id,
             candidate_name,
             candidate_email,
+            assessment_id,
             assessment_name,
             "exam_started",
             {},
+            session_start,
             0.0,
         )
     )
@@ -155,28 +168,26 @@ def _to_built_events(
                 attempt_id,
                 candidate_name,
                 candidate_email,
+                assessment_id,
                 assessment_name,
                 ev.event_type,
                 ev.payload,
+                session_start,
                 float(ev.offset_s),
             )
         )
-
-    # Add a submit event slightly after the last behavioral action.
-    if behavior_events:
-        last_offset = max(float(e.offset_s) for e in behavior_events)
-    else:
-        last_offset = 60.0
 
     built.append(
         build_event(
             attempt_id,
             candidate_name,
             candidate_email,
+            assessment_id,
             assessment_name,
             "exam_submitted",
             {},
-            float(last_offset + random.uniform(8.0, 25.0)),
+            session_start,
+            submit_offset,
         )
     )
 
@@ -196,9 +207,10 @@ def simulate_candidate(
     sleep_min_s: float = 1.0,
     sleep_max_s: float = 2.0,
     seed: int | None = None,
+    question_count: int | None = None,
+    assessment_id: str = "assessment_python_01",
+    assessment_name: str = "Python Coding Assessment",
 ):
-    assessment_name = "Python Coding Assessment"
-
     print("\n===================================")
     print(f"Starting simulation for {candidate_name}")
     print(f"Candidate type: {str(candidate_type).upper()}")
@@ -219,12 +231,13 @@ def simulate_candidate(
     else:
         profile = profile_by_name(ct)
 
-    question_ids = _default_question_ids()
+    question_ids = _question_ids_for_count(question_count) if question_count else _default_question_ids()
     behavior_events = profile.generate(question_ids=question_ids)
     events = _to_built_events(
         attempt_id=attempt_id,
         candidate_name=candidate_name,
         candidate_email=candidate_email,
+        assessment_id=assessment_id,
         assessment_name=assessment_name,
         behavior_events=behavior_events,
     )
@@ -253,6 +266,11 @@ def main() -> int:
         description="Simulate realistic assessment behavior and stream events to /v1/events/ingest"
     )
     parser.add_argument("--base-url", default=BASE_URL, help="FastAPI base URL")
+    parser.add_argument("--attempt-id", default=None, help="Override the attempt_id for a single-candidate simulation")
+    parser.add_argument("--candidate-name", default=None, help="Override the candidate_name for a single-candidate simulation")
+    parser.add_argument("--candidate-email", default=None, help="Override the candidate_email for a single-candidate simulation")
+    parser.add_argument("--assessment-id", default="assessment_python_01", help="Assessment identifier to send with events")
+    parser.add_argument("--assessment-name", default="Python Coding Assessment", help="Assessment name to send with events")
     parser.add_argument(
         "--profile",
         default="weighted",
@@ -300,6 +318,9 @@ def main() -> int:
                 sleep_min_s=float(args.sleep_min),
                 sleep_max_s=float(args.sleep_max),
                 seed=args.seed,
+                question_count=int(candidate.get("question_count") or 0) or None,
+                assessment_id=str(args.assessment_id),
+                assessment_name=str(args.assessment_name),
             )
         return 0
 
@@ -314,9 +335,9 @@ def main() -> int:
             chosen = str(args.profile)
 
         simulate_candidate(
-            attempt_id=f"attempt_{1000 + i}",
-            candidate_name=name,
-            candidate_email=email,
+            attempt_id=str(args.attempt_id or f"attempt_{1000 + i}"),
+            candidate_name=str(args.candidate_name or name),
+            candidate_email=str(args.candidate_email or email),
             candidate_type=chosen,
             base_url=str(args.base_url),
             dry_run=bool(args.dry_run),
@@ -324,6 +345,8 @@ def main() -> int:
             sleep_min_s=float(args.sleep_min),
             sleep_max_s=float(args.sleep_max),
             seed=args.seed,
+            assessment_id=str(args.assessment_id),
+            assessment_name=str(args.assessment_name),
         )
 
     return 0

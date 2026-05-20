@@ -55,26 +55,30 @@
       This page demonstrates how to embed <strong>sdk/risk-telemetry-sdk.js</strong> into a simple assessment.
       It sends metadata-only events to your existing backend endpoint: <code>POST /v1/events/ingest</code>.
     </p>
+    <p class="muted">
+      Candidate consent placeholder: this demo collects behavioral telemetry metadata for assessment integrity.
+      It does not capture webcam, audio, screen recordings, answer text, or clipboard contents.
+    </p>
 
     <div class="row">
       <div class="card" style="flex: 1; min-width: 320px;">
         <h2>1) Setup</h2>
 
         <label>Base URL (FastAPI)</label>
-        <input id="baseUrl" value="http://localhost:8000" />
-        <p class="muted">For multi-device demos, point this to your public backend tunnel URL.</p>
+        <input id="baseUrl" value="https://your-demo-backend.example.com" />
+        <p class="muted">For hosted demos, point this to your deployed backend URL. For local development, use http://127.0.0.1:8000.</p>
 
         <label>Attempt ID</label>
-        <input id="attemptId" value="attempt_demo_001" />
+        <input id="attemptId" value="demo_hosted_1001" />
 
         <label>Candidate ID</label>
         <input id="candidateId" value="candidate_demo_001" />
 
         <label>Candidate Name</label>
-        <input id="candidateName" value="Demo Candidate" />
+        <input id="candidateName" value="Hosted Demo Candidate" />
 
         <label>Candidate Email</label>
-        <input id="candidateEmail" value="demo.candidate@example.com" />
+        <input id="candidateEmail" value="hosted.demo@example.com" />
 
         <label>Assessment ID</label>
         <input id="assessmentId" value="assessment_python_01" />
@@ -151,8 +155,14 @@
           savedBaseUrl = null;
         }
 
-        var initialBaseUrl = params.get('baseUrl') || savedBaseUrl || 'http://localhost:8000';
+        var initialBaseUrl = params.get('baseUrl') || savedBaseUrl || 'https://your-demo-backend.example.com';
         document.getElementById('baseUrl').value = initialBaseUrl;
+        if (params.get('attemptId')) document.getElementById('attemptId').value = params.get('attemptId');
+        if (params.get('candidateId')) document.getElementById('candidateId').value = params.get('candidateId');
+        if (params.get('candidateName')) document.getElementById('candidateName').value = params.get('candidateName');
+        if (params.get('candidateEmail')) document.getElementById('candidateEmail').value = params.get('candidateEmail');
+        if (params.get('assessmentId')) document.getElementById('assessmentId').value = params.get('assessmentId');
+        if (params.get('assessmentName')) document.getElementById('assessmentName').value = params.get('assessmentName');
 
         function setStatus(msg) {
           document.getElementById('status').textContent = 'SDK status: ' + msg;

@@ -31,6 +31,14 @@ It only sends metadata such as:
 - Visibility state
 - Typing duration (approx)
 
+## Candidate Consent Placeholder
+
+Before using this SDK with external candidates, show a consent notice similar to:
+
+> This assessment collects behavioral telemetry metadata to help protect assessment integrity.
+> It does not record webcam, audio, screen video, typed answer text, or clipboard contents.
+> It may collect timestamps, focus changes, idle periods, paste-size metadata, and question-navigation behavior.
+
 ## How To Include
 
 Add the SDK to your assessment page:
@@ -43,7 +51,7 @@ Then initialize it:
 
 ```js
 RiskTelemetry.init({
-  baseUrl: 'http://localhost:8000',
+  baseUrl: 'https://your-demo-backend.example.com',
   attemptId: 'attempt_123',
 
   candidateId: 'cand_001',
@@ -60,7 +68,7 @@ RiskTelemetry.init({
 })
 ```
 
-The SDK endpoint is configurable through `baseUrl`. For a multi-device demo, this should be your public backend tunnel URL rather than `localhost`.
+The SDK endpoint is configurable through `baseUrl`. For a hosted or multi-device demo, this should be your public backend URL rather than `localhost`.
 
 ## SDK API
 
@@ -119,7 +127,7 @@ The SDK emits events that match the backend ingest model in `app/main.py`:
 docker compose up
 ```
 
-The API should be available at `http://localhost:8000`.
+The API should be available at your configured backend URL, for example `http://localhost:8000` locally or `https://your-demo-backend.example.com` when hosted.
 
 ### 2) Start frontend (dashboard)
 
@@ -136,7 +144,7 @@ Open `sdk/example-assessment.html` directly in your browser.
 You can also prefill the backend endpoint with a query string:
 
 ```text
-sdk/example-assessment.html?baseUrl=https://your-backend-tunnel.example
+sdk/example-assessment.html?baseUrl=https://your-demo-backend.example.com&attemptId=demo_hosted_1001&candidateName=Hosted%20Demo%20Candidate&candidateEmail=hosted.demo@example.com&assessmentId=assessment_python_01&assessmentName=Python%20Coding%20Assessment
 ```
 
 Then:
@@ -155,7 +163,7 @@ Tip: The SDK uses `devMode: true` in the example page so you can watch console l
 ## Troubleshooting
 
 - If your browser blocks requests due to CORS, ensure you are using an origin allowed by the backend CORS list.
-- For tunneled demos, add the public frontend / SDK origin to backend `CORS_ALLOW_ORIGINS`.
+- For hosted or tunneled demos, add the public frontend / SDK origin to backend `CORS_ALLOW_ORIGINS`.
   - For local testing, opening the HTML file as `file://` may not be treated as `http://localhost:5173`.
   - Easiest: serve `sdk/` via a simple static server or open the file in a browser that allows local requests.
 

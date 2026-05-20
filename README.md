@@ -74,15 +74,9 @@ Minimum required variables:
 
 ```env
 JWT_SECRET_KEY=change-me
-DEFAULT_ADMIN_EMAIL=admin@example.com
-DEFAULT_ADMIN_PASSWORD=AdminPass123!
-DEFAULT_ADMIN_NAME=Default Admin
-DEFAULT_REVIEWER_EMAIL=reviewer@example.com
-DEFAULT_REVIEWER_PASSWORD=ReviewerPass123!
-DEFAULT_REVIEWER_NAME=Default Reviewer
-DEFAULT_VIEWER_EMAIL=viewer@example.com
-DEFAULT_VIEWER_PASSWORD=ViewerPass123!
-DEFAULT_VIEWER_NAME=Default Viewer
+DEMO_ADMIN_EMAIL=admin@example.com
+DEMO_ADMIN_PASSWORD=change-me-admin-password
+DEMO_ADMIN_NAME=Demo Administrator
 ```
 
 Notes:
@@ -90,9 +84,13 @@ Notes:
 - If `DATABASE_URL` is set to a PostgreSQL URL, the backend uses PostgreSQL as the primary runtime database.
 - `REDIS_URL` defaults to `redis://localhost:6379/0` for local development and Docker Compose runs.
 - `APP_MODE` defaults to `local-demo` and is surfaced in `/health` and `/health/deep`.
+- `ENABLE_DOCS` defaults to `true` only in local/dev-style modes. In hosted demo mode, leave it unset or set it explicitly to `false`.
+- `FRONTEND_URL` can be used to add the hosted reviewer console origin to the backend CORS allow-list.
 - Local demo schema changes are handled with `create_all` plus a lightweight compatibility patch.
 - Alembic is future work and is intentionally not introduced in this sprint.
 - `CORS_ALLOW_ORIGINS` is optional and is used when you need to allow a public frontend or SDK origin during a tunnel-based demo.
+- In hosted modes, `CORS_ALLOW_ORIGINS` must be explicit and cannot contain `*`.
+- `PERSIST_DEMO_DATA=true` keeps enterprise demo seeding append-only unless you explicitly pass a reset flag.
 
 ### Runtime modes
 
@@ -198,6 +196,8 @@ The compose file uses sane local defaults and environment-variable overrides for
 - `DATABASE_URL`
 - `REDIS_URL`
 - `JWT_SECRET_KEY`
+- `ENABLE_DOCS`
+- `FRONTEND_URL`
 - `CORS_ALLOW_ORIGINS`
 - `POSTGRES_USER`
 - `POSTGRES_PASSWORD`
@@ -229,6 +229,27 @@ python scripts/seed_reviewer.py
 python scripts/seed_viewer.py
 ```
 
+## Seed Persistent Enterprise Demo Data
+
+Generate an operational demo dataset with realistic LOW / MEDIUM / HIGH attempts:
+
+```bash
+python scripts/seed_demo_dataset.py
+```
+
+Useful options:
+
+```bash
+python scripts/seed_demo_dataset.py --count 100 --seed 42
+python scripts/seed_demo_dataset.py --reset --count 100 --seed 42
+```
+
+Behavior:
+- uses deterministic scoring and existing telemetry profiles
+- keeps data persistent across restarts when `PERSIST_DEMO_DATA=true`
+- skips existing dataset attempt IDs safely on repeat runs
+- only deletes dataset-prefixed attempts when `--reset` is explicitly provided
+
 ## Local Demo Credentials
 
 - Admin: `admin@example.com` / `AdminPass123!`
@@ -236,6 +257,11 @@ python scripts/seed_viewer.py
 - Viewer: `viewer@example.com` / `ViewerPass123!`
 
 If you change the environment variables, use those values instead.
+
+For controlled hosted demos, prefer seeding only the admin account with:
+- `DEMO_ADMIN_EMAIL`
+- `DEMO_ADMIN_PASSWORD`
+- `DEMO_ADMIN_NAME`
 
 ## Reviewer Workflow APIs
 
@@ -605,6 +631,180 @@ This is the architecture path only. It is not fully implemented in this sprint.
 - WebSocket access remains unauthenticated to avoid breaking the current live demo path.
 - The frontend is optimized for a controlled demo, not full multi-user case collaboration.
 - Local SQLite is supported for demo convenience; PostgreSQL remains the preferred path outside the demo setup.
+
+## Controlled Demo Hosting Guide
+
+This platform is ready for a controlled online demo or pilot. It is not yet a public SaaS product.
+
+### Intended hosting shape
+
+- hosted frontend
+- hosted FastAPI backend
+- PostgreSQL database
+- Redis if available
+- HTTPS on both frontend and backend
+- seeded admin-only demo login
+- persistent demo dataset
+- candidate assessment page using the SDK example or a thin custom wrapper
+
+### Required environment variables
+
+Backend:
+
+```env
+DATABASE_URL=postgresql://risk_user:risk_password@db-host:5432/risk_db
+REDIS_URL=redis://redis-host:6379/0
+JWT_SECRET_KEY=replace-with-a-strong-secret
+CORS_ALLOW_ORIGINS=https://your-frontend.example.com,https://your-sdk-origin.example.com
+FRONTEND_URL=https://your-frontend.example.com
+APP_MODE=controlled-demo
+ENABLE_DOCS=false
+PERSIST_DEMO_DATA=true
+DEMO_ADMIN_EMAIL=admin@example.com
+DEMO_ADMIN_PASSWORD=replace-with-a-strong-password
+DEMO_ADMIN_NAME=Demo Administrator
+```
+
+Frontend:
+
+```env
+VITE_API_BASE_URL=https://your-backend.example.com
+```
+
+### Backend deployment
+
+#### Option A: Render / Railway style deployment
+
+1. Provision PostgreSQL.
+2. Provision Redis if available.
+3. Deploy the repo as a Python web service.
+4. Set the backend environment variables listed above.
+5. Start the API with:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+6. Seed the admin:
+
+```bash
+python scripts/seed_admin.py
+```
+
+7. Seed the persistent demo dataset:
+
+```bash
+python scripts/seed_demo_dataset.py --count 100 --seed 42
+```
+
+#### Option B: Docker Compose on a VPS
+
+1. Copy `.env.example` to `.env`.
+2. Replace the demo defaults with strong values.
+3. Set:
+
+```env
+APP_MODE=controlled-demo
+ENABLE_DOCS=false
+JWT_SECRET_KEY=replace-with-a-strong-secret
+FRONTEND_URL=https://your-frontend.example.com
+CORS_ALLOW_ORIGINS=https://your-frontend.example.com,https://your-sdk-origin.example.com
+VITE_API_BASE_URL=https://your-backend.example.com
+```
+
+4. Start:
+
+```bash
+docker compose up --build -d
+```
+
+5. Seed:
+
+```bash
+python scripts/seed_admin.py
+python scripts/seed_demo_dataset.py --count 100 --seed 42
+```
+
+### Frontend deployment
+
+Build command:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+The reviewer console must be configured with:
+
+```env
+VITE_API_BASE_URL=https://your-backend.example.com
+```
+
+You can host the built `frontend/dist` on any static host that supports HTTPS.
+
+### Candidate SDK / assessment link
+
+The SDK and example assessment already support:
+- configurable backend base URL
+- configurable `attemptId`
+- configurable candidate metadata
+- configurable `assessmentId`
+- configurable `assessmentName`
+
+Example hosted URL:
+
+```text
+https://your-sdk-host.example.com/example-assessment.html?baseUrl=https://your-backend.example.com&attemptId=demo_hosted_1001&candidateName=Hosted%20Demo%20Candidate&candidateEmail=hosted.demo@example.com&assessmentId=assessment_python_01&assessmentName=Python%20Coding%20Assessment
+```
+
+### Demo startup checklist
+
+1. Set a strong `JWT_SECRET_KEY`.
+2. Set `APP_MODE=controlled-demo`.
+3. Set `ENABLE_DOCS=false`.
+4. Set `FRONTEND_URL`.
+5. Set explicit `CORS_ALLOW_ORIGINS`.
+6. Seed the admin account.
+7. Seed the persistent demo dataset.
+8. Verify backend health endpoints.
+9. Verify frontend login.
+10. Verify the Review Queue and Investigation Report render with seeded data.
+
+### Post-deployment verification checklist
+
+Backend:
+- `GET /health`
+- `GET /health/deep`
+- `POST /v1/auth/login` with the seeded admin
+
+Frontend:
+- login works
+- Command Center loads
+- Review Queue loads
+- Investigation Report loads
+- PDF export works if used
+
+SDK:
+- `POST /v1/events/ingest` accepts telemetry from the hosted assessment page
+- new attempts appear in the reviewer console
+
+### Security warnings
+
+- This is not a public self-serve SaaS yet.
+- Do not enable public signup.
+- Do not expose default demo passwords online.
+- Do not use the system for real high-stakes exam decisions yet.
+- Show a candidate privacy/consent notice before external pilot use.
+- Prefer admin-only hosted demo access unless you explicitly need reviewer/viewer roles.
+
+### Remaining production gaps
+
+- Alembic migrations are still future work.
+- WebSocket auth is still not hardened for internet-facing multi-user production use.
+- Background workers and durable async ingest are not implemented yet.
+- Full observability, alerting, and audit export are still future work.
+- This is suitable for controlled demos and pilots, not broad public internet launch.
 
 ## Future Work Not Implemented
 

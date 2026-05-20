@@ -17,13 +17,13 @@ from app.models.user import User, UserRole
 
 
 def main() -> None:
-    email = os.getenv("DEFAULT_ADMIN_EMAIL", "")
-    password = os.getenv("DEFAULT_ADMIN_PASSWORD", "")
-    full_name = os.getenv("DEFAULT_ADMIN_NAME", "Default Admin")
+    email = os.getenv("DEMO_ADMIN_EMAIL", "").strip() or os.getenv("DEFAULT_ADMIN_EMAIL", "")
+    password = os.getenv("DEMO_ADMIN_PASSWORD", "").strip() or os.getenv("DEFAULT_ADMIN_PASSWORD", "")
+    full_name = os.getenv("DEMO_ADMIN_NAME", "").strip() or os.getenv("DEFAULT_ADMIN_NAME", "Default Admin")
 
     if not email or not password:
         raise SystemExit(
-            "Missing DEFAULT_ADMIN_EMAIL/DEFAULT_ADMIN_PASSWORD. "
+            "Missing DEMO_ADMIN_EMAIL/DEMO_ADMIN_PASSWORD (or DEFAULT_ADMIN_EMAIL/DEFAULT_ADMIN_PASSWORD). "
             "Set them as environment variables before running this script."
         )
 
