@@ -46,15 +46,22 @@ import ViolationOverview from "./components/ViolationOverview";
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
 function toWsUrl(baseUrl, path) {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   try {
-    const url = new URL(baseUrl);
+    const rawBase = String(baseUrl || "").trim();
+    const withProtocol = /^https?:\/\//i.test(rawBase)
+      ? rawBase
+      : `${window.location.protocol === "https:" ? "https:" : "http:"}//${rawBase.replace(/^\/+/, "")}`;
+    const url = new URL(withProtocol);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.pathname = path;
+    url.pathname = normalizedPath;
     url.search = "";
     url.hash = "";
     return url.toString();
   } catch {
-    return `ws://127.0.0.1:8000${path}`;
+    const pageProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const fallbackHost = window.location.host || "127.0.0.1:8000";
+    return `${pageProtocol}//${fallbackHost}${normalizedPath}`;
   }
 }
 
@@ -1267,6 +1274,7 @@ export default function App() {
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [wsState, setWsState] = useState("paused");
   const [searchTerm, setSearchTerm] = useState("");
   const [riskFilter, setRiskFilter] = useState({ LOW: true, MEDIUM: true, HIGH: true });
 
@@ -1478,62 +1486,104 @@ export default function App() {
     }, 0);
     if (!liveUpdatesEnabled) {
       setWsConnected(false);
+      setWsState("paused");
       return () => {
         window.clearTimeout(timeoutId);
       };
     }
+    let ws;
+    let reconnectTimerId;
+    let disposed = false;
 
-    const ws = new WebSocket(WS_URL);
-
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
-    ws.onerror = () => setWsConnected(false);
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type !== "risk_update") return;
-
-        const newLog = {
-          timestamp: new Date().toISOString(),
-          attempt_id: data.attempt_id,
-          candidate_id: data.candidate_id,
-          candidate_name: data.candidate_name,
-          candidate_email: data.candidate_email,
-          assessment_id: data.assessment_id,
-          assessment_name: data.assessment_name,
-          risk: data.risk,
-          confidence: data.confidence,
-          combined_score: data.combined_score,
-          explanation: data.explanation,
-          explanation_text: data.explanation,
-          latest_event: data.latest_event,
-          timeline_point: data.timeline_point,
-          event_count: data.event_count,
-          features: data.features || {},
-          signals: data.signals || {},
-        };
-
-        setLogs((prev) => {
-          const exists = prev.some((x) => x.attempt_id === newLog.attempt_id);
-          if (exists) {
-            return prev.map((x) => (x.attempt_id === newLog.attempt_id ? { ...x, ...newLog } : x));
-          }
-          return [...prev, newLog].slice(-500);
-        });
-
-        setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
-        void fetchCases();
-        void fetchDashboardSummary();
-        void fetchReviewQueue();
-      } catch (err) {
-        console.error("WS parse error:", err);
-      }
+    const scheduleReconnect = () => {
+      if (disposed || !liveUpdatesEnabled) return;
+      setWsState("reconnecting");
+      reconnectTimerId = window.setTimeout(() => {
+        if (!disposed) {
+          connect();
+        }
+      }, 2500);
     };
 
+    const connect = () => {
+      try {
+        setWsState("reconnecting");
+        ws = new WebSocket(WS_URL);
+      } catch (error) {
+        console.error("WS connection error:", error);
+        setWsConnected(false);
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        setWsConnected(true);
+        setWsState("connected");
+      };
+      ws.onerror = () => {
+        setWsConnected(false);
+        setWsState("reconnecting");
+      };
+      ws.onclose = () => {
+        setWsConnected(false);
+        if (!disposed) {
+          scheduleReconnect();
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type !== "risk_update") return;
+
+          const newLog = {
+            timestamp: new Date().toISOString(),
+            attempt_id: data.attempt_id,
+            candidate_id: data.candidate_id,
+            candidate_name: data.candidate_name,
+            candidate_email: data.candidate_email,
+            assessment_id: data.assessment_id,
+            assessment_name: data.assessment_name,
+            risk: data.risk,
+            confidence: data.confidence,
+            combined_score: data.combined_score,
+            explanation: data.explanation,
+            explanation_text: data.explanation,
+            latest_event: data.latest_event,
+            timeline_point: data.timeline_point,
+            event_count: data.event_count,
+            features: data.features || {},
+            signals: data.signals || {},
+          };
+
+          setLogs((prev) => {
+            const exists = prev.some((x) => x.attempt_id === newLog.attempt_id);
+            if (exists) {
+              return prev.map((x) => (x.attempt_id === newLog.attempt_id ? { ...x, ...newLog } : x));
+            }
+            return [...prev, newLog].slice(-500);
+          });
+
+          setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
+          void fetchCases();
+          void fetchDashboardSummary();
+          void fetchReviewQueue();
+        } catch (err) {
+          console.error("WS parse error:", err);
+        }
+      };
+    };
+
+    connect();
+
     return () => {
+      disposed = true;
       window.clearTimeout(timeoutId);
-      ws.close();
+      window.clearTimeout(reconnectTimerId);
+      setWsState("paused");
+      if (ws && ws.readyState < WebSocket.CLOSING) {
+        ws.close();
+      }
     };
   }, [fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, liveUpdatesEnabled, token]);
 
@@ -1581,6 +1631,16 @@ export default function App() {
     const avgConfidence = filteredLogs.reduce((sum, x) => sum + Number(x.confidence || 0), 0) / (total || 1);
     return { total, high, medium, low, ongoing, completed, avgConfidence };
   }, [filteredLogs]);
+  const wsStatusLabel = wsState === "connected"
+    ? "Live stream connected"
+    : wsState === "reconnecting"
+      ? "Live stream reconnecting"
+      : "Live stream paused";
+  const wsStatusDetail = wsState === "connected"
+    ? "Receiving events"
+    : wsState === "reconnecting"
+      ? "REST polling continues while the stream reconnects"
+      : "Live updates are paused";
 
   if (!token) {
     return (
@@ -1638,9 +1698,9 @@ export default function App() {
           <div className={`connection-card ${wsConnected ? "online" : "offline"}`}>
             <div className="connection-card-row">
               <span className="pulse"></span>
-              <strong>{wsConnected ? "Live stream connected" : "Live stream disconnected"}</strong>
+              <strong>{wsStatusLabel}</strong>
             </div>
-            <small>{wsConnected ? "Receiving events" : "Waiting for stream recovery"}</small>
+            <small>{wsStatusDetail}</small>
           </div>
 
           {currentUser ? (
@@ -1673,6 +1733,7 @@ export default function App() {
             setPage={setPage}
             loading={loading}
             wsConnected={wsConnected}
+            wsState={wsState}
           />
         )}
 
@@ -1712,6 +1773,7 @@ export default function App() {
             currentUser={currentUser}
             apiBaseUrl={API_BASE_URL}
             wsConnected={wsConnected}
+            wsState={wsState}
             themeMode={themeMode}
             onThemeModeChange={setThemeMode}
             autoRefreshInterval={autoRefreshInterval}
@@ -1727,7 +1789,7 @@ export default function App() {
   );
 }
 
-function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setSelected, setPage, loading, wsConnected }) {
+function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setSelected, setPage, loading, wsConnected, wsState }) {
   const [feedExpanded, setFeedExpanded] = useState(false);
   const recentLogs = useMemo(
     () => filterRecentItems(logs, (item) => item?.timestamp || getLastActivityAt(item)),
@@ -1947,7 +2009,12 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
           <PanelHeader title="System Health" subtitle="Real-time system status" />
           <div className="system-health-list">
             <SystemHealthRow icon={<Server size={16} />} label="Backend API" value={dashboardSummary?.system_health_basic?.backend_api || getHealthLabel(logs.length > 0, loading)} tone="success" />
-            <SystemHealthRow icon={<Wifi size={16} />} label="WebSocket Stream" value={dashboardSummary?.system_health_basic?.websocket_stream || (wsConnected ? "Connected" : "Disconnected")} tone={(dashboardSummary?.system_health_basic?.websocket_stream || (wsConnected ? "Connected" : "Disconnected")) === "Disconnected" ? "danger" : "success"} />
+            <SystemHealthRow
+              icon={<Wifi size={16} />}
+              label="WebSocket Stream"
+              value={dashboardSummary?.system_health_basic?.websocket_stream || (wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused")}
+              tone={(dashboardSummary?.system_health_basic?.websocket_stream || (wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused")) === "Connected" ? "success" : "danger"}
+            />
             <SystemHealthRow icon={<Radio size={16} />} label="Event Stream" value={dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")} tone={(dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")) === "Idle" ? "warning" : "success"} />
             <SystemHealthRow icon={<ShieldCheck size={16} />} label="Authentication" value={dashboardSummary?.system_health_basic?.authentication || (currentUser ? "Active" : "Unknown")} tone="success" />
             <SystemHealthRow icon={<Database size={16} />} label="Database" value={dashboardSummary?.system_health_basic?.database || (logs.length || cases.length ? "Healthy" : "Awaiting Data")} tone="success" />
@@ -2953,6 +3020,7 @@ function SettingsPage({
   currentUser,
   apiBaseUrl,
   wsConnected,
+  wsState,
   themeMode,
   onThemeModeChange,
   autoRefreshInterval,
@@ -2965,7 +3033,7 @@ function SettingsPage({
   const sessionState = currentUser ? "Authenticated" : "Signed out";
   const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "System default";
   const appVersion = import.meta.env.VITE_APP_VERSION || "Demo Build";
-  const wsStatus = wsConnected ? "Connected" : liveUpdatesEnabled ? "Reconnecting" : "Paused";
+  const wsStatus = wsState === "connected" ? "Connected" : liveUpdatesEnabled ? "Reconnecting" : "Paused";
 
   return (
     <div className="settings-page">
