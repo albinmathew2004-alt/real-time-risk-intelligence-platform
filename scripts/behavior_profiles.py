@@ -133,6 +133,10 @@ def _paste_event(out: List[BehaviorEvent], *, offset_s: float, size: str, source
     out.append(BehaviorEvent(offset_s=offset_s, event_type="clipboard", payload=payload))
 
 
+def _metadata_event(out: List[BehaviorEvent], *, offset_s: float, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    out.append(BehaviorEvent(offset_s=offset_s, event_type=event_type, payload=payload or {}))
+
+
 def _typing_activity(out: List[BehaviorEvent], *, offset_s: float, dwell_s: float, qid: str) -> None:
     if dwell_s < 4:
         return
@@ -620,6 +624,335 @@ class AggressiveCheater(CandidateProfile):
         return out
 
 
+class HighRiskLongSessionCandidate(CandidateProfile):
+    """Long-running, explainable HIGH-risk candidate for demos.
+
+    Story:
+    - starts with mostly normal pacing
+    - later shows repeated focus loss / clipboard / answer-change sequences
+    - includes typing anomalies after idle periods
+    - uses repeated paste-without-typing patterns
+    - runs long enough for session intelligence momentum and correlation amplification
+    """
+
+    name = "HighRiskLongSessionCandidate"
+
+    def generate(self, *, question_ids: Sequence[str]) -> List[BehaviorEvent]:
+        out: List[BehaviorEvent] = []
+        t = 0.0
+        qids = list(question_ids) if question_ids else _pick_question_ids(8)
+
+        # Warm-up: plausible early-session behavior before the suspicious patterns begin.
+        warmup_count = min(2, len(qids))
+        for qid in qids[:warmup_count]:
+            _metadata_event(out, offset_s=t + 0.4, event_type="normal_mouse_activity", payload={"question_id": qid, "activity": "pointer_move"})
+            _metadata_event(out, offset_s=t + 1.0, event_type="question_viewed", payload={"question_id": qid})
+            dwell = _lognormal_seconds(median_s=24, sigma=0.30, min_s=14, max_s=42)
+            t = _question_view_pair(out, offset_s=t, qid=qid, dwell_s=_jitter(dwell))
+            _metadata_event(out, offset_s=t - 6.0, event_type="normal_typing", payload={"question_id": qid, "duration_s": round(random.uniform(5.0, 12.0), 2)})
+            _answer_event(out, offset_s=t - _jitter(random.uniform(2.4, 7.2)), qid=qid, style="considered_answer")
+            _metadata_event(out, offset_s=t - 1.2, event_type="answer_changed", payload={"question_id": qid, "mode": "normal"})
+            t += _jitter(random.uniform(16.0, 26.0))
+
+        # Suspicious second phase: repeated correlated patterns across a long session.
+        suspicious_passes = 3
+        for pass_index in range(suspicious_passes):
+            pass_qids = qids[warmup_count:] if pass_index == 0 else qids[max(1, warmup_count - 1):]
+            for idx, qid in enumerate(pass_qids):
+                question_start = t
+                _metadata_event(out, offset_s=t + 0.3, event_type="normal_mouse_activity", payload={"question_id": qid, "activity": "cursor_pause"})
+                _metadata_event(out, offset_s=t + 0.8, event_type="question_viewed", payload={"question_id": qid})
+                out.append(BehaviorEvent(offset_s=t, event_type="question_view", payload={"question_id": qid, "action": "enter"}))
+
+                # A very short in-question read before the suspicious sequence begins.
+                t += _jitter(random.uniform(0.4, 1.1))
+
+                # Repeated focus-loss cluster helps the correlation engine and storyline.
+                blur_offset = t + _jitter(random.uniform(0.2, 0.8))
+                _metadata_event(out, offset_s=blur_offset, event_type="blur", payload={"question_id": qid, "reason": "window_switch"})
+                t = _tab_switch_pair(
+                    out,
+                    offset_s=blur_offset + 0.05,
+                    away_s=_jitter(random.uniform(0.8, 2.2)),
+                    reason="external_lookup",
+                )
+                _metadata_event(out, offset_s=t + 0.02, event_type="focus", payload={"question_id": qid, "reason": "window_return"})
+
+                # Clipboard metadata plus existing engine-driving clipboard event.
+                _metadata_event(out, offset_s=t + 0.08, event_type="clipboard_copy", payload={"question_id": qid, "size": "small", "source": "external"})
+                _metadata_event(out, offset_s=t + 0.18, event_type="clipboard_paste", payload={"question_id": qid, "size": random.choice(["medium", "large"]), "source": "external"})
+                _paste_event(out, offset_s=t + 0.22, size=random.choice(["medium", "large"]), source="external", question_id=qid)
+
+                # Some questions get minimal/no typing after paste to trigger paste-without-typing.
+                if (idx + pass_index) % 3 != 0:
+                    _metadata_event(out, offset_s=t + 0.6, event_type="typing_started", payload={"question_id": qid, "input_context": "answer_box"})
+                    _metadata_event(
+                        out,
+                        offset_s=t + 0.72,
+                        event_type="typing_burst",
+                        payload={
+                            "question_id": qid,
+                            "burst_length": random.randint(6, 10),
+                            "duration_ms": random.randint(520, 980),
+                            "interval_ms": random.choice([76, 82, 94]),
+                        },
+                    )
+                    _metadata_event(
+                        out,
+                        offset_s=t + 1.05,
+                        event_type="typing_stopped",
+                        payload={"question_id": qid, "session_duration_ms": random.randint(500, 1400), "total_bursts": 1, "pause_count": 0},
+                    )
+
+                answer_offset = t + _jitter(random.uniform(0.45, 1.35))
+                _metadata_event(out, offset_s=answer_offset - 0.18, event_type="rapid_answer_burst", payload={"question_id": qid, "burst_count": random.randint(2, 4)})
+                _metadata_event(out, offset_s=answer_offset - 0.1, event_type="answer_changed", payload={"question_id": qid, "mode": "post_return_edit"})
+                _answer_event(out, offset_s=answer_offset, qid=qid, style="post_lookup_change")
+                out.append(BehaviorEvent(offset_s=answer_offset + 0.18, event_type="question_view", payload={"question_id": qid, "action": "leave"}))
+                t = answer_offset + 0.18
+
+                # Extra clustered focus loss to reinforce repeated patterns.
+                if random.random() < 0.8:
+                    extra_blur = t + _jitter(random.uniform(0.5, 1.2))
+                    _metadata_event(out, offset_s=extra_blur, event_type="blur", payload={"question_id": qid, "reason": "repeat_switch"})
+                    t = _tab_switch_pair(out, offset_s=extra_blur + 0.04, away_s=_jitter(random.uniform(2.0, 7.0)), reason="repeat_lookup")
+                    _metadata_event(out, offset_s=t + 0.02, event_type="focus", payload={"question_id": qid, "reason": "repeat_return"})
+
+                # Longer between-question pauses keep the session realistic without inflating question dwell time.
+                if idx % 2 == 0 or pass_index == 1:
+                    idle_for = _lognormal_seconds(median_s=46, sigma=0.45, min_s=24, max_s=110)
+                    t = _idle_pair(out, offset_s=t + 0.5, idle_s=idle_for, reason="lookup_pause")
+                    _metadata_event(out, offset_s=t + 0.08, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(4.5, 12.0), 2)})
+                    _metadata_event(out, offset_s=t + 0.2, event_type="typing_started", payload={"question_id": qid, "input_context": "answer_box"})
+                    _metadata_event(
+                        out,
+                        offset_s=t + 0.32,
+                        event_type="typing_burst",
+                        payload={
+                            "question_id": qid,
+                            "burst_length": random.randint(11, 18),
+                            "duration_ms": random.randint(640, 1500),
+                            "interval_ms": random.choice([68, 74, 82, 88]),
+                        },
+                    )
+                    _metadata_event(
+                        out,
+                        offset_s=t + 0.56,
+                        event_type="backspace_activity",
+                        payload={"question_id": qid, "count": random.randint(2, 6), "burst_window_ms": random.randint(220, 680)},
+                    )
+                    _metadata_event(
+                        out,
+                        offset_s=t + 0.88,
+                        event_type="typing_stopped",
+                        payload={"question_id": qid, "session_duration_ms": random.randint(900, 2200), "total_bursts": random.randint(1, 3), "pause_count": 1},
+                    )
+                    t += _jitter(random.uniform(2.4, 5.8))
+
+                t += _jitter(random.uniform(12.0, 26.0))
+
+        # Long final pause before a short suspicious submission sequence.
+        final_qid = qids[-1]
+        t = _idle_pair(out, offset_s=t + 1.0, idle_s=_lognormal_seconds(median_s=58, sigma=0.45, min_s=30, max_s=120), reason="final_lookup")
+        _metadata_event(out, offset_s=t + 0.5, event_type="question_viewed", payload={"question_id": final_qid})
+        out.append(BehaviorEvent(offset_s=t, event_type="question_view", payload={"question_id": final_qid, "action": "enter"}))
+        _metadata_event(out, offset_s=t + 0.08, event_type="typing_pause", payload={"question_id": final_qid, "pause_duration_s": round(random.uniform(6.0, 14.0), 2)})
+        _metadata_event(out, offset_s=t + 0.18, event_type="typing_burst", payload={"question_id": final_qid, "burst_length": random.randint(13, 20), "duration_ms": random.randint(760, 1680), "interval_ms": random.choice([64, 72, 80])})
+        _metadata_event(out, offset_s=t + 0.42, event_type="clipboard_paste", payload={"question_id": final_qid, "size": "large", "source": "external"})
+        _paste_event(out, offset_s=t + 0.46, size="large", source="external", question_id=final_qid)
+        _metadata_event(out, offset_s=t + 0.78, event_type="rapid_answer_burst", payload={"question_id": final_qid, "burst_count": 4})
+        _metadata_event(out, offset_s=t + 0.86, event_type="answer_changed", payload={"question_id": final_qid, "mode": "final_revision"})
+        _answer_event(out, offset_s=t + 0.94, qid=final_qid, style="submitted_after_external_lookup")
+        out.append(BehaviorEvent(offset_s=t + 1.08, event_type="question_view", payload={"question_id": final_qid, "action": "leave"}))
+
+        return out
+
+
+class DemoLowAaravCandidate(CandidateProfile):
+    """Low-risk demo candidate with stable, believable behavior."""
+
+    name = "DemoLowAaravCandidate"
+
+    def generate(self, *, question_ids: Sequence[str]) -> List[BehaviorEvent]:
+        out: List[BehaviorEvent] = []
+        t = 0.0
+        qids = list(question_ids) if question_ids else _pick_question_ids(8)
+        focus_check_done = False
+
+        for idx, qid in enumerate(qids):
+            dwell = _lognormal_seconds(median_s=22, sigma=0.26, min_s=14, max_s=36)
+            _metadata_event(out, offset_s=t + 0.25, event_type="question_viewed", payload={"question_id": qid})
+            _metadata_event(out, offset_s=t + 0.45, event_type="normal_mouse_activity", payload={"question_id": qid, "activity": "pointer_move"})
+            out.append(BehaviorEvent(offset_s=t, event_type="question_view", payload={"question_id": qid, "action": "enter"}))
+            _metadata_event(out, offset_s=t + 1.1, event_type="typing_started", payload={"question_id": qid, "input_context": "answer_box"})
+            _metadata_event(
+                out,
+                offset_s=t + 2.8,
+                event_type="typing_burst",
+                payload={
+                    "question_id": qid,
+                    "burst_length": random.randint(4, 7),
+                    "duration_ms": random.randint(880, 1620),
+                    "interval_ms": random.choice([130, 150, 170, 190]),
+                },
+            )
+            if idx in {2, 5}:
+                _metadata_event(out, offset_s=t + 5.8, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(1.8, 3.0), 2)})
+            _metadata_event(
+                out,
+                offset_s=t + max(6.8, dwell - 3.6),
+                event_type="typing_stopped",
+                payload={"question_id": qid, "session_duration_ms": int(max(2200, (dwell - 1.2) * 1000)), "total_bursts": 1, "pause_count": 1 if idx in {2, 5} else 0},
+            )
+            _metadata_event(out, offset_s=t + max(4.5, dwell - 4.0), event_type="normal_typing", payload={"question_id": qid, "duration_s": round(random.uniform(6.5, 11.0), 2)})
+            answer_at = t + _jitter(dwell - random.uniform(1.6, 3.4), rel_std=0.06, abs_std=0.18)
+            _answer_event(out, offset_s=answer_at, qid=qid, style="steady_answer")
+            if idx % 3 == 1:
+                _metadata_event(out, offset_s=answer_at - 0.72, event_type="answer_changed", payload={"question_id": qid, "mode": "minor_revision"})
+            t = answer_at + 0.18
+            out.append(BehaviorEvent(offset_s=t, event_type="question_view", payload={"question_id": qid, "action": "leave"}))
+
+            if not focus_check_done and idx == max(1, len(qids) // 2):
+                blur_at = t + 0.5
+                _metadata_event(out, offset_s=blur_at, event_type="blur", payload={"question_id": qid, "reason": "brief_refocus"})
+                _metadata_event(out, offset_s=blur_at + 0.85, event_type="focus", payload={"question_id": qid, "reason": "brief_refocus"})
+                focus_check_done = True
+
+            if random.random() < 0.18:
+                _metadata_event(out, offset_s=t + 0.35, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(1.4, 3.2), 2)})
+
+            t += _jitter(random.uniform(7.0, 14.0), rel_std=0.08, abs_std=0.25)
+
+        return out
+
+
+class DemoMediumNehaCandidate(CandidateProfile):
+    """Medium-risk demo candidate that stays review-worthy and ambiguous."""
+
+    name = "DemoMediumNehaCandidate"
+
+    def generate(self, *, question_ids: Sequence[str]) -> List[BehaviorEvent]:
+        out: List[BehaviorEvent] = []
+        t = 0.0
+        qids = list(question_ids) if question_ids else _pick_question_ids(8)
+        paste_targets = {1, 4, 6}
+        visibility_targets = {2}
+        blur_targets = {1, 2, 4}
+        sequence_targets = {4}
+
+        for idx, qid in enumerate(qids):
+            dwell = _lognormal_seconds(median_s=19, sigma=0.28, min_s=11, max_s=32)
+            _metadata_event(out, offset_s=t + 0.2, event_type="question_viewed", payload={"question_id": qid})
+            out.append(BehaviorEvent(offset_s=t, event_type="question_view", payload={"question_id": qid, "action": "enter"}))
+            _typing_activity(out, offset_s=t, dwell_s=dwell, qid=qid)
+
+            if idx in blur_targets:
+                blur_at = t + _jitter(random.uniform(3.4, 6.8), rel_std=0.10, abs_std=0.25)
+                _metadata_event(out, offset_s=blur_at, event_type="blur", payload={"question_id": qid, "reason": "distraction"})
+                if idx in visibility_targets:
+                    t_focus = _tab_switch_pair(out, offset_s=blur_at + 0.05, away_s=_jitter(random.uniform(4.0, 8.0), rel_std=0.10, abs_std=0.25), reason="reference_check")
+                    _metadata_event(out, offset_s=t_focus + 0.02, event_type="focus", payload={"question_id": qid, "reason": "return"})
+                else:
+                    t_focus = blur_at + _jitter(random.uniform(1.2, 2.6), rel_std=0.08, abs_std=0.2)
+                    _metadata_event(out, offset_s=t_focus, event_type="focus", payload={"question_id": qid, "reason": "return"})
+                t = max(t, t_focus)
+
+            if idx in paste_targets:
+                _metadata_event(out, offset_s=t + 0.18, event_type="clipboard_paste", payload={"question_id": qid, "size": random.choice(["small", "medium"]), "source": "notes"})
+                _paste_event(out, offset_s=t + 0.22, size=random.choice(["small", "medium"]), source="notes", question_id=qid)
+                if idx in sequence_targets:
+                    _metadata_event(out, offset_s=t + 0.38, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(5.0, 9.0), 2)})
+                    _metadata_event(out, offset_s=t + 0.56, event_type="typing_burst", payload={"question_id": qid, "burst_length": random.randint(8, 10), "duration_ms": random.randint(860, 1560), "interval_ms": random.choice([104, 112, 124])})
+                    _metadata_event(out, offset_s=t + 0.78, event_type="backspace_activity", payload={"question_id": qid, "count": random.randint(1, 2), "burst_window_ms": random.randint(280, 620)})
+                    _metadata_event(out, offset_s=t + 1.02, event_type="typing_stopped", payload={"question_id": qid, "session_duration_ms": random.randint(900, 1800), "total_bursts": 1, "pause_count": 1})
+                    t += _jitter(random.uniform(0.8, 1.4), rel_std=0.08, abs_std=0.2)
+
+            if idx in {4}:
+                t = _idle_pair(out, offset_s=t + 0.4, idle_s=_jitter(random.uniform(20.0, 36.0), rel_std=0.10, abs_std=0.25), reason="thinking_pause")
+                _metadata_event(out, offset_s=t + 0.14, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(4.4, 8.5), 2)})
+                _metadata_event(out, offset_s=t + 0.34, event_type="typing_burst", payload={"question_id": qid, "burst_length": random.randint(7, 9), "duration_ms": random.randint(920, 1540), "interval_ms": random.choice([108, 116, 126])})
+
+            answer_at = t + _jitter(random.uniform(4.0, 8.8), rel_std=0.10, abs_std=0.25)
+            _answer_event(out, offset_s=answer_at, qid=qid, style="review_needed_answer")
+            if idx in {1, 4}:
+                _metadata_event(out, offset_s=answer_at - 0.18, event_type="answer_changed", payload={"question_id": qid, "mode": "uncertain_revision"})
+            out.append(BehaviorEvent(offset_s=answer_at + 0.2, event_type="question_view", payload={"question_id": qid, "action": "leave"}))
+            t = answer_at + _jitter(random.uniform(12.0, 22.0), rel_std=0.10, abs_std=0.25)
+
+        return out
+
+
+class DemoHighRohanCandidate(CandidateProfile):
+    """High-risk demo candidate with progressive escalation and correlation-rich behavior."""
+
+    name = "DemoHighRohanCandidate"
+
+    def generate(self, *, question_ids: Sequence[str]) -> List[BehaviorEvent]:
+        out: List[BehaviorEvent] = []
+        t = 0.0
+        qids = list(question_ids) if question_ids else _pick_question_ids(9)
+
+        # Phase 1: mostly normal opening.
+        opener = qids[:1]
+        for qid in opener:
+            dwell = _lognormal_seconds(median_s=14, sigma=0.22, min_s=9, max_s=22)
+            _metadata_event(out, offset_s=t + 0.2, event_type="question_viewed", payload={"question_id": qid})
+            _metadata_event(out, offset_s=t + 0.42, event_type="normal_mouse_activity", payload={"question_id": qid, "activity": "pointer_move"})
+            t = _question_view_pair(out, offset_s=t, qid=qid, dwell_s=_jitter(dwell, rel_std=0.08, abs_std=0.2))
+            _metadata_event(out, offset_s=t - 1.8, event_type="normal_typing", payload={"question_id": qid, "duration_s": round(random.uniform(5.0, 9.0), 2)})
+            _answer_event(out, offset_s=t - _jitter(random.uniform(1.1, 2.4), rel_std=0.08, abs_std=0.2), qid=qid, style="initial_answer")
+            t += _jitter(random.uniform(10.0, 16.0), rel_std=0.08, abs_std=0.25)
+
+        # Phase 2/3: repeated correlated suspicious behavior.
+        suspicious_qids = qids[1:]
+        for idx, qid in enumerate(suspicious_qids):
+            _metadata_event(out, offset_s=t + 0.16, event_type="question_viewed", payload={"question_id": qid})
+            out.append(BehaviorEvent(offset_s=t, event_type="question_view", payload={"question_id": qid, "action": "enter"}))
+            t += _jitter(random.uniform(0.5, 1.1), rel_std=0.08, abs_std=0.2)
+
+            blur_at = t + _jitter(random.uniform(0.18, 0.48), rel_std=0.08, abs_std=0.15)
+            _metadata_event(out, offset_s=blur_at, event_type="blur", payload={"question_id": qid, "reason": "window_switch"})
+            visible_at = _tab_switch_pair(out, offset_s=blur_at + 0.04, away_s=_jitter(random.uniform(0.9, 2.0), rel_std=0.08, abs_std=0.15), reason="external_lookup")
+            _metadata_event(out, offset_s=visible_at + 0.02, event_type="focus", payload={"question_id": qid, "reason": "window_return"})
+            t = max(t, visible_at)
+
+            if idx % 2 == 0:
+                extra_blur = t + _jitter(random.uniform(0.3, 0.8), rel_std=0.08, abs_std=0.15)
+                _metadata_event(out, offset_s=extra_blur, event_type="blur", payload={"question_id": qid, "reason": "repeat_switch"})
+                visible_again = _tab_switch_pair(out, offset_s=extra_blur + 0.04, away_s=_jitter(random.uniform(0.8, 1.8), rel_std=0.08, abs_std=0.15), reason="repeat_lookup")
+                _metadata_event(out, offset_s=visible_again + 0.02, event_type="focus", payload={"question_id": qid, "reason": "repeat_return"})
+                t = max(t, visible_again)
+
+            _metadata_event(out, offset_s=t + 0.12, event_type="clipboard_copy", payload={"question_id": qid, "size": "small", "source": "external"})
+            _metadata_event(out, offset_s=t + 0.22, event_type="clipboard_paste", payload={"question_id": qid, "size": random.choice(["medium", "large"]), "source": "external"})
+            _paste_event(out, offset_s=t + 0.26, size=random.choice(["medium", "large"]), source="external", question_id=qid)
+
+            if idx in {0, 2, 4, 6}:
+                _metadata_event(out, offset_s=t + 0.46, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(5.2, 9.4), 2)})
+            else:
+                _metadata_event(out, offset_s=t + 0.42, event_type="typing_started", payload={"question_id": qid, "input_context": "answer_box"})
+                _metadata_event(out, offset_s=t + 0.56, event_type="typing_burst", payload={"question_id": qid, "burst_length": random.randint(7, 10), "duration_ms": random.randint(580, 980), "interval_ms": random.choice([74, 82, 92])})
+                _metadata_event(out, offset_s=t + 0.82, event_type="typing_stopped", payload={"question_id": qid, "session_duration_ms": random.randint(520, 1100), "total_bursts": 1, "pause_count": 0})
+
+            answer_at = t + _jitter(random.uniform(0.32, 0.86), rel_std=0.08, abs_std=0.12)
+            _metadata_event(out, offset_s=answer_at - 0.16, event_type="rapid_answer_burst", payload={"question_id": qid, "burst_count": random.randint(2, 4)})
+            _metadata_event(out, offset_s=answer_at - 0.08, event_type="answer_changed", payload={"question_id": qid, "mode": "post_return_edit"})
+            _answer_event(out, offset_s=answer_at, qid=qid, style="post_lookup_change")
+            out.append(BehaviorEvent(offset_s=answer_at + 0.16, event_type="question_view", payload={"question_id": qid, "action": "leave"}))
+            t = answer_at + 0.16
+            if idx in {1, 3, 5}:
+                t = _idle_pair(out, offset_s=t + 0.4, idle_s=_jitter(random.uniform(26.0, 42.0), rel_std=0.10, abs_std=0.25), reason="lookup_pause")
+                _metadata_event(out, offset_s=t + 0.1, event_type="typing_pause", payload={"question_id": qid, "pause_duration_s": round(random.uniform(6.0, 11.0), 2)})
+                _metadata_event(out, offset_s=t + 0.24, event_type="typing_started", payload={"question_id": qid, "input_context": "answer_box"})
+                _metadata_event(out, offset_s=t + 0.36, event_type="typing_burst", payload={"question_id": qid, "burst_length": random.randint(12, 18), "duration_ms": random.randint(700, 1400), "interval_ms": random.choice([64, 72, 80, 88])})
+                _metadata_event(out, offset_s=t + 0.58, event_type="backspace_activity", payload={"question_id": qid, "count": random.randint(2, 5), "burst_window_ms": random.randint(220, 620)})
+                _metadata_event(out, offset_s=t + 0.82, event_type="typing_stopped", payload={"question_id": qid, "session_duration_ms": random.randint(900, 1900), "total_bursts": 1, "pause_count": 1})
+                t += _jitter(random.uniform(0.7, 1.2), rel_std=0.08, abs_std=0.15)
+            t += _jitter(random.uniform(18.0, 32.0), rel_std=0.10, abs_std=0.25)
+
+        return out
+
+
 class BurnoutCandidate(CandidateProfile):
     """Legit-but-fatigued candidate.
 
@@ -772,10 +1105,14 @@ class OverpreparedFastCandidate(CandidateProfile):
 
 def all_profiles() -> List[CandidateProfile]:
     return [
+        DemoLowAaravCandidate(),
+        DemoMediumNehaCandidate(),
+        DemoHighRohanCandidate(),
         NormalThoughtfulCandidate(),
         FastButLegitCandidate(),
         BorderlineCandidate(),
         AggressiveCheater(),
+        HighRiskLongSessionCandidate(),
         TemplateCopier(),
         SearcherPatternCandidate(),
         DistractedButLegitCandidate(),
@@ -798,6 +1135,11 @@ def profile_by_name(name: str) -> CandidateProfile:
         "borderline": "BorderlineCandidate",
         "high": "AggressiveCheater",
         "cheater": "AggressiveCheater",
+        "highlong": "HighRiskLongSessionCandidate",
+        "longhigh": "HighRiskLongSessionCandidate",
+        "aarav": "DemoLowAaravCandidate",
+        "neha": "DemoMediumNehaCandidate",
+        "rohan": "DemoHighRohanCandidate",
         "template": "TemplateCopier",
         "searcher": "SearcherPatternCandidate",
         "distracted": "DistractedButLegitCandidate",
@@ -819,6 +1161,9 @@ def choose_profile_weighted() -> CandidateProfile:
 
     profiles = all_profiles()
     weights = {
+        "DemoLowAaravCandidate": 0.00,
+        "DemoMediumNehaCandidate": 0.00,
+        "DemoHighRohanCandidate": 0.00,
         "NormalThoughtfulCandidate": 0.26,
         "FastButLegitCandidate": 0.16,
         "BorderlineCandidate": 0.20,

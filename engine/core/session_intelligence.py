@@ -236,6 +236,7 @@ def _build_timeline_points(
 
     points: List[Dict[str, Any]] = []
     start_time = _first_event_time(events)
+    end_time = _last_event_time(events)
     if start_time:
         baseline = min(base_score, max(0.02, base_score * 0.35))
         points.append(
@@ -247,6 +248,27 @@ def _build_timeline_points(
                 "confidence": round(session_confidence, 4),
             }
         )
+
+    if start_time and end_time and start_time != end_time:
+        start_dt = _parse_ts(start_time)
+        end_dt = _parse_ts(end_time)
+        if start_dt is not None and end_dt is not None:
+            mid_dt = start_dt + ((end_dt - start_dt) / 2)
+            if milestones:
+                midpoint_score = min(adjusted_score, max(points[-1]["score"], base_score * 0.8))
+                midpoint_trigger = "Risk context accumulated across the session"
+            else:
+                midpoint_score = min(adjusted_score, max(points[-1]["score"], max(base_score * 0.65, adjusted_score * 0.8)))
+                midpoint_trigger = "Stable engagement maintained through the session"
+            points.append(
+                {
+                    "timestamp": mid_dt.isoformat(),
+                    "score": round(midpoint_score, 4),
+                    "risk_level": _risk_level(midpoint_score),
+                    "trigger": midpoint_trigger,
+                    "confidence": round(session_confidence, 4),
+                }
+            )
 
     running_score = points[0]["score"] if points else min(base_score, 0.05)
     seen_triggers = set()
@@ -288,13 +310,57 @@ def _build_timeline_points(
             "confidence": round(session_confidence, 4),
         }
 
+    sorted_points = sorted(
+        points,
+        key=lambda item: _parse_ts(item.get("timestamp")) or datetime.min,
+    )
+
     compact: List[Dict[str, Any]] = []
-    for point in points:
+    for point in sorted_points:
         if compact and compact[-1]["timestamp"] == point["timestamp"] and compact[-1]["risk_level"] == point["risk_level"]:
             compact[-1] = point
         else:
             compact.append(point)
     return compact
+
+
+def _compose_session_narrative(
+    *,
+    current_base_risk: str,
+    patterns: Sequence[Any],
+    features: Mapping[str, Any],
+    milestones: Sequence[Dict[str, Any]],
+    risk_momentum: float,
+    decay_applied: float,
+) -> str:
+    clipboard_count = int(_safe_float(features.get("paste_count"), 0.0))
+    focus_count = int(_safe_float(features.get("tab_hidden_count"), 0.0))
+    typing_anomalies = int(_safe_float(features.get("typing_behavior_anomaly_count"), 0.0))
+    if current_base_risk == "HIGH" and patterns:
+        parts: List[str] = ["Candidate progressively escalated from normal engagement into repeated suspicious behavior"]
+        if focus_count > 0:
+            parts.append("with recurring focus loss")
+        if clipboard_count > 0:
+            parts.append("clipboard activity")
+        if typing_anomalies > 0:
+            parts.append("irregular typing recovery patterns")
+        if risk_momentum > 0.12:
+            parts.append("and tightly clustered suspicious sequences")
+        sentence = ", ".join(parts[:-1]) + (f", and {parts[-1]}" if len(parts) > 1 else parts[0])
+        return sentence + "."
+    if patterns:
+        top_pattern = getattr(patterns[0], "evidence", {}) or {}
+        return (
+            top_pattern.get("reviewer_summary")
+            or "Repeated suspicious behavioral chains kept the attempt elevated despite later normal activity."
+        )
+    if current_base_risk == "LOW" and len(patterns) == 0:
+        return "Candidate demonstrated stable and consistent engagement throughout the session with minimal suspicious behavior."
+    if risk_momentum > 0.08:
+        return "Suspicious activity was clustered in short windows rather than spread randomly."
+    if decay_applied > 0.03:
+        return "Risk stabilized after a period of normal behavior, but earlier suspicious activity remained relevant."
+    return "Behavioral risk evolved gradually based on the timing and consistency of observed signals."
 
 
 def build_session_intelligence(
@@ -343,20 +409,14 @@ def build_session_intelligence(
     if not explanation_factors:
         explanation_factors.append("Behavior remained mostly stable across the session.")
 
-    if current_base_risk == "HIGH":
-        session_narrative = "Strong deterministic evidence kept the attempt in the HIGH risk band throughout the session."
-    elif patterns:
-        top_pattern = getattr(patterns[0], "evidence", {}) or {}
-        session_narrative = (
-            top_pattern.get("reviewer_summary")
-            or "Repeated suspicious behavioral chains kept the attempt elevated despite later normal activity."
-        )
-    elif risk_momentum > 0.08:
-        session_narrative = "Suspicious activity was clustered in short windows rather than spread randomly."
-    elif decay_applied > 0.03:
-        session_narrative = "Risk stabilized after a period of normal behavior, but earlier suspicious activity remained relevant."
-    else:
-        session_narrative = "Behavioral risk evolved gradually based on the timing and consistency of observed signals."
+    session_narrative = _compose_session_narrative(
+        current_base_risk=current_base_risk,
+        patterns=patterns,
+        features=features,
+        milestones=milestones,
+        risk_momentum=risk_momentum,
+        decay_applied=decay_applied,
+    )
 
     timeline_points = _build_timeline_points(
         events=events,

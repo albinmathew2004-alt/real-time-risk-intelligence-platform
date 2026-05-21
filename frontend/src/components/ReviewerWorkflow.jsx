@@ -1,6 +1,28 @@
 import { useState } from "react";
 import { AlertTriangle, Check, History, NotebookPen, ShieldCheck, UserPlus } from "lucide-react";
 
+function formatWorkflowStatus(value) {
+  return String(value || "NEW")
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatWorkflowTime(value) {
+  if (!value) return "Pending timestamp";
+  try {
+    return new Date(value).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch {
+    return String(value);
+  }
+}
+
 export default function ReviewerWorkflow({
   caseStatus,
   assignedReviewer,
@@ -32,7 +54,7 @@ export default function ReviewerWorkflow({
       <div className="reviewer-status-panel">
         <span className="report-section-kicker">Case Status</span>
         <div className="reviewer-status-row">
-          <strong className={`reviewer-case-pill ${String(caseStatus || "NEW").toLowerCase()}`}>{caseStatus || "NEW"}</strong>
+          <strong className={`reviewer-case-pill ${String(caseStatus || "NEW").toLowerCase()}`}>{formatWorkflowStatus(caseStatus || "NEW")}</strong>
           <p>Assigned to: {assignedReviewer}</p>
         </div>
         {caseId ? <small>Case #{caseId}</small> : <small>Case record is still loading.</small>}
@@ -94,17 +116,17 @@ export default function ReviewerWorkflow({
               {actionHistory.map((action) => {
                 const actor = action.reviewer_name || action.reviewer_email || `Reviewer ${action.reviewer_id}`;
                 const transition = action.new_status
-                  ? `${action.previous_status || "NONE"} -> ${action.new_status}`
-                  : action.previous_status || action.action_type;
+                  ? `${formatWorkflowStatus(action.previous_status || "NONE")} -> ${formatWorkflowStatus(action.new_status)}`
+                  : formatWorkflowStatus(action.previous_status || action.action_type);
                 return (
                   <article className="reviewer-history-item" key={action.id}>
                     <div className="reviewer-history-head">
-                      <strong>{action.action_type}</strong>
+                      <strong>{formatWorkflowStatus(action.action_type)}</strong>
                       <span>{transition}</span>
                     </div>
                     <p>{action.comment || "No reviewer comment provided."}</p>
                     <small>
-                      {actor} • {action.created_at}
+                      {actor} | {formatWorkflowTime(action.created_at)}
                     </small>
                   </article>
                 );

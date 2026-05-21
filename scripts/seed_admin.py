@@ -12,43 +12,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from engine.db.database import Base, engine, SessionLocal
-from app.auth.security import hash_password
-from app.models.user import User, UserRole
+from app.auth.demo_admin import ensure_demo_admin
 
 
 def main() -> None:
-    email = os.getenv("DEMO_ADMIN_EMAIL", "").strip() or os.getenv("DEFAULT_ADMIN_EMAIL", "")
-    password = os.getenv("DEMO_ADMIN_PASSWORD", "").strip() or os.getenv("DEFAULT_ADMIN_PASSWORD", "")
-    full_name = os.getenv("DEMO_ADMIN_NAME", "").strip() or os.getenv("DEFAULT_ADMIN_NAME", "Default Admin")
-
-    if not email or not password:
-        raise SystemExit(
-            "Missing DEMO_ADMIN_EMAIL/DEMO_ADMIN_PASSWORD (or DEFAULT_ADMIN_EMAIL/DEFAULT_ADMIN_PASSWORD). "
-            "Set them as environment variables before running this script."
-        )
-
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
     try:
-        existing = db.query(User).filter(User.email == email).first()
-        if existing:
-            print(f"[OK] Admin already exists: {existing.email} (role={existing.role}, active={existing.is_active})")
-            return
-
-        user = User(
-            email=email,
-            full_name=full_name,
-            hashed_password=hash_password(password),
-            role=UserRole.ADMIN.value,
-            is_active=True,
+        result = ensure_demo_admin(db)
+        print(
+            f"[OK] Demo admin verified: {result['email']} "
+            f"(role={result['role']}, created={result['created']}, updated={result['updated']}, active={result['is_active']})"
         )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-        print(f"[OK] Created admin user: {user.email} (id={user.id})")
     finally:
         db.close()
 

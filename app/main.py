@@ -26,6 +26,7 @@ from app.websocket_manager import manager
 
 # Auth (Phase 1)
 from app.auth.routes import router as auth_router
+from app.auth.demo_admin import ensure_demo_admin, should_verify_demo_admin_on_startup
 from app.auth.dependencies import require_reviewer
 from app.cases.routes import router as cases_router
 from app.cases.routes import _build_review_queue_payload, _sync_cases_from_attempts
@@ -123,6 +124,13 @@ def startup_event():
         Base.metadata.create_all(bind=engine)
         ensure_demo_schema()
         print("[OK] Database tables created/verified")
+        if should_verify_demo_admin_on_startup(APP_MODE):
+            db = SessionLocal()
+            try:
+                ensure_demo_admin(db)
+                print("[OK] Demo admin verified")
+            finally:
+                db.close()
     except Exception as e:
         print("[WARN] Database initialization failed:", e)
 
@@ -283,12 +291,12 @@ def build_reason(result: Dict[str, Any]) -> str:
         return session_narrative[:500]
 
     if risk == "HIGH":
-        return "Risk escalated to HIGH based on strong behavioral evidence."
+        return "Risk escalated to HIGH after repeated deterministic integrity signals accumulated over the session."
 
     if risk == "MEDIUM":
-        return "Risk escalated to MEDIUM based on suspicious behavioral signals."
+        return "Risk escalated to MEDIUM after multiple reviewer-relevant irregularities were observed."
 
-    return "Risk remains LOW. No major suspicious behavior detected."
+    return "Risk remains LOW with stable engagement and limited suspicious behavior."
 
 
 def _last_timeline_point(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -673,8 +681,11 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
     active_sessions = sum(
         1
         for row in attempt_rows
-        if not bool((row.get("features") or {}).get("has_submit_event"))
-        and row.get("latest_event_type") != "exam_submitted"
+        if (
+            not bool((row.get("features") or {}).get("has_submit_event"))
+            and row.get("latest_event_type") != "exam_submitted"
+            and _actionable_case_status(str(row.get("status") or "NEW"))
+        )
     )
     high_risk_count = sum(
         1
@@ -696,22 +707,33 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
 
     latest_log_time = max((parse_timestamp(row.get("timestamp")) for row in attempt_rows if row.get("timestamp")), default=None)
     if latest_log_time is not None:
-        window_start = latest_log_time.timestamp() - 300
-        live_event_rate = max(
-            0,
-            round(
-                sum(
-                    1
-                    for row in attempt_rows
-                    if (parse_timestamp(row.get("timestamp")) or latest_log_time).timestamp() >= window_start
-                ) / 5
-            ),
+        window_start = latest_log_time - timedelta(minutes=15)
+        raw_event_times = [
+            parse_timestamp(event.occurred_at)
+            for event in db.query(RawExamEvent.occurred_at).all()
+        ]
+        recent_event_count = sum(
+            1
+            for event_time in raw_event_times
+            if event_time is not None and event_time >= window_start and event_time <= latest_log_time
         )
+        live_event_rate = max(0, round(recent_event_count / 15))
     else:
         live_event_rate = 0
 
+    feed_candidates: List[Dict[str, Any]] = []
+    for preferred_risk in ("HIGH", "MEDIUM", "LOW"):
+        match = next((row for row in attempt_rows if row.get("risk_level") == preferred_risk), None)
+        if match and match not in feed_candidates:
+            feed_candidates.append(match)
+    for row in attempt_rows:
+        if row not in feed_candidates:
+            feed_candidates.append(row)
+        if len(feed_candidates) >= 8:
+            break
+
     recent_risk_feed = []
-    for row in attempt_rows[:5]:
+    for row in feed_candidates[:8]:
         event_meta = latest_event_by_attempt.get(row.get("attempt_id"))
         recent_risk_feed.append({
             "attempt_id": row.get("attempt_id"),
@@ -935,6 +957,7 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         "attempt_id": attempt_id,
         "event_count": len(events),
         "evidence_items": evidence_items,
+        "investigation_insights": summary.get("investigation_insights", []),
         "violation_overview_counts": overview_counts,
         "candidate_name": assessment.get("candidate_name") or "Unknown Candidate",
         "candidate_email": assessment.get("candidate_email") or "No email available",

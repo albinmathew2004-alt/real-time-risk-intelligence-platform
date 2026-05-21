@@ -164,9 +164,9 @@ export default function RiskHistoryChart({ data, loading }) {
       </div>
 
       {loading ? (
-        <div className="timeline-empty">Loading risk movement...</div>
+        <div className="timeline-empty">Timeline still loading.</div>
       ) : chartData.length === 0 ? (
-        <div className="timeline-empty">No risk history points are available for this attempt yet.</div>
+        <div className="timeline-empty">Waiting for enough risk snapshots to render the timeline.</div>
       ) : (
         <div className="risk-chart-shell">
           <div className="risk-chart-legend">

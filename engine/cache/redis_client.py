@@ -134,3 +134,36 @@ def get_current_risk(attempt_id: str):
         _mem_kv.pop(key, None)
         return None
     return json.loads(value)
+
+
+def clear_attempt_state(attempt_id: str) -> None:
+    event_key = f"attempt:{attempt_id}:events"
+    risk_key = f"attempt:{attempt_id}:current_risk"
+
+    client = _get_redis()
+    if client is not None:
+        client.delete(event_key, risk_key)
+        return
+
+    _mem_events.pop(event_key, None)
+    _mem_kv.pop(risk_key, None)
+
+
+def clear_all_attempt_state() -> int:
+    removed = 0
+    client = _get_redis()
+    if client is not None:
+        keys = list(client.scan_iter(match="attempt:*"))
+        if keys:
+            removed = int(client.delete(*keys) or 0)
+        return removed
+
+    for key in list(_mem_events.keys()):
+        if key.startswith("attempt:"):
+            _mem_events.pop(key, None)
+            removed += 1
+    for key in list(_mem_kv.keys()):
+        if key.startswith("attempt:"):
+            _mem_kv.pop(key, None)
+            removed += 1
+    return removed

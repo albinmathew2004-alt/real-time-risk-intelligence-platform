@@ -68,8 +68,11 @@ const REVIEW_QUEUE_URL = `${API_BASE_URL}/v1/review-queue`;
 const CASES_URL = `${API_BASE_URL}/v1/cases`;
 const AUTH_URL = `${API_BASE_URL}/v1/auth`;
 const RECENT_DEMO_HOURS = 24;
+const ACTIONABLE_CASE_STATUSES = ["NEW", "TRIAGED", "UNDER_INVESTIGATION", "ESCALATED"];
+const COMPLETED_CASE_STATUSES = ["CONFIRMED_RISK", "RESOLVED", "FALSE_POSITIVE", "CLEARED", "CLOSED", "COMPLETED"];
 
 const TOKEN_KEY = "riskintel_access_token";
+const CLIENT_TIME_SKEW_GRACE_MS = 2 * 60 * 1000;
 
 function formatNumber(value, digits = 2) {
   return Number(value || 0).toFixed(digits);
@@ -86,21 +89,17 @@ function riskClass(risk) {
 }
 
 function formatTime(value) {
-  if (!value) return "â€”";
-  try {
-    return new Date(value).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-  } catch {
-    return value;
-  }
+  const date = getDisplayDate(value);
+  if (!date) return "â€”";
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatDateTime(value) {
   if (!value) return "â€”";
-  const date = parseDateValue(value);
+  const date = getDisplayDate(value);
   if (!date) return "â€”";
 
   const now = new Date();
@@ -168,8 +167,8 @@ function statusClass(status) {
 }
 
 function caseStatusTone(status) {
-  if (status === "ESCALATED" || status === "CONFIRMED_RISK") return "urgent";
-  if (status === "CLEARED" || status === "FALSE_POSITIVE" || status === "CLOSED") return "completed";
+  if (status === "ESCALATED") return "urgent";
+  if (COMPLETED_CASE_STATUSES.includes(String(status || "").toUpperCase())) return "completed";
   if (status === "TRIAGED" || status === "UNDER_INVESTIGATION" || status === "NEW") return "review";
   return "ongoing";
 }
@@ -226,19 +225,19 @@ function primaryIssue(attempt) {
   if (idle > 0) return "Idle activity gap detected";
   if (avgTime > 0 && avgTime <= 12) return "Fast answering pattern";
 
-  return "No major violation detected";
+  return "Stable assessment engagement observed";
 }
 
 function decisionText(risk) {
-  if (risk === "HIGH") return "Urgent evaluator review recommended";
-  if (risk === "MEDIUM") return "Manual review recommended";
-  return "No immediate review required";
+  if (risk === "HIGH") return "Escalation recommended";
+  if (risk === "MEDIUM") return "Reviewer assessment required";
+  return "Stable session with limited concern";
 }
 
 function decisionSummaryLine(risk) {
-  if (risk === "HIGH") return "This attempt should be escalated for reviewer action before a final decision.";
-  if (risk === "MEDIUM") return "This attempt should be manually reviewed before a final decision.";
-  return "Current telemetry does not indicate a high-confidence integrity concern.";
+  if (risk === "HIGH") return "Repeated, connected integrity signals warrant escalation before any final outcome is released.";
+  if (risk === "MEDIUM") return "This attempt contains enough ambiguity to require reviewer judgement before a final decision.";
+  return "Observed behavior remains stable and explainable without repeated suspicious progression.";
 }
 
 function buildEvidence(attempt) {
@@ -323,8 +322,8 @@ function buildEvidence(attempt) {
       title: "Normal Behavior Pattern",
       icon: <ShieldCheck size={21} />,
       severity: "LOW",
-      finding: "No major suspicious behavior detected",
-      explanation: "The available behavioral signals do not indicate strong assessment integrity risk.",
+      finding: "Stable engagement observed",
+      explanation: "The available behavioral signals do not indicate repeated or escalating integrity concerns.",
     });
   }
 
@@ -335,12 +334,12 @@ function reportSummary(attempt) {
   const risk = attempt?.risk || "LOW";
 
   if (risk === "HIGH") {
-    return `This attempt needs urgent review. The strongest reason is: ${primaryIssue(attempt)}.`;
+    return `This attempt should be escalated because repeated suspicious behaviors built a strong integrity concern around ${primaryIssue(attempt)}.`;
   }
   if (risk === "MEDIUM") {
-    return `This attempt should be manually reviewed. The strongest reason is: ${primaryIssue(attempt)}.`;
+    return `This attempt presents mixed signals that deserve reviewer judgement, primarily around ${primaryIssue(attempt)}.`;
   }
-  return "This attempt currently appears normal. No strong suspicious behavioral pattern was detected.";
+  return "This attempt remained broadly stable, with only limited behavioral noise and no sustained suspicious progression.";
 }
 
 function getLatestActivity(item) {
@@ -406,6 +405,25 @@ function parseDateValue(value) {
   if (!value) return null;
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function getDisplayDate(value) {
+  const parsed = parseDateValue(value);
+  if (!parsed) return null;
+  const now = new Date();
+  if (parsed.getTime() - now.getTime() > CLIENT_TIME_SKEW_GRACE_MS) {
+    return now;
+  }
+  return parsed;
+}
+
+function formatClockLabel(value) {
+  const date = getDisplayDate(value);
+  if (!date) return "—";
+  return date.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function filterRecentItems(items, getTimestamp, hours = RECENT_DEMO_HOURS) {
@@ -789,7 +807,7 @@ function buildEvidenceRowsFromReport(evidenceItems = []) {
   return evidenceItems.map((item) => ({
     key: String(item.signal_type || "signal").toLowerCase(),
     title: item.title || "Observed Signal",
-    subtitle: item.explanation || "Behavioral evidence was observed for this attempt.",
+    subtitle: item.reviewer_summary || item.explanation || "Behavioral evidence was observed for this attempt.",
     severity: item.severity || "LOW",
     details: `${Number(item.count || 0)} observed; ${Number(item.related_event_count || 0)} related event${Number(item.related_event_count || 0) === 1 ? "" : "s"}`,
     count: Number(item.count || 0),
@@ -799,7 +817,39 @@ function buildEvidenceRowsFromReport(evidenceItems = []) {
     signalType: item.signal_type || "SIGNAL",
     firstSeen: item.first_seen || null,
     lastSeen: item.last_seen || null,
+    reviewerSummary: item.reviewer_summary || "",
+    evidenceCategory: item.evidence_category || "",
+    involvedEventTypes: Array.isArray(item.involved_event_types) ? item.involved_event_types : [],
+    confidence: Number(item.correlation_confidence || 0),
   }));
+}
+
+function buildInvestigationInsights(reportData, evidenceRows, displayRisk) {
+  const explicitInsights = Array.isArray(reportData?.investigation_insights)
+    ? reportData.investigation_insights.filter(Boolean).map((item) => String(item).trim()).filter(Boolean)
+    : [];
+  if (explicitInsights.length) return explicitInsights.slice(0, 4);
+
+  const insightRows = evidenceRows
+    .filter((row) => row.key !== "high_risk_score" && row.key !== "score")
+    .sort((a, b) => {
+      const severityDelta = severityRank(b.severity) - severityRank(a.severity);
+      if (severityDelta !== 0) return severityDelta;
+      return Number(b.count || 0) - Number(a.count || 0);
+    })
+    .slice(0, 4);
+
+  if (insightRows.length) {
+    return insightRows.map((row) => row.reviewerSummary || row.subtitle || `${row.title} was observed.`).map((item) => String(item).trim());
+  }
+
+  if (displayRisk === "HIGH") {
+    return ["Repeated deterministic integrity signals escalated over the course of the attempt."];
+  }
+  if (displayRisk === "MEDIUM") {
+    return ["Moderate behavioral irregularities were observed and should be reviewed in context."];
+  }
+  return ["Assessment engagement remained stable without repeated suspicious progression."];
 }
 
 function evidencePriority(row) {
@@ -827,25 +877,29 @@ function buildTechnicalDetails({ attempt, events, eventCount, firstEvent, lastEv
 }
 
 function formatRelativeTime(value) {
-  const date = parseDateValue(value);
+  const date = getDisplayDate(value);
   if (!date) return "No activity";
   const deltaMinutes = Math.round((Date.now() - date.getTime()) / 60000);
-  if (deltaMinutes < -1) return "Future timestamp";
   const minutes = Math.max(0, deltaMinutes);
-  if (minutes < 1) return "just now";
+  if (minutes < 1) return "Just now";
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
+  if (hours < 8) return `${hours}h ago`;
+  if (hours < 24) return formatDateTime(date);
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
 
 function isResolvedCaseStatus(status) {
-  return ["CLEARED", "FALSE_POSITIVE", "CLOSED"].includes(status || "");
+  return COMPLETED_CASE_STATUSES.includes(String(status || "").toUpperCase());
 }
 
 function isQueueResolvedStatus(status) {
-  return [...["RESOLVED"], "CLEARED", "FALSE_POSITIVE", "CLOSED"].includes(status || "");
+  return COMPLETED_CASE_STATUSES.includes(normalizeQueueStatus(status));
+}
+
+function isQueueActionableStatus(status) {
+  return ACTIONABLE_CASE_STATUSES.includes(normalizeQueueStatus(status));
 }
 
 function getQueueStatus(caseRecord) {
@@ -856,12 +910,10 @@ function getQueueStatus(caseRecord) {
 
 function getStatusPriority(status) {
   if (status === "ESCALATED") return 0;
-  if (status === "CONFIRMED_RISK") return 1;
-  if (status === "UNDER_INVESTIGATION") return 2;
-  if (status === "TRIAGED") return 3;
-  if (status === "NEW") return 4;
-  if (status === "RESOLVED") return 5;
-  if (status === "CLOSED") return 6;
+  if (status === "UNDER_INVESTIGATION") return 1;
+  if (status === "TRIAGED") return 2;
+  if (status === "NEW") return 3;
+  if (isQueueResolvedStatus(status)) return 4;
   return 7;
 }
 
@@ -964,7 +1016,7 @@ function buildQueueTabCounts(rows) {
     new: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "NEW").length,
     under_investigation: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "UNDER_INVESTIGATION").length,
     escalated: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "ESCALATED").length,
-    resolved: rows.filter((row) => ["RESOLVED", "CLEARED", "FALSE_POSITIVE", "COMPLETED"].includes(normalizeQueueStatus(row.queueStatus))).length,
+    resolved: rows.filter((row) => isQueueResolvedStatus(row.queueStatus)).length,
     closed: rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "CLOSED").length,
   };
 }
@@ -974,7 +1026,7 @@ function filterQueueRows(rows, tab) {
   if (tab === "new") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "NEW");
   if (tab === "under_investigation") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "UNDER_INVESTIGATION");
   if (tab === "escalated") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "ESCALATED");
-  if (tab === "resolved") return rows.filter((row) => ["RESOLVED", "CLEARED", "FALSE_POSITIVE", "COMPLETED"].includes(normalizeQueueStatus(row.queueStatus)));
+  if (tab === "resolved") return rows.filter((row) => isQueueResolvedStatus(row.queueStatus));
   if (tab === "closed") return rows.filter((row) => normalizeQueueStatus(row.queueStatus) === "CLOSED");
   return rows;
 }
@@ -1000,7 +1052,7 @@ function getQueuePrioritySortValue(row) {
   if (risk === "MEDIUM") return 3;
   if (status === "NEW") return 4;
   if (risk === "LOW") return 5;
-  if (["RESOLVED", "CLEARED", "FALSE_POSITIVE", "CLOSED", "COMPLETED"].includes(status)) return 6;
+  if (isQueueResolvedStatus(status)) return 6;
   return 7;
 }
 
@@ -1175,21 +1227,34 @@ function setStoredSetting(key, value) {
 async function authJsonFetch(url, { token, method = "GET", body } = {}) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let data = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { detail: text };
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { detail: text };
+      }
     }
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return {
+      ok: false,
+      status: 0,
+      data: { detail: "Backend is unavailable or waking up. Please retry shortly." },
+    };
+  } finally {
+    window.clearTimeout(timeoutId);
   }
-  return { ok: res.ok, status: res.status, data };
 }
 
 export default function App() {
@@ -1327,9 +1392,10 @@ export default function App() {
       };
     }
     await fetchCases();
+    await fetchDashboardSummary();
     await fetchReviewQueue();
     return { ok: true, data: result.data };
-  }, [fetchCases, fetchReviewQueue, logout, token]);
+  }, [fetchCases, fetchDashboardSummary, fetchReviewQueue, logout, token]);
 
   const login = useCallback(async ({ email, password }) => {
     setAuthError("");
@@ -1680,8 +1746,8 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
     avgConfidence: recentLogs.reduce((sum, x) => sum + Number(x.confidence || 0), 0) / (recentLogs.length || 1),
   };
   const fallbackFeedRows = sortedLogs.slice(0, 5);
-  const fallbackReviewCases = reviewRows.filter((row) => !isQueueResolvedStatus(row.queueStatus)).slice(0, 5);
-  const unresolvedCases = reviewRows.filter((row) => !isQueueResolvedStatus(row.queueStatus)).length;
+  const fallbackReviewCases = reviewRows.filter((row) => isQueueActionableStatus(row.queueStatus)).slice(0, 5);
+  const unresolvedCases = reviewRows.filter((row) => isQueueActionableStatus(row.queueStatus)).length;
   const fallbackSignalSummary = buildAggregateSignals(recentLogs);
   const fallbackLiveEventRate = getLiveEventRate(recentLogs);
   const riskTotal = Math.max(1, fallbackStats.total);
@@ -1822,7 +1888,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
                     <small>{formatDateTime(row.lastActivity || row.last_activity)}</small>
                   </span>
                   <span className={riskClass(row.risk || row.risk_level)}>{row.risk || row.risk_level}</span>
-                  <span className={caseStatusClass(row.queueStatus || row.status)}>{row.queueStatus || row.status}</span>
+                  <span className={caseStatusClass(row.queueStatus || row.status)}>{formatWorkflowStatus(row.queueStatus || row.status)}</span>
                   <span>{formatNumber(row.score)}</span>
                   <button
                     className="action-link-button"
@@ -1980,19 +2046,19 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
   const pageRows = filteredRows.slice(currentPage * rowsPerPage, currentPage * rowsPerPage + rowsPerPage);
 
   const summary = {
-    highPriority: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "HIGH" && !isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length,
-    mediumPriority: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "MEDIUM" && !isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length,
+    highPriority: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "HIGH" && isQueueActionableStatus(row.queueStatus)).length,
+    mediumPriority: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "MEDIUM" && isQueueActionableStatus(row.queueStatus)).length,
     newCases: reviewRows.filter((row) => normalizeQueueStatus(row.queueStatus) === "NEW").length,
     underInvestigation: reviewRows.filter((row) => normalizeQueueStatus(row.queueStatus) === "UNDER_INVESTIGATION").length,
-    resolved: reviewRows.filter((row) => ["RESOLVED", "CLEARED", "FALSE_POSITIVE", "COMPLETED"].includes(normalizeQueueStatus(row.queueStatus))).length,
+    resolved: reviewRows.filter((row) => isQueueResolvedStatus(row.queueStatus)).length,
     total: reviewRows.length,
   };
 
   const queueHealth = [
     { label: "High", count: summary.highPriority, color: "#ff5f67" },
     { label: "Medium", count: summary.mediumPriority, color: "#ffb703" },
-    { label: "Low", count: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "LOW" && !isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length, color: "#65d46e" },
-    { label: "Resolved", count: reviewRows.filter((row) => isQueueResolvedStatus(normalizeQueueStatus(row.queueStatus))).length, color: "#4f8cff" },
+    { label: "Low", count: reviewRows.filter((row) => normalizeQueueRisk(row.risk) === "LOW" && isQueueActionableStatus(row.queueStatus)).length, color: "#65d46e" },
+    { label: "Resolved", count: reviewRows.filter((row) => isQueueResolvedStatus(row.queueStatus)).length, color: "#4f8cff" },
   ];
 
   const resolvedWithDates = Object.values(caseByAttemptId).filter((item) => item?.updated_at && item?.created_at && isResolvedCaseStatus(item.status));
@@ -2169,7 +2235,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
         <div className="queue-table-scroll">
           <div className="queue-enterprise-table">
             <div className="queue-enterprise-head">
-              <span></span>
               <span>Priority</span>
               <span>Candidate / Attempt</span>
               <span>Assessment</span>
@@ -2188,7 +2253,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
             ) : (
               pageRows.map((row, index) => (
                 <div className="queue-enterprise-row" key={row.caseId || row.attemptId}>
-                  <span><input type="checkbox" aria-label={`Select ${row.attemptId}`} /></span>
                   <span className={`priority-index tone-${riskTone(row.risk)}`}>{row.priorityRank || currentPage * rowsPerPage + index + 1}</span>
                   <span className="queue-candidate-block">
                     <span className="queue-candidate-avatar">{getInitials(row.candidateName || row.attemptId)}</span>
@@ -2203,7 +2267,7 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
                     <MiniSparkline tone={riskTone(row.risk)} seed={`${row.attemptId}-${row.score}`} />
                   </span>
                   <span className={riskClass(normalizeQueueRisk(row.risk))}>{normalizeQueueRisk(row.risk)}</span>
-                  <span className={caseStatusClass(normalizeQueueStatus(row.queueStatus))}>{normalizeQueueStatus(row.queueStatus)}</span>
+                  <span className={caseStatusClass(normalizeQueueStatus(row.queueStatus))}>{formatWorkflowStatus(normalizeQueueStatus(row.queueStatus))}</span>
                   <span>{row.assignedTo || "Unassigned"}</span>
                   <span className="queue-last-activity">
                     <strong>{row.lastActivity ? formatDateTime(row.lastActivity) : "—"}</strong>
@@ -2471,7 +2535,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   ];
   const chartData = riskHistory.map((item) => ({
     ...item,
-    label: formatTime(item.timestamp).slice(0, 5),
+    label: formatClockLabel(item.timestamp),
     score: item.score ?? item.combined_score,
     risk_level: item.risk_level || item.risk,
   }));
@@ -2489,6 +2553,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
     return bTime - aTime;
   });
   const topEvidenceRows = sortedEvidenceRows.slice(0, 5);
+  const investigationInsights = buildInvestigationInsights(reportData, sortedEvidenceRows, displayRisk);
   const canExportPdf = ["ADMIN", "REVIEWER"].includes(String(currentUser?.role || "").toUpperCase());
 
   const handleExportPdf = useCallback(async () => {
@@ -2530,6 +2595,9 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
           <td>${escapeHtml(row.subtitle || row.details || "—")}</td>
         </tr>
       `).join("");
+      const insightsHtml = investigationInsights.length
+        ? investigationInsights.map((item) => `<li>${escapeHtml(item)}</li>`).join("")
+        : `<li>Waiting for evidence aggregation.</li>`;
       const historyHtml = actionHistory.length
         ? actionHistory.map((action) => `
             <div class="pdf-history-item">
@@ -2642,6 +2710,8 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
               .pdf-history-item:first-child { border-top: 0; padding-top: 0; }
               .pdf-history-item p { margin: 8px 0; color: #334155; line-height: 1.45; }
               .pdf-history-item small { color: #64748b; }
+              .pdf-insight-list { margin: 0; padding-left: 18px; color: #334155; display: grid; gap: 8px; }
+              .pdf-insight-list li { line-height: 1.45; }
               .pdf-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
               .pdf-empty { padding: 12px 0; color: #64748b; }
               .pdf-generated { margin-top: 18px; color: #64748b; font-size: 12px; }
@@ -2680,6 +2750,11 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
               <section class="pdf-section">
                 <h2>Violation Overview</h2>
                 <div class="pdf-grid-overview">${violationOverviewHtml}</div>
+              </section>
+
+              <section class="pdf-section">
+                <h2>Most Suspicious Behaviors Observed</h2>
+                <ul class="pdf-insight-list">${insightsHtml}</ul>
               </section>
 
               <section class="pdf-section">
@@ -2778,6 +2853,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
     evidenceRows,
     finalDecision,
     headerMetadata,
+    investigationInsights,
     liveRisk,
     overviewItems,
     reportData,
@@ -2830,8 +2906,22 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
 
         <ViolationOverview items={overviewItems} />
 
+        <section className="investigation-card investigation-insights-card">
+          <div className="report-card-head accent">
+            <h3>Most Suspicious Behaviors Observed</h3>
+          </div>
+          <div className="investigation-insights-list">
+            {investigationInsights.map((item) => (
+              <article className="investigation-insight-item" key={item}>
+                <span className={`insight-dot ${String(displayRisk || "LOW").toLowerCase()}`}></span>
+                <p>{item}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+
         <div className="report-main-row investigation-main-grid">
-          <EvidenceTable rows={sortedEvidenceRows} />
+          <EvidenceTable rows={sortedEvidenceRows} loading={reportLoading} />
           <ReviewerWorkflow
             caseStatus={caseStatus}
             assignedReviewer={assignedReviewer}

@@ -250,6 +250,12 @@ def _build_item(
     }
 
 
+def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
+    if count == 1:
+        return singular
+    return plural or f"{singular}s"
+
+
 def _typing_event(event: Dict[str, Any]) -> bool:
     return str(event.get("event_type") or "").lower() in {
         "typing_started",
@@ -342,7 +348,10 @@ def normalize_evidence(
                 title="Clipboard Activity",
                 severity=severity,
                 count=clipboard_count,
-                explanation=f"Clipboard metadata was captured {clipboard_count} time{'s' if clipboard_count != 1 else ''} during the attempt.",
+                explanation=(
+                    f"Clipboard metadata was recorded {clipboard_count} {_pluralize(clipboard_count, 'time')} during the attempt, "
+                    "which should be reviewed alongside nearby focus and answer activity."
+                ),
                 first_seen=first_seen,
                 last_seen=last_seen,
                 related_event_count=max(clipboard_count, len(clipboard_times)),
@@ -360,7 +369,10 @@ def normalize_evidence(
                 title="Tab Switching",
                 severity=severity,
                 count=tab_switch_count,
-                explanation=f"The assessment lost tab visibility {tab_switch_count} time{'s' if tab_switch_count != 1 else ''}.",
+                explanation=(
+                    f"The assessment window lost visibility {tab_switch_count} {_pluralize(tab_switch_count, 'time')}, "
+                    "indicating repeated movement away from the active assessment tab."
+                ),
                 first_seen=first_seen,
                 last_seen=last_seen,
                 related_event_count=max(tab_switch_count, len(tab_switch_times)),
@@ -378,7 +390,10 @@ def normalize_evidence(
                 title="Focus / Blur Events",
                 severity=severity,
                 count=focus_blur_count,
-                explanation=f"Window focus changed or blurred {focus_blur_count} time{'s' if focus_blur_count != 1 else ''} during the attempt.",
+                explanation=(
+                    f"Window focus changed or blurred {focus_blur_count} {_pluralize(focus_blur_count, 'time')} during the attempt, "
+                    "creating repeated gaps in on-screen engagement."
+                ),
                 first_seen=first_seen,
                 last_seen=last_seen,
                 related_event_count=focus_blur_count,
@@ -402,8 +417,8 @@ def normalize_evidence(
                 severity=severity,
                 count=max(idle_spike_count, len(idle_events)),
                 explanation=(
-                    f"Idle telemetry recorded {max(idle_spike_count, len(idle_events))} spike"
-                    f"{'s' if max(idle_spike_count, len(idle_events)) != 1 else ''}; longest observed gap was {format_duration(idle_max_seconds)}."
+                    f"Idle telemetry recorded {max(idle_spike_count, len(idle_events))} "
+                    f"{_pluralize(max(idle_spike_count, len(idle_events)), 'spike')}; longest observed gap was {format_duration(idle_max_seconds)}."
                 ),
                 first_seen=first_seen,
                 last_seen=last_seen,
@@ -420,7 +435,10 @@ def normalize_evidence(
                 title="Rapid Answer Burst",
                 severity=severity,
                 count=int(burst_metrics["count"]),
-                explanation=f"Answer submissions arrived in quick succession {burst_metrics['count']} time{'s' if burst_metrics['count'] != 1 else ''}.",
+                explanation=(
+                    f"Answer changes or submissions occurred in quick succession {burst_metrics['count']} "
+                    f"{_pluralize(int(burst_metrics['count']), 'time')}, reducing normal dwell time between responses."
+                ),
                 first_seen=burst_metrics["first_seen"],
                 last_seen=burst_metrics["last_seen"],
                 related_event_count=int(burst_metrics["related_event_count"]),
@@ -437,8 +455,8 @@ def normalize_evidence(
                 severity=severity,
                 count=int(sequence_metrics["count"]),
                 explanation=(
-                    "Clipboard or focus-loss activity was followed by answer submission within short event sequences "
-                    f"{sequence_metrics['count']} time{'s' if sequence_metrics['count'] != 1 else ''}."
+                    "Clipboard or focus-loss activity was followed by answer changes inside short event windows "
+                    f"{sequence_metrics['count']} {_pluralize(int(sequence_metrics['count']), 'time')}, suggesting linked suspicious behavior."
                 ),
                 first_seen=sequence_metrics["first_seen"],
                 last_seen=sequence_metrics["last_seen"],
@@ -494,7 +512,10 @@ def normalize_evidence(
                 title="High Risk Score",
                 severity=HIGH,
                 count=1,
-                explanation=f"The combined risk score reached {safe_float(risk_score):.2f}, which falls in the HIGH risk band.",
+                explanation=(
+                    f"The combined risk score reached {safe_float(risk_score):.2f}, reflecting sustained high-concern evidence "
+                    "rather than an isolated signal."
+                ),
                 first_seen=overall_last_seen,
                 last_seen=overall_last_seen,
                 related_event_count=event_count,

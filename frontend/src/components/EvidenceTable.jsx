@@ -93,6 +93,14 @@ function signalTypeLabel(option) {
   return "Other";
 }
 
+function eventFlowLabel(eventTypes = []) {
+  if (!Array.isArray(eventTypes) || !eventTypes.length) return "";
+  return eventTypes
+    .map((item) => String(item || "").replaceAll("_", " ").toLowerCase())
+    .map((item) => item.split(" ").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" "))
+    .join(" -> ");
+}
+
 function sortTimelineRows(rows, sortMode) {
   return [...rows].sort((a, b) => {
     const aTime = a.lastSeen ? new Date(a.lastSeen).getTime() : 0;
@@ -125,12 +133,12 @@ function sortTimelineRows(rows, sortMode) {
   });
 }
 
-export default function EvidenceTable({ rows }) {
+export default function EvidenceTable({ rows, loading = false }) {
   const [showTimeline, setShowTimeline] = useState(false);
   const [severityFilter, setSeverityFilter] = useState("ALL");
   const [typeFilter, setTypeFilter] = useState("ALL");
   const [searchQuery, setSearchQuery] = useState("");
-  const [sortMode, setSortMode] = useState("severity");
+  const [sortMode, setSortMode] = useState("recent");
 
   const rankedRows = useMemo(() => {
     return [...rows].sort((a, b) => {
@@ -180,6 +188,22 @@ export default function EvidenceTable({ rows }) {
 
     return sortTimelineRows(filteredRows, sortMode);
   }, [rankedRows, searchQuery, severityFilter, sortMode, typeFilter]);
+  const groupedTimelineRows = useMemo(() => {
+    return filteredTimelineRows.reduce((groups, row) => {
+      const option = signalTypeOption(row);
+      const existing = groups.find((group) => group.key === option);
+      if (existing) {
+        existing.rows.push(row);
+        return groups;
+      }
+      groups.push({
+        key: option,
+        label: signalTypeLabel(option),
+        rows: [row],
+      });
+      return groups;
+    }, []);
+  }, [filteredTimelineRows]);
 
   useEffect(() => {
     if (!showTimeline) return undefined;
@@ -204,8 +228,10 @@ export default function EvidenceTable({ rows }) {
           </button>
         </div>
 
-        {rankedRows.length === 0 ? (
-          <div className="timeline-empty">No high-signal evidence has been generated for this attempt yet.</div>
+        {loading ? (
+          <div className="timeline-empty">Waiting for evidence aggregation.</div>
+        ) : rankedRows.length === 0 ? (
+          <div className="timeline-empty">Waiting for evidence aggregation.</div>
         ) : (
           <div className="evidence-table-shell">
             <div className="evidence-table-head">
@@ -319,34 +345,49 @@ export default function EvidenceTable({ rows }) {
             </div>
 
             <div className="evidence-timeline-list">
-              {filteredTimelineRows.length === 0 ? (
+              {loading ? (
+                <div className="timeline-empty">Timeline still loading.</div>
+              ) : groupedTimelineRows.length === 0 ? (
                 <div className="timeline-empty">No evidence signals available.</div>
-              ) : filteredTimelineRows.map((row) => {
-                const Icon = ICONS[row.key] || ICONS.fallback;
-                return (
-                  <article className="evidence-timeline-item" key={`timeline-${row.key}-${row.title}`}>
-                    <div className="evidence-timeline-top">
-                      <div className="evidence-type-cell">
-                        <span className={`evidence-icon-chip ${String(row.severity || "low").toLowerCase()}`}>
-                          <Icon size={16} />
-                        </span>
-                        <div>
-                          <strong>{row.title}</strong>
-                          <p>{signalTypeLabel(signalTypeOption(row))}</p>
-                        </div>
-                      </div>
-                      <span className={`severity-chip ${String(row.severity || "low").toLowerCase()}`}>{row.severity}</span>
-                    </div>
-                    <p className="evidence-timeline-explanation">{row.subtitle || row.explanation || row.details || "No explanation available."}</p>
-                    <div className="evidence-timeline-meta">
-                      <span>Count: {row.countDisplay || row.count || "0"}</span>
-                      <span>Related Events: {row.relatedEventCount ?? 0}</span>
-                      <span>First Seen: {formatTimestamp(row.firstSeen)}</span>
-                      <span>Last Seen: {formatTimestamp(row.lastSeen)}</span>
-                    </div>
-                  </article>
-                );
-              })}
+              ) : groupedTimelineRows.map((group) => (
+                <section className="evidence-timeline-group" key={group.key}>
+                  <div className="evidence-timeline-group-head">
+                    <span>{group.label}</span>
+                    <small>{group.rows.length} signal{group.rows.length === 1 ? "" : "s"}</small>
+                  </div>
+                  <div className="evidence-timeline-group-list">
+                    {group.rows.map((row) => {
+                      const Icon = ICONS[row.key] || ICONS.fallback;
+                      return (
+                        <article className="evidence-timeline-item" key={`timeline-${group.key}-${row.key}-${row.title}`}>
+                          <div className="evidence-timeline-top">
+                            <div className="evidence-type-cell">
+                              <span className={`evidence-icon-chip ${String(row.severity || "low").toLowerCase()}`}>
+                                <Icon size={16} />
+                              </span>
+                              <div>
+                                <strong>{row.title}</strong>
+                                <p>{signalTypeLabel(signalTypeOption(row))}</p>
+                              </div>
+                            </div>
+                            <span className={`severity-chip ${String(row.severity || "low").toLowerCase()}`}>{row.severity}</span>
+                          </div>
+                          <p className="evidence-timeline-explanation">{row.reviewerSummary || row.subtitle || row.explanation || row.details || "No explanation available."}</p>
+                          {row.involvedEventTypes?.length ? (
+                            <div className="evidence-timeline-flow">Sequence: {eventFlowLabel(row.involvedEventTypes)}</div>
+                          ) : null}
+                          <div className="evidence-timeline-meta">
+                            <span>Count: {row.countDisplay || row.count || "0"}</span>
+                            <span>Related Events: {row.relatedEventCount ?? 0}</span>
+                            <span>First Seen: {formatTimestamp(row.firstSeen)}</span>
+                            <span>Last Seen: {formatTimestamp(row.lastSeen)}</span>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
             </div>
           </div>
         </div>

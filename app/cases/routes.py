@@ -9,6 +9,7 @@ from sqlalchemy import distinct
 from app.auth.dependencies import require_reviewer
 from app.models.user import User
 from app.services.evidence_service import normalize_evidence, normalize_risk_level, safe_float
+from app.services.final_assessment_service import build_final_risk_assessment
 from app.schemas.cases import (
     CaseAssignRequest,
     CaseDetailOut,
@@ -32,6 +33,20 @@ from engine.db.models import (
 
 
 router = APIRouter(prefix="/v1/cases", tags=["cases"])
+ACTIONABLE_CASE_STATUSES = {
+    CaseStatus.NEW.value,
+    CaseStatus.TRIAGED.value,
+    CaseStatus.UNDER_INVESTIGATION.value,
+    CaseStatus.ESCALATED.value,
+}
+COMPLETED_CASE_STATUSES = {
+    "RESOLVED",
+    CaseStatus.CLEARED.value,
+    CaseStatus.CONFIRMED_RISK.value,
+    CaseStatus.FALSE_POSITIVE.value,
+    CaseStatus.CLOSED.value,
+    "COMPLETED",
+}
 
 TERMINAL_DECISIONS = {
     CaseStatus.CLEARED.value,
@@ -131,32 +146,24 @@ def _latest_snapshot(db, attempt_id: str) -> Optional[Dict[str, object]]:
     if not current_risk and not latest_history and not latest_event and not latest_attempt_log:
         return None
 
+    assessment = build_final_risk_assessment(
+        attempt_id=attempt_id,
+        latest_history=latest_history,
+        latest_attempt_log=latest_attempt_log,
+        latest_event=latest_event,
+        current_risk=current_risk,
+    )
+
     return {
-        "candidate_id": current_risk.get("candidate_id") or getattr(latest_history, "candidate_id", None) or getattr(latest_event, "candidate_id", None),
-        "candidate_name": current_risk.get("candidate_name") or getattr(latest_history, "candidate_name", None) or getattr(latest_event, "candidate_name", None),
-        "candidate_email": current_risk.get("candidate_email") or getattr(latest_history, "candidate_email", None) or getattr(latest_event, "candidate_email", None),
-        "assessment_id": current_risk.get("assessment_id") or getattr(latest_history, "assessment_id", None) or getattr(latest_event, "assessment_id", None),
-        "assessment_name": current_risk.get("assessment_name") or getattr(latest_history, "assessment_name", None) or getattr(latest_event, "assessment_name", None),
-        "current_risk": current_risk.get("risk") or getattr(latest_history, "risk", None) or getattr(latest_attempt_log, "risk", None),
-        "current_confidence": (
-            current_risk.get("confidence")
-            if current_risk.get("confidence") is not None
-            else getattr(latest_history, "confidence", None)
-            if latest_history is not None
-            else getattr(latest_attempt_log, "confidence", None)
-        ),
-        "current_combined_score": (
-            current_risk.get("combined_score")
-            if current_risk.get("combined_score") is not None
-            else getattr(latest_history, "combined_score", None)
-            if latest_history is not None
-            else getattr(latest_attempt_log, "combined_score", None)
-        ),
-        "latest_event_at": current_risk.get("updated_at")
-        or getattr(latest_history, "timestamp", None)
-        or getattr(latest_event, "received_at", None)
-        or getattr(latest_event, "occurred_at", None)
-        or getattr(latest_attempt_log, "timestamp", None),
+        "candidate_id": assessment.get("candidate_id"),
+        "candidate_name": assessment.get("candidate_name"),
+        "candidate_email": assessment.get("candidate_email"),
+        "assessment_id": assessment.get("assessment_id"),
+        "assessment_name": assessment.get("assessment_name"),
+        "current_risk": assessment.get("risk_level"),
+        "current_confidence": assessment.get("confidence"),
+        "current_combined_score": assessment.get("combined_score"),
+        "latest_event_at": assessment.get("generated_at"),
     }
 
 
@@ -300,18 +307,14 @@ def _queue_status(case: InvestigationCase) -> str:
 def _status_priority(status_value: str) -> int:
     if status_value == CaseStatus.ESCALATED.value:
         return 0
-    if status_value == CaseStatus.CONFIRMED_RISK.value:
-        return 1
     if status_value == CaseStatus.UNDER_INVESTIGATION.value:
-        return 2
+        return 1
     if status_value == CaseStatus.TRIAGED.value:
-        return 3
+        return 2
     if status_value == CaseStatus.NEW.value:
+        return 3
+    if status_value in COMPLETED_CASE_STATUSES:
         return 4
-    if status_value == "RESOLVED":
-        return 5
-    if status_value == CaseStatus.CLOSED.value:
-        return 6
     return 7
 
 
@@ -359,7 +362,29 @@ def _latest_attempt_logs_by_attempt(db) -> Dict[str, AttemptLog]:
     return result
 
 
-def _strongest_signal_for_case(*, latest_log: Optional[AttemptLog], latest_event: Optional[RawExamEvent], risk_score: float, risk_level: str) -> str:
+def _latest_history_by_attempt(db) -> Dict[str, RiskHistory]:
+    rows = (
+        db.query(RiskHistory)
+        .order_by(RiskHistory.timestamp.desc(), RiskHistory.id.desc())
+        .all()
+    )
+    result: Dict[str, RiskHistory] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in result:
+            result[row.attempt_id] = row
+    return result
+
+
+def _strongest_signal_for_case(
+    *,
+    latest_log: Optional[AttemptLog],
+    latest_event: Optional[RawExamEvent],
+    risk_score: float,
+    risk_level: str,
+    strongest_reason: str = "",
+) -> str:
+    if strongest_reason:
+        return strongest_reason
     features = getattr(latest_log, "features", None) or {}
     events = []
     if latest_event is not None:
@@ -400,6 +425,7 @@ def _build_review_queue_payload(
     event_counts = _event_counts_by_attempt(db)
     latest_events = _latest_events_by_attempt(db)
     latest_logs = _latest_attempt_logs_by_attempt(db)
+    latest_history = _latest_history_by_attempt(db)
 
     rows = []
     cutoff = _recent_cutoff(recent_hours)
@@ -412,17 +438,37 @@ def _build_review_queue_payload(
         latest_log = latest_logs.get(case.attempt_id)
         assigned_to = getattr(assigned_user, "full_name", None) or getattr(assigned_user, "email", None) or "Unassigned"
         last_activity = case.latest_event_at or getattr(latest_event, "received_at", None) or getattr(latest_event, "occurred_at", None)
+        canonical_assessment = build_final_risk_assessment(
+            attempt_id=case.attempt_id,
+            latest_event=latest_event,
+            latest_attempt_log=latest_log,
+            latest_history=latest_history.get(case.attempt_id),
+            current_risk=None,
+            fallback_result={
+                "candidate_id": case.candidate_id,
+                "candidate_name": case.candidate_name,
+                "candidate_email": case.candidate_email,
+                "assessment_id": case.assessment_id,
+                "assessment_name": case.assessment_name,
+                "risk": case.current_risk,
+                "confidence": case.current_confidence,
+                "combined_score": case.current_combined_score,
+                "generated_at": case.latest_event_at,
+            },
+        )
+        risk_score = safe_float(canonical_assessment.get("combined_score"), 0.0)
+        risk_level = str(canonical_assessment.get("risk_level") or normalize_risk_level(risk_score))
 
         rows.append(
             {
                 "case_id": case.id,
                 "attempt_id": case.attempt_id,
-                "candidate_name": case.candidate_name or getattr(latest_event, "candidate_name", None) or "Unknown Candidate",
-                "candidate_email": case.candidate_email or getattr(latest_event, "candidate_email", None) or "No email available",
-                "assessment_name": case.assessment_name or getattr(latest_event, "assessment_name", None) or "Python Coding Assessment",
+                "candidate_name": canonical_assessment.get("candidate_name") or "Unknown Candidate",
+                "candidate_email": canonical_assessment.get("candidate_email") or "No email available",
+                "assessment_name": canonical_assessment.get("assessment_name") or "Python Coding Assessment",
                 "risk_level": risk_level,
                 "risk_score": round(risk_score, 4),
-                "confidence": round(safe_float(case.current_confidence, 0.0), 4),
+                "confidence": round(safe_float(canonical_assessment.get("confidence"), 0.0), 4),
                 "case_status": queue_status,
                 "assigned_to": assigned_to,
                 "last_activity": last_activity,
@@ -432,6 +478,7 @@ def _build_review_queue_payload(
                     latest_event=latest_event,
                     risk_score=risk_score,
                     risk_level=risk_level,
+                    strongest_reason=str(canonical_assessment.get("strongest_reason") or "").strip(),
                 ),
             }
         )
@@ -460,7 +507,7 @@ def _build_review_queue_payload(
         "new": sum(1 for row in rows if row["case_status"] == CaseStatus.NEW.value),
         "under_investigation": sum(1 for row in rows if row["case_status"] == CaseStatus.UNDER_INVESTIGATION.value),
         "escalated": sum(1 for row in rows if row["case_status"] == CaseStatus.ESCALATED.value),
-        "resolved": sum(1 for row in rows if row["case_status"] == "RESOLVED"),
+        "resolved": sum(1 for row in rows if row["case_status"] in COMPLETED_CASE_STATUSES),
         "closed": sum(1 for row in rows if row["case_status"] == CaseStatus.CLOSED.value),
     }
 
