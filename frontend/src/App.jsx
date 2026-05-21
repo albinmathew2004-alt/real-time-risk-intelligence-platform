@@ -33,8 +33,17 @@ import {
   ChevronDown,
   ArrowUpRight,
   FileDown,
+  CheckSquare,
+  Code2,
+  BrainCircuit,
+  Bug,
+  DatabaseZap,
+  Play,
+  Lock,
+  TimerReset,
 } from "lucide-react";
 
+import "../../sdk/risk-telemetry-sdk.js";
 import "./App.css";
 import EvidenceTable from "./components/EvidenceTable";
 import InvestigationHeader from "./components/InvestigationHeader";
@@ -1264,7 +1273,559 @@ async function authJsonFetch(url, { token, method = "GET", body } = {}) {
   }
 }
 
+const PUBLIC_DEMO_ASSESSMENTS = [
+  {
+    id: "assessment_coding_01",
+    name: "Coding Assessment",
+    durationMinutes: 14,
+    icon: Code2,
+    intro: "Demonstrate implementation thinking, debugging discipline, and short-form coding judgement.",
+    questions: [
+      {
+        id: "code_q1",
+        title: "Python Data Handling",
+        prompt: "Describe how you would safely parse a CSV file with missing values and normalize the rows before analysis.",
+        type: "textarea",
+        placeholder: "Outline the parsing steps, validation approach, and how you would handle missing fields.",
+      },
+      {
+        id: "code_q2",
+        title: "Algorithm Tradeoff",
+        prompt: "A teammate proposes a nested loop solution over 100k rows. What would you review before approving it?",
+        type: "textarea",
+        placeholder: "Discuss time complexity, memory, edge cases, and operational implications.",
+      },
+      {
+        id: "code_q3",
+        title: "Function Signature",
+        prompt: "Write a concise function signature for validating and scoring a browser telemetry event batch.",
+        type: "input",
+        placeholder: "def score_batch(events: list[dict], attempt_id: str) -> dict:",
+      },
+    ],
+  },
+  {
+    id: "assessment_reasoning_01",
+    name: "Logical Reasoning",
+    durationMinutes: 12,
+    icon: BrainCircuit,
+    intro: "Assess structured reasoning, prioritization, and concise decision making under time pressure.",
+    questions: [
+      {
+        id: "reason_q1",
+        title: "Incident Triage",
+        prompt: "Three assessment integrity alerts arrive at once. How would you prioritize them and why?",
+        type: "textarea",
+        placeholder: "Explain your triage sequence and the signals that would drive escalation.",
+      },
+      {
+        id: "reason_q2",
+        title: "Evidence Review",
+        prompt: "What combination of signals would make a MEDIUM-risk case worth manual review instead of automatic clearance?",
+        type: "textarea",
+        placeholder: "Discuss ambiguity, evidence correlation, and reviewer judgement.",
+      },
+      {
+        id: "reason_q3",
+        title: "Decision Note",
+        prompt: "Summarize a final reviewer decision in one sentence for the audit trail.",
+        type: "input",
+        placeholder: "Example: Repeated focus loss and paste recovery justified escalation for manual action.",
+      },
+    ],
+  },
+  {
+    id: "assessment_frontend_01",
+    name: "Frontend Debugging",
+    durationMinutes: 13,
+    icon: Bug,
+    intro: "Evaluate debugging clarity, frontend diagnosis, and risk-based prioritization of UI issues.",
+    questions: [
+      {
+        id: "front_q1",
+        title: "Layout Bug",
+        prompt: "A dashboard table is clipping its action buttons on 1440px screens. What would you inspect first?",
+        type: "textarea",
+        placeholder: "Mention containers, overflow, min-width, flex/grid constraints, and responsive checks.",
+      },
+      {
+        id: "front_q2",
+        title: "State Bug",
+        prompt: "A reviewer page shows stale risk levels after an action. How would you isolate the source of truth issue?",
+        type: "textarea",
+        placeholder: "Describe how you would trace state, API payloads, and refresh/update timing.",
+      },
+      {
+        id: "front_q3",
+        title: "Quick Fix Note",
+        prompt: "Write a short engineering note describing the likely cause of a blank export popup.",
+        type: "input",
+        placeholder: "Example: popup opened before printable content finished rendering.",
+      },
+    ],
+  },
+  {
+    id: "assessment_sql_01",
+    name: "SQL Basics",
+    durationMinutes: 11,
+    icon: DatabaseZap,
+    intro: "Measure database reasoning, filtering logic, and confidence with simple analytics tasks.",
+    questions: [
+      {
+        id: "sql_q1",
+        title: "Query Intent",
+        prompt: "How would you retrieve the latest review case per attempt without showing stale statuses?",
+        type: "textarea",
+        placeholder: "Describe the SQL shape or logic you would use.",
+      },
+      {
+        id: "sql_q2",
+        title: "Operational Metric",
+        prompt: "How would you count only actionable HIGH-risk cases for a dashboard KPI?",
+        type: "textarea",
+        placeholder: "Explain the filters or case lifecycle rules you would apply.",
+      },
+      {
+        id: "sql_q3",
+        title: "Index Hint",
+        prompt: "Name one index that would help a review queue ordered by last activity.",
+        type: "input",
+        placeholder: "Example: index on (status, updated_at desc)",
+      },
+    ],
+  },
+];
+
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "candidate";
+}
+
+function createDemoAttemptId(name, assessmentId) {
+  const candidateSlug = slugify(name).slice(0, 18);
+  const assessmentSlug = slugify(assessmentId).replace(/^assessment_/, "").slice(0, 16);
+  return `demo_public_${candidateSlug}_${assessmentSlug}_${Date.now()}`;
+}
+
+function createDemoCandidateId(name, email) {
+  const source = slugify(email || name || "demo_candidate");
+  return `candidate_${source}_${Math.floor(Date.now() / 1000)}`;
+}
+
+function PublicDemoPage({ apiBaseUrl }) {
+  const [consented, setConsented] = useState(false);
+  const [candidateName, setCandidateName] = useState("");
+  const [candidateEmail, setCandidateEmail] = useState("");
+  const [assessmentId, setAssessmentId] = useState(PUBLIC_DEMO_ASSESSMENTS[0].id);
+  const [stage, setStage] = useState("welcome");
+  const [attemptId, setAttemptId] = useState("");
+  const [candidateId, setCandidateId] = useState("");
+  const [answers, setAnswers] = useState({});
+  const [questionIndex, setQuestionIndex] = useState(0);
+  const [timeRemaining, setTimeRemaining] = useState(PUBLIC_DEMO_ASSESSMENTS[0].durationMinutes * 60);
+  const [telemetryStatus, setTelemetryStatus] = useState("Telemetry inactive");
+  const [telemetryError, setTelemetryError] = useState("");
+  const [submittedAt, setSubmittedAt] = useState("");
+
+  const selectedAssessment = useMemo(
+    () => PUBLIC_DEMO_ASSESSMENTS.find((item) => item.id === assessmentId) || PUBLIC_DEMO_ASSESSMENTS[0],
+    [assessmentId],
+  );
+  const currentQuestion = selectedAssessment.questions[questionIndex] || selectedAssessment.questions[0];
+  const totalQuestions = selectedAssessment.questions.length;
+  const progressPercent = totalQuestions > 0 ? ((questionIndex + 1) / totalQuestions) * 100 : 0;
+
+  useEffect(() => {
+    if (stage !== "assessment") {
+      setTimeRemaining(selectedAssessment.durationMinutes * 60);
+    }
+  }, [selectedAssessment.durationMinutes, stage]);
+
+  useEffect(() => {
+    if (stage !== "assessment") return undefined;
+    const intervalId = window.setInterval(() => {
+      setTimeRemaining((prev) => {
+        if (prev <= 1) {
+          window.clearInterval(intervalId);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [stage]);
+
+  useEffect(() => {
+    if (stage !== "assessment" || !currentQuestion || typeof window === "undefined" || !window.RiskTelemetry) return undefined;
+    window.RiskTelemetry.enterQuestion(currentQuestion.id);
+    return () => {
+      try {
+        window.RiskTelemetry.leaveQuestion(currentQuestion.id);
+      } catch {
+        // ignore SDK cleanup issues
+      }
+    };
+  }, [currentQuestion, stage]);
+
+  useEffect(() => {
+    if (timeRemaining !== 0 || stage !== "assessment") return;
+    void handleSubmit();
+  }, [stage, timeRemaining]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== "undefined" && window.RiskTelemetry) {
+        try {
+          window.RiskTelemetry.destroy();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, []);
+
+  const handleStart = useCallback(() => {
+    if (!candidateName.trim() || !candidateEmail.trim()) {
+      setTelemetryError("Enter a candidate name and email to begin the demo assessment.");
+      return;
+    }
+    if (!consented) {
+      setTelemetryError("Candidate consent is required before telemetry can begin.");
+      return;
+    }
+
+    const nextAttemptId = createDemoAttemptId(candidateName, selectedAssessment.id);
+    const nextCandidateId = createDemoCandidateId(candidateName, candidateEmail);
+    setAttemptId(nextAttemptId);
+    setCandidateId(nextCandidateId);
+    setAnswers({});
+    setQuestionIndex(0);
+    setSubmittedAt("");
+    setTelemetryError("");
+
+    try {
+      if (!window.RiskTelemetry) {
+        setTelemetryError("Telemetry SDK is unavailable in this build.");
+        return;
+      }
+      try {
+        window.RiskTelemetry.destroy();
+      } catch {
+        // ignore prior session cleanup failures
+      }
+      window.RiskTelemetry.init({
+        baseUrl: apiBaseUrl,
+        attemptId: nextAttemptId,
+        candidateId: nextCandidateId,
+        candidateName: candidateName.trim(),
+        candidateEmail: candidateEmail.trim(),
+        assessmentId: selectedAssessment.id,
+        assessmentName: selectedAssessment.name,
+        idleTimeoutMs: 25000,
+        typingStopMs: 1200,
+        devMode: false,
+      });
+      window.RiskTelemetry.startExam();
+      setTelemetryStatus("Telemetry active");
+      setStage("assessment");
+    } catch (error) {
+      setTelemetryError(error instanceof Error ? error.message : "Unable to initialize assessment telemetry.");
+    }
+  }, [apiBaseUrl, assessmentId, candidateEmail, candidateName, consented, selectedAssessment.id, selectedAssessment.name]);
+
+  const handleAnswerChange = useCallback((questionId, value) => {
+    setAnswers((prev) => ({ ...prev, [questionId]: value }));
+    try {
+      window.RiskTelemetry?.trackAnswerChange(questionId, value);
+    } catch (error) {
+      setTelemetryError(error instanceof Error ? error.message : "Unable to record typing telemetry.");
+    }
+  }, []);
+
+  const handleSubmit = useCallback(async () => {
+    try {
+      window.RiskTelemetry?.endExam();
+      setTelemetryStatus("Assessment submitted");
+    } catch (error) {
+      setTelemetryError(error instanceof Error ? error.message : "Unable to submit telemetry cleanly.");
+    }
+    setSubmittedAt(new Date().toISOString());
+    setStage("submitted");
+  }, []);
+
+  const handleRestart = useCallback(() => {
+    try {
+      window.RiskTelemetry?.destroy();
+    } catch {
+      // ignore
+    }
+    setTelemetryStatus("Telemetry inactive");
+    setTelemetryError("");
+    setAttemptId("");
+    setCandidateId("");
+    setAnswers({});
+    setQuestionIndex(0);
+    setSubmittedAt("");
+    setStage("welcome");
+    setTimeRemaining(selectedAssessment.durationMinutes * 60);
+  }, [selectedAssessment.durationMinutes]);
+
+  return (
+    <div className="public-demo-shell">
+      <div className="public-demo-page">
+        <section className="public-demo-hero">
+          <div className="public-demo-hero-copy">
+            <span className="page-kicker">PUBLIC DEMO</span>
+            <h1>Experience a live ProctorIQ assessment</h1>
+            <p>
+              ProctorIQ analyzes privacy-preserving behavioral telemetry in real time to produce deterministic,
+              explainable assessment integrity signals without webcam, audio, or content capture.
+            </p>
+          </div>
+          <div className="public-demo-hero-actions">
+            <a className="demo-link-btn" href="/">Open Reviewer Console</a>
+          </div>
+        </section>
+
+        <section className="public-demo-grid">
+          <div className="public-demo-main">
+            {stage === "welcome" && (
+              <section className="public-demo-card">
+                <div className="public-demo-card-head">
+                  <h2>Welcome</h2>
+                  <span className="demo-status-chip neutral">Metadata-only telemetry</span>
+                </div>
+                <div className="public-demo-copy-block">
+                  <p>
+                    This interactive demo sends the same assessment telemetry used by the reviewer console: answer timing,
+                    focus changes, clipboard metadata, idle recovery, and typing behavior patterns.
+                  </p>
+                  <ul className="public-demo-bullets">
+                    <li>No webcam or audio capture</li>
+                    <li>No answer text stored</li>
+                    <li>No clipboard contents stored</li>
+                    <li>No screen recording</li>
+                    <li>Deterministic and explainable risk analysis</li>
+                  </ul>
+                </div>
+                <div className="public-demo-consent">
+                  <label className="public-demo-checkbox">
+                    <input checked={consented} onChange={(event) => setConsented(event.target.checked)} type="checkbox" />
+                    <span>I understand this demo collects behavioral telemetry metadata and does not capture sensitive content.</span>
+                  </label>
+                </div>
+                <div className="public-demo-card-head compact">
+                  <h3>Candidate Setup</h3>
+                </div>
+                <div className="public-demo-form-grid">
+                  <label>
+                    <span>Candidate Name</span>
+                    <input value={candidateName} onChange={(event) => setCandidateName(event.target.value)} placeholder="Aarav Menon" />
+                  </label>
+                  <label>
+                    <span>Email</span>
+                    <input value={candidateEmail} onChange={(event) => setCandidateEmail(event.target.value)} placeholder="aarav.menon@example.com" />
+                  </label>
+                </div>
+                <div className="public-demo-assessment-grid">
+                  {PUBLIC_DEMO_ASSESSMENTS.map((assessment) => {
+                    const Icon = assessment.icon;
+                    const active = assessment.id === assessmentId;
+                    return (
+                      <button
+                        className={`public-demo-assessment-card ${active ? "active" : ""}`}
+                        key={assessment.id}
+                        onClick={() => setAssessmentId(assessment.id)}
+                        type="button"
+                      >
+                        <span className="public-demo-assessment-icon"><Icon size={18} /></span>
+                        <strong>{assessment.name}</strong>
+                        <small>{assessment.intro}</small>
+                      </button>
+                    );
+                  })}
+                </div>
+                {telemetryError ? <div className="workflow-message workflow-message-warning">{telemetryError}</div> : null}
+                <div className="public-demo-actions">
+                  <button className="workflow-action-btn primary" onClick={handleStart} type="button">
+                    <Play size={16} />
+                    Begin Assessment
+                  </button>
+                </div>
+              </section>
+            )}
+
+            {stage === "assessment" && (
+              <section className="public-demo-card">
+                <div className="public-demo-card-head">
+                  <div>
+                    <span className="report-section-kicker">{selectedAssessment.name}</span>
+                    <h2>{currentQuestion.title}</h2>
+                  </div>
+                  <span className="demo-status-chip active">{telemetryStatus}</span>
+                </div>
+                <div className="public-demo-progress-head">
+                  <div>
+                    <strong>Question {questionIndex + 1} of {totalQuestions}</strong>
+                    <p>{selectedAssessment.intro}</p>
+                  </div>
+                  <div className="public-demo-timer">
+                    <TimerReset size={16} />
+                    <strong>{formatDuration(timeRemaining)}</strong>
+                  </div>
+                </div>
+                <div className="public-demo-progress-bar">
+                  <span style={{ width: `${progressPercent}%` }}></span>
+                </div>
+                <div className="public-demo-question">
+                  <p>{currentQuestion.prompt}</p>
+                  {currentQuestion.type === "textarea" ? (
+                    <textarea
+                      rows={6}
+                      value={answers[currentQuestion.id] || ""}
+                      onChange={(event) => handleAnswerChange(currentQuestion.id, event.target.value)}
+                      placeholder={currentQuestion.placeholder}
+                    />
+                  ) : (
+                    <input
+                      value={answers[currentQuestion.id] || ""}
+                      onChange={(event) => handleAnswerChange(currentQuestion.id, event.target.value)}
+                      placeholder={currentQuestion.placeholder}
+                    />
+                  )}
+                </div>
+                <div className="public-demo-actions spread">
+                  <button
+                    className="workflow-action-btn"
+                    disabled={questionIndex === 0}
+                    onClick={() => setQuestionIndex((prev) => Math.max(0, prev - 1))}
+                    type="button"
+                  >
+                    Previous
+                  </button>
+                  <div className="public-demo-inline-hint">
+                    <Lock size={14} />
+                    Try copy/paste, tab switching, short idle gaps, or rapid answering to see reviewer-side telemetry evolve.
+                  </div>
+                  {questionIndex < totalQuestions - 1 ? (
+                    <button
+                      className="workflow-action-btn primary"
+                      onClick={() => setQuestionIndex((prev) => Math.min(totalQuestions - 1, prev + 1))}
+                      type="button"
+                    >
+                      Next
+                    </button>
+                  ) : (
+                    <button className="workflow-action-btn warning" onClick={() => void handleSubmit()} type="button">
+                      Submit Assessment
+                    </button>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {stage === "submitted" && (
+              <section className="public-demo-card">
+                <div className="public-demo-card-head">
+                  <h2>Assessment submitted</h2>
+                  <span className="demo-status-chip success">Telemetry delivered</span>
+                </div>
+                <div className="public-demo-copy-block">
+                  <p>
+                    The assessment session has been submitted. Reviewer dashboards can now inspect the attempt,
+                    generated evidence, and real-time risk history.
+                  </p>
+                </div>
+                <div className="public-demo-summary-grid">
+                  <div className="public-demo-summary-item">
+                    <span>Attempt ID</span>
+                    <strong>{attemptId}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Candidate</span>
+                    <strong>{candidateName || "—"}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Assessment</span>
+                    <strong>{selectedAssessment.name}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Submitted</span>
+                    <strong>{formatDateTime(submittedAt)}</strong>
+                  </div>
+                </div>
+                <div className="public-demo-actions">
+                  <button className="workflow-action-btn primary" onClick={handleRestart} type="button">
+                    <CheckSquare size={16} />
+                    Start Another Demo Attempt
+                  </button>
+                  <a className="demo-link-btn secondary" href="/">
+                    Open Reviewer Console
+                  </a>
+                </div>
+              </section>
+            )}
+          </div>
+
+          <aside className="public-demo-sidebar">
+            <section className="public-demo-card compact">
+              <div className="public-demo-card-head compact">
+                <h3>What telemetry is collected?</h3>
+              </div>
+              <ul className="public-demo-bullets compact">
+                <li>Focus loss and visibility changes</li>
+                <li>Clipboard copy/paste metadata</li>
+                <li>Question timing and answer change timing</li>
+                <li>Idle recovery and typing rhythm metadata</li>
+                <li>Correlated suspicious event sequences</li>
+              </ul>
+            </section>
+
+            <section className="public-demo-card compact">
+              <div className="public-demo-card-head compact">
+                <h3>Privacy notice</h3>
+              </div>
+              <ul className="public-demo-bullets compact">
+                <li>No webcam monitoring</li>
+                <li>No microphone recording</li>
+                <li>No answer text stored</li>
+                <li>No clipboard contents stored</li>
+                <li>No screen recording</li>
+              </ul>
+            </section>
+
+            <section className="public-demo-card compact">
+              <div className="public-demo-card-head compact">
+                <h3>Demo session</h3>
+              </div>
+              <div className="public-demo-summary-grid single">
+                <div className="public-demo-summary-item">
+                  <span>Telemetry Status</span>
+                  <strong>{telemetryStatus}</strong>
+                </div>
+                <div className="public-demo-summary-item">
+                  <span>Candidate ID</span>
+                  <strong>{candidateId || "Generated on start"}</strong>
+                </div>
+                <div className="public-demo-summary-item">
+                  <span>Backend</span>
+                  <strong>{apiBaseUrl}</strong>
+                </div>
+              </div>
+              {telemetryError ? <div className="workflow-message workflow-message-warning">{telemetryError}</div> : null}
+            </section>
+          </aside>
+        </section>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  const isPublicDemoRoute = typeof window !== "undefined" && window.location.pathname.replace(/\/+$/, "") === "/demo";
   const [page, setPage] = useState("dashboard");
   const [logs, setLogs] = useState([]);
   const [cases, setCases] = useState([]);
@@ -1286,6 +1847,13 @@ export default function App() {
   const [autoRefreshInterval, setAutoRefreshInterval] = useState(() => getStoredSetting("riskintel_auto_refresh", "30"));
   const [liveUpdatesEnabled, setLiveUpdatesEnabled] = useState(() => getStoredSetting("riskintel_live_updates", "true") === "true");
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => getStoredSetting("riskintel_notifications", "true") === "true");
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = isPublicDemoRoute ? "dark" : themeMode;
+    if (!isPublicDemoRoute) {
+      setStoredSetting("riskintel_theme_mode", themeMode);
+    }
+  }, [isPublicDemoRoute, themeMode]);
 
   const logout = useCallback(() => {
     setStoredToken(null);
@@ -1434,11 +2002,6 @@ export default function App() {
       setAuthLoading(false);
     }
   }, []);
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = themeMode;
-    setStoredSetting("riskintel_theme_mode", themeMode);
-  }, [themeMode]);
 
   useEffect(() => {
     setStoredSetting("riskintel_auto_refresh", autoRefreshInterval);
@@ -1641,6 +2204,10 @@ export default function App() {
     : wsState === "reconnecting"
       ? "REST polling continues while the stream reconnects"
       : "Live updates are paused";
+
+  if (isPublicDemoRoute) {
+    return <PublicDemoPage apiBaseUrl={API_BASE_URL} />;
+  }
 
   if (!token) {
     return (
