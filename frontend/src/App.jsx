@@ -170,11 +170,16 @@ function getAssessmentName(item) {
 function getExamStatus(item, events = []) {
   const f = getFeatures(item);
   const latestEvent = item?.latest_event?.event_type;
-  const hasSubmit = events.some((e) => e.event_type === "exam_submitted");
+  const canonicalStatus = String(item?.attempt_status || item?.status || "").toUpperCase();
+  const hasSubmit = events.some((e) => ["exam_submitted", "assessment_submitted", "submit", "completed"].includes(String(e.event_type || "").toLowerCase()));
+
+  if (canonicalStatus === "SUBMITTED" || canonicalStatus === "UNDER_REVIEW" || canonicalStatus === "RESOLVED" || canonicalStatus === "COMPLETED") {
+    return "COMPLETED";
+  }
 
   if (f?.has_submit_event === true) return "COMPLETED";
 
-  if (latestEvent === "exam_submitted" || hasSubmit) return "COMPLETED";
+  if (["exam_submitted", "assessment_submitted", "submit", "completed"].includes(String(latestEvent || "").toLowerCase()) || hasSubmit) return "COMPLETED";
   return "ONGOING";
 }
 
@@ -3036,6 +3041,15 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   const [exportingPdf, setExportingPdf] = useState(false);
 
   useEffect(() => {
+    setEvents([]);
+    setRiskHistory([]);
+    setLiveRisk(null);
+    setReportData(null);
+    setCaseDetail(null);
+    setWorkflowMessage("");
+  }, [selected?.attempt_id]);
+
+  useEffect(() => {
     async function fetchReportData() {
       if (!selected?.attempt_id) return;
       try {
@@ -3062,16 +3076,40 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
         setLiveRisk(liveJson.data || null);
         setEvents(eventsJson.data || []);
         setRiskHistory(historyJson.data || []);
-        setReportData(reportJson?.status === "success" ? reportJson.data || null : null);
+        setReportData((prev) => {
+          if (reportJson?.status !== "success") {
+            return prev;
+          }
+          const nextData = reportJson.data || null;
+          const prevEvidence = Array.isArray(prev?.evidence_items) ? prev.evidence_items : [];
+          const nextEvidence = Array.isArray(nextData?.evidence_items) ? nextData.evidence_items : [];
+          const prevOverview = prev?.violation_overview_counts ? Object.keys(prev.violation_overview_counts).length : 0;
+          const nextOverview = nextData?.violation_overview_counts ? Object.keys(nextData.violation_overview_counts).length : 0;
+          if (prev && prevEvidence.length > 0 && nextData && nextEvidence.length === 0 && nextOverview === 0) {
+            return {
+              ...prev,
+              ...nextData,
+              evidence_items: prevEvidence,
+              violation_overview_counts: prev.violation_overview_counts || nextData.violation_overview_counts,
+            };
+          }
+          if (prev && prevOverview > 0 && nextData && nextEvidence.length === 0 && nextOverview === 0) {
+            return {
+              ...prev,
+              ...nextData,
+              violation_overview_counts: prev.violation_overview_counts,
+            };
+          }
+          return nextData;
+        });
       } catch (err) {
         console.error("Failed to fetch report data:", err);
-        setReportData(null);
       } finally {
         setReportLoading(false);
       }
     }
     void fetchReportData();
-  }, [onUnauthorized, selected?.attempt_id, selected?.combined_score, selected?.event_count, selected?.latest_event?.event_type, selected?.latest_event?.occurred_at, token]);
+  }, [onUnauthorized, selected?.attempt_id, token]);
 
   useEffect(() => {
     async function fetchCaseDetail() {
@@ -3145,7 +3183,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   const displayConfidence = reportData?.confidence ?? reportAttempt.confidence;
   const candidateName = reportData?.candidate_name || reportAttempt.candidate_name || events[0]?.candidate_name || riskHistory[0]?.candidate_name || "Unknown Candidate";
   const candidateEmail = reportData?.candidate_email || reportAttempt.candidate_email || events[0]?.candidate_email || riskHistory[0]?.candidate_email || "No email available";
-  const status = getExamStatus(reportAttempt, events);
+  const status = getExamStatus(reportData ? { ...reportAttempt, attempt_status: reportData.attempt_status } : reportAttempt, events);
   const firstEvent = events[0]?.occurred_at || reportAttempt.timestamp;
   const lastEvent = events[events.length - 1]?.occurred_at || getLastActivityAt(reportAttempt) || reportAttempt.timestamp;
   const durationSeconds = getAttemptDurationSeconds(reportAttempt) || getSecondsBetween(firstEvent, lastEvent);

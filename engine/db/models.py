@@ -37,6 +37,41 @@ class AttemptLog(Base):
     timestamp = Column(String)
 
 
+class AttemptState(Base):
+    __tablename__ = "attempt_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    attempt_id = Column(String, unique=True, index=True, nullable=False)
+
+    candidate_id = Column(String, nullable=True, index=True)
+    candidate_name = Column(String, nullable=True)
+    candidate_email = Column(String, nullable=True)
+
+    assessment_id = Column(String, nullable=True, index=True)
+    assessment_name = Column(String, nullable=True)
+
+    status = Column(String, nullable=False, default="ONGOING", index=True)
+    review_status = Column(String, nullable=True, index=True)
+
+    final_risk_level = Column(String, nullable=True, index=True)
+    final_risk_score = Column(Float, nullable=True)
+    confidence = Column(Float, nullable=True)
+    strongest_reason = Column(String, nullable=True)
+
+    violation_overview = Column(JSON, nullable=True)
+    evidence_summary = Column(JSON, nullable=True)
+    risk_history = Column(JSON, nullable=True)
+    features = Column(JSON, nullable=True)
+    signals = Column(JSON, nullable=True)
+
+    latest_event_type = Column(String, nullable=True)
+    latest_event_at = Column(String, nullable=True)
+    event_count = Column(Integer, nullable=False, default=0)
+
+    submitted_at = Column(String, nullable=True)
+    updated_at = Column(String, nullable=False)
+
+
 class RawExamEvent(Base):
     __tablename__ = "raw_exam_events"
 

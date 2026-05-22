@@ -24,6 +24,7 @@ from engine.cache.redis_client import get_current_risk
 from engine.db.database import SessionLocal
 from engine.db.models import (
     AttemptLog,
+    AttemptState,
     CaseStatus,
     InvestigationCase,
     RawExamEvent,
@@ -253,6 +254,26 @@ def _ensure_case_index_ready(db) -> None:
         _sync_cases_from_attempts(db)
 
 
+def _sync_attempt_state_from_case(db, case: InvestigationCase) -> None:
+    state = db.query(AttemptState).filter(AttemptState.attempt_id == case.attempt_id).first()
+    if state is None:
+        return
+
+    next_status = state.status or "ONGOING"
+    if case.status in COMPLETED_CASE_STATUSES:
+        next_status = "RESOLVED"
+    elif case.status in {CaseStatus.TRIAGED.value, CaseStatus.UNDER_INVESTIGATION.value, CaseStatus.ESCALATED.value}:
+        next_status = "UNDER_REVIEW"
+    elif next_status != "SUBMITTED":
+        next_status = "ONGOING"
+
+    state.review_status = case.status
+    state.status = next_status
+    if case.latest_event_at:
+        state.latest_event_at = case.latest_event_at
+    state.updated_at = _utcnow().isoformat()
+
+
 def _serialize_action(db, action: ReviewerAction) -> ReviewerActionOut:
     reviewer = db.query(User).filter(User.id == action.reviewer_id).first()
     return ReviewerActionOut(
@@ -376,6 +397,19 @@ def _latest_attempt_logs_by_attempt(db) -> Dict[str, AttemptLog]:
     return result
 
 
+def _latest_attempt_states_by_attempt(db) -> Dict[str, AttemptState]:
+    rows = (
+        db.query(AttemptState)
+        .order_by(AttemptState.updated_at.desc(), AttemptState.id.desc())
+        .all()
+    )
+    result: Dict[str, AttemptState] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in result:
+            result[row.attempt_id] = row
+    return result
+
+
 def _latest_history_by_attempt(db) -> Dict[str, RiskHistory]:
     rows = (
         db.query(RiskHistory)
@@ -440,6 +474,7 @@ def _build_review_queue_payload(
     latest_events = _latest_events_by_attempt(db)
     latest_logs = _latest_attempt_logs_by_attempt(db)
     latest_history = _latest_history_by_attempt(db)
+    latest_states = _latest_attempt_states_by_attempt(db)
 
     rows = []
     cutoff = _recent_cutoff(recent_hours)
@@ -450,24 +485,27 @@ def _build_review_queue_payload(
         queue_status = _queue_status(case)
         latest_event = latest_events.get(case.attempt_id)
         latest_log = latest_logs.get(case.attempt_id)
+        latest_state = latest_states.get(case.attempt_id)
         assigned_to = getattr(assigned_user, "full_name", None) or getattr(assigned_user, "email", None) or "Unassigned"
-        last_activity = case.latest_event_at or getattr(latest_event, "received_at", None) or getattr(latest_event, "occurred_at", None)
+        last_activity = getattr(latest_state, "updated_at", None) or getattr(latest_state, "latest_event_at", None) or case.latest_event_at or getattr(latest_event, "received_at", None) or getattr(latest_event, "occurred_at", None)
         canonical_assessment = build_final_risk_assessment(
             attempt_id=case.attempt_id,
+            persisted_state=latest_state,
             latest_event=latest_event,
             latest_attempt_log=latest_log,
             latest_history=latest_history.get(case.attempt_id),
             current_risk=None,
             fallback_result={
-                "candidate_id": case.candidate_id,
-                "candidate_name": case.candidate_name,
-                "candidate_email": case.candidate_email,
-                "assessment_id": case.assessment_id,
-                "assessment_name": case.assessment_name,
-                "risk": case.current_risk,
-                "confidence": case.current_confidence,
-                "combined_score": case.current_combined_score,
-                "generated_at": case.latest_event_at,
+                "candidate_id": getattr(latest_state, "candidate_id", None) or case.candidate_id,
+                "candidate_name": getattr(latest_state, "candidate_name", None) or case.candidate_name,
+                "candidate_email": getattr(latest_state, "candidate_email", None) or case.candidate_email,
+                "assessment_id": getattr(latest_state, "assessment_id", None) or case.assessment_id,
+                "assessment_name": getattr(latest_state, "assessment_name", None) or case.assessment_name,
+                "risk": getattr(latest_state, "final_risk_level", None) or case.current_risk,
+                "confidence": getattr(latest_state, "confidence", None) or case.current_confidence,
+                "combined_score": getattr(latest_state, "final_risk_score", None) or case.current_combined_score,
+                "generated_at": getattr(latest_state, "updated_at", None) or case.latest_event_at,
+                "strongest_reason": getattr(latest_state, "strongest_reason", None),
             },
         )
         risk_score = safe_float(canonical_assessment.get("combined_score"), 0.0)
@@ -486,7 +524,7 @@ def _build_review_queue_payload(
                 "case_status": queue_status,
                 "assigned_to": assigned_to,
                 "last_activity": last_activity,
-                "event_count": event_counts.get(case.attempt_id, 0),
+                "event_count": max(event_counts.get(case.attempt_id, 0), int(getattr(latest_state, "event_count", 0) or 0)),
                 "strongest_signal": _strongest_signal_for_case(
                     latest_log=latest_log,
                     latest_event=latest_event,
@@ -689,6 +727,7 @@ def assign_case(case_id: int, payload: CaseAssignRequest, current_user: User = D
             new_status=case.status,
             comment=comment,
         )
+        _sync_attempt_state_from_case(db, case)
         db.commit()
         db.refresh(case)
         return CaseDetailResponse(data=_serialize_case(db, case, include_actions=True))
@@ -737,6 +776,7 @@ def transition_case(case_id: int, payload: CaseTransitionRequest, current_user: 
             new_status=case.status,
             comment=(payload.comment or "").strip() or None,
         )
+        _sync_attempt_state_from_case(db, case)
         db.commit()
         db.refresh(case)
         return CaseDetailResponse(data=_serialize_case(db, case, include_actions=True))
@@ -769,6 +809,7 @@ def add_case_note(case_id: int, payload: CaseNoteRequest, current_user: User = D
             new_status=case.status,
             comment=comment,
         )
+        _sync_attempt_state_from_case(db, case)
         db.commit()
         db.refresh(case)
         return CaseDetailResponse(data=_serialize_case(db, case, include_actions=True))

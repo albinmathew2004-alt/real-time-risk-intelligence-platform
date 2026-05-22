@@ -14,7 +14,7 @@ from engine.core.scorer import run_scoring
 from sqlalchemy import text
 
 from engine.db.database import Base, engine, SessionLocal, current_database_mode, ensure_demo_schema
-from engine.db.models import AttemptLog, InvestigationCase, RawExamEvent, RiskHistory
+from engine.db.models import AttemptLog, AttemptState, InvestigationCase, RawExamEvent, RiskHistory
 
 from engine.cache.redis_client import (
     append_event,
@@ -51,6 +51,7 @@ APP_MODE = os.getenv("APP_MODE", "local-demo").strip() or "local-demo"
 ACTIONABLE_CASE_STATUSES = {"NEW", "TRIAGED", "UNDER_INVESTIGATION", "ESCALATED"}
 COMPLETED_CASE_STATUSES = {"CONFIRMED_RISK", "FALSE_POSITIVE", "CLEARED", "RESOLVED", "CLOSED", "COMPLETED"}
 PERSIST_DEMO_DATA = os.getenv("PERSIST_DEMO_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
+SUBMISSION_EVENT_TYPES = {"exam_submitted", "assessment_submitted", "submit", "completed"}
 
 
 def _is_local_mode() -> bool:
@@ -619,6 +620,165 @@ def _actionable_case_status(status: str) -> bool:
     return status in ACTIONABLE_CASE_STATUSES
 
 
+def _is_submission_event_type(event_type: Any) -> bool:
+    return str(event_type or "").strip().lower() in SUBMISSION_EVENT_TYPES
+
+
+def _derive_attempt_status(
+    *,
+    existing_status: Optional[str] = None,
+    review_status: Optional[str] = None,
+    latest_event_type: Optional[str] = None,
+    features: Optional[Dict[str, Any]] = None,
+) -> str:
+    normalized_existing = str(existing_status or "").strip().upper()
+    if normalized_existing == "RESOLVED":
+        return "RESOLVED"
+
+    normalized_review = str(review_status or "").strip().upper()
+    if normalized_review in COMPLETED_CASE_STATUSES:
+        return "RESOLVED"
+    if normalized_review in {"TRIAGED", "UNDER_INVESTIGATION", "ESCALATED"}:
+        return "UNDER_REVIEW"
+
+    if _is_submission_event_type(latest_event_type) or bool((features or {}).get("has_submit_event")):
+        return "SUBMITTED"
+    return "ONGOING"
+
+
+def _serialize_risk_history_points(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for point in points:
+        timestamp = point.get("timestamp")
+        if not timestamp:
+            continue
+        serialized.append(
+            {
+                "timestamp": str(timestamp),
+                "score": round(safe_float(point.get("score"), 0.0), 4),
+                "combined_score": round(safe_float(point.get("score"), 0.0), 4),
+                "risk_level": str(point.get("risk_level") or normalize_risk_level(point.get("score"))),
+                "risk": str(point.get("risk_level") or normalize_risk_level(point.get("score"))),
+                "confidence": round(safe_float(point.get("confidence"), 0.0), 4),
+                "trigger": str(point.get("trigger") or point.get("reason") or "Behavioral milestone detected"),
+                "reason": str(point.get("reason") or point.get("trigger") or "Behavioral milestone detected"),
+                "summary": str(point.get("summary") or point.get("trigger") or point.get("reason") or "Behavioral milestone detected"),
+            }
+        )
+    serialized.sort(
+        key=lambda item: parse_timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return serialized
+
+
+def _latest_attempt_state_by_attempt(db) -> Dict[str, AttemptState]:
+    rows = (
+        db.query(AttemptState)
+        .order_by(AttemptState.updated_at.desc(), AttemptState.id.desc())
+        .all()
+    )
+    by_attempt: Dict[str, AttemptState] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in by_attempt:
+            by_attempt[row.attempt_id] = row
+    return by_attempt
+
+
+def _upsert_attempt_log(
+    db,
+    *,
+    attempt_id: str,
+    risk_level: str,
+    confidence: float,
+    score: float,
+    features: Optional[Dict[str, Any]],
+    signals: Optional[Dict[str, Any]],
+    timestamp: str,
+) -> AttemptLog:
+    entry = AttemptLog(
+        attempt_id=attempt_id,
+        risk=risk_level,
+        confidence=confidence,
+        confidence_score=confidence,
+        combined_score=score,
+        features=features or {},
+        signals=signals or {},
+        timestamp=timestamp,
+    )
+    db.add(entry)
+    return entry
+
+
+def _upsert_attempt_state(
+    db,
+    *,
+    attempt_id: str,
+    candidate_id: Optional[str],
+    candidate_name: Optional[str],
+    candidate_email: Optional[str],
+    assessment_id: Optional[str],
+    assessment_name: Optional[str],
+    review_status: Optional[str],
+    latest_event_type: Optional[str],
+    latest_event_at: Optional[str],
+    event_count: int,
+    risk_level: str,
+    score: float,
+    confidence: float,
+    strongest_reason: str,
+    violation_overview: Dict[str, Any],
+    evidence_summary: List[Dict[str, Any]],
+    risk_history: List[Dict[str, Any]],
+    features: Optional[Dict[str, Any]],
+    signals: Optional[Dict[str, Any]],
+) -> AttemptState:
+    state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+    if state is None:
+        state = AttemptState(attempt_id=attempt_id, updated_at=utc_now())
+        db.add(state)
+
+    prior_submitted_at = getattr(state, "submitted_at", None)
+    next_submitted_at = prior_submitted_at
+    if _is_submission_event_type(latest_event_type):
+        next_submitted_at = latest_event_at or utc_now()
+
+    final_status = _derive_attempt_status(
+        existing_status=getattr(state, "status", None),
+        review_status=review_status,
+        latest_event_type=latest_event_type,
+        features=features,
+    )
+
+    state.candidate_id = candidate_id or state.candidate_id
+    state.candidate_name = candidate_name or state.candidate_name
+    state.candidate_email = candidate_email or state.candidate_email
+    state.assessment_id = assessment_id or state.assessment_id
+    state.assessment_name = assessment_name or state.assessment_name
+    state.status = final_status
+    state.review_status = review_status or state.review_status
+    state.final_risk_level = risk_level
+    state.final_risk_score = score
+    state.confidence = confidence
+    if strongest_reason or not state.strongest_reason:
+        state.strongest_reason = strongest_reason
+    if violation_overview or not state.violation_overview:
+        state.violation_overview = violation_overview or {}
+    if evidence_summary or not state.evidence_summary:
+        state.evidence_summary = evidence_summary or []
+    if risk_history or not state.risk_history:
+        state.risk_history = risk_history or []
+    if features or not state.features:
+        state.features = features or {}
+    if signals or not state.signals:
+        state.signals = signals or {}
+    state.latest_event_type = latest_event_type or state.latest_event_type
+    state.latest_event_at = latest_event_at or state.latest_event_at
+    state.event_count = max(int(event_count or 0), int(state.event_count or 0))
+    state.submitted_at = next_submitted_at
+    state.updated_at = utc_now()
+    return state
+
+
 def _latest_event_metadata(db) -> Dict[str, RawExamEvent]:
     rows = (
         db.query(RawExamEvent)
@@ -673,12 +833,14 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, syn
     latest_event_by_attempt = _latest_event_metadata(db)
     latest_history_by_attempt = _latest_risk_history_by_attempt(db)
     latest_logs_by_attempt = _latest_attempt_log_by_attempt(db)
+    latest_states_by_attempt = _latest_attempt_state_by_attempt(db)
     event_counts = _event_counts_by_attempt(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     cutoff = _recent_cutoff(recent_hours)
     case_by_attempt = {case.attempt_id: case for case in cases if case.attempt_id}
     attempt_ids = sorted(
         {
+            *(attempt_id for attempt_id in latest_states_by_attempt.keys() if attempt_id),
             *(attempt_id for attempt_id in case_by_attempt.keys() if attempt_id),
             *(attempt_id for attempt_id in latest_event_by_attempt.keys() if attempt_id),
             *(attempt_id for attempt_id in latest_history_by_attempt.keys() if attempt_id),
@@ -688,6 +850,7 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, syn
 
     attempt_rows: List[Dict[str, Any]] = []
     for attempt_id in attempt_ids:
+        attempt_state = latest_states_by_attempt.get(attempt_id)
         latest_event = latest_event_by_attempt.get(attempt_id)
         latest_history = latest_history_by_attempt.get(attempt_id)
         latest_log = latest_logs_by_attempt.get(attempt_id)
@@ -695,28 +858,39 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, syn
         queue_status = _queue_status(case_record)
         assessment = build_final_risk_assessment(
             attempt_id=attempt_id,
+            persisted_state=attempt_state,
             latest_history=latest_history,
             latest_attempt_log=latest_log,
             latest_event=latest_event,
             current_risk=None,
             fallback_result={
-                "candidate_id": getattr(case_record, "candidate_id", None),
-                "candidate_name": getattr(case_record, "candidate_name", None),
-                "candidate_email": getattr(case_record, "candidate_email", None),
-                "assessment_id": getattr(case_record, "assessment_id", None),
-                "assessment_name": getattr(case_record, "assessment_name", None),
-                "risk": getattr(case_record, "current_risk", None),
-                "confidence": getattr(case_record, "current_confidence", None),
-                "combined_score": getattr(case_record, "current_combined_score", None),
-                "generated_at": getattr(case_record, "latest_event_at", None),
-            } if case_record is not None else None,
+                "candidate_id": getattr(attempt_state, "candidate_id", None) or getattr(case_record, "candidate_id", None),
+                "candidate_name": getattr(attempt_state, "candidate_name", None) or getattr(case_record, "candidate_name", None),
+                "candidate_email": getattr(attempt_state, "candidate_email", None) or getattr(case_record, "candidate_email", None),
+                "assessment_id": getattr(attempt_state, "assessment_id", None) or getattr(case_record, "assessment_id", None),
+                "assessment_name": getattr(attempt_state, "assessment_name", None) or getattr(case_record, "assessment_name", None),
+                "risk": getattr(attempt_state, "final_risk_level", None) or getattr(case_record, "current_risk", None),
+                "confidence": getattr(attempt_state, "confidence", None) or getattr(case_record, "current_confidence", None),
+                "combined_score": getattr(attempt_state, "final_risk_score", None) or getattr(case_record, "current_combined_score", None),
+                "generated_at": getattr(attempt_state, "updated_at", None) or getattr(case_record, "latest_event_at", None),
+                "strongest_reason": getattr(attempt_state, "strongest_reason", None),
+            } if attempt_state is not None or case_record is not None else None,
         )
         last_activity = (
+            getattr(attempt_state, "updated_at", None)
+            or getattr(attempt_state, "latest_event_at", None)
+            or
             assessment.get("generated_at")
             or getattr(case_record, "latest_event_at", None)
             or getattr(latest_event, "received_at", None)
             or getattr(latest_event, "occurred_at", None)
             or getattr(latest_log, "timestamp", None)
+        )
+        attempt_status = _derive_attempt_status(
+            existing_status=getattr(attempt_state, "status", None),
+            review_status=queue_status,
+            latest_event_type=getattr(attempt_state, "latest_event_type", None) or getattr(latest_event, "event_type", None),
+            features=(getattr(attempt_state, "features", None) or getattr(latest_log, "features", None) or {}),
         )
         attempt_rows.append(
             {
@@ -734,20 +908,31 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, syn
                 "explanation": assessment.get("strongest_reason") or "",
                 "explanation_text": assessment.get("strongest_reason") or "",
                 "status": queue_status,
+                "attempt_status": attempt_status,
                 "timestamp": last_activity,
-                "features": getattr(latest_log, "features", None) or {},
-                "signals": getattr(latest_log, "signals", None) or {},
-                "event_count": event_counts.get(attempt_id, 0),
-                "latest_event_type": getattr(latest_event, "event_type", None),
+                "features": getattr(attempt_state, "features", None) or getattr(latest_log, "features", None) or {},
+                "signals": getattr(attempt_state, "signals", None) or getattr(latest_log, "signals", None) or {},
+                "event_count": max(event_counts.get(attempt_id, 0), int(getattr(attempt_state, "event_count", 0) or 0)),
+                "latest_event_type": getattr(attempt_state, "latest_event_type", None) or getattr(latest_event, "event_type", None),
+                "submitted_at": getattr(attempt_state, "submitted_at", None),
                 "latest_event": (
                     {
-                        "event_type": latest_event.event_type,
-                        "occurred_at": latest_event.occurred_at,
-                        "timestamp": latest_event.received_at,
+                        "event_type": getattr(attempt_state, "latest_event_type", None) or latest_event.event_type,
+                        "occurred_at": getattr(attempt_state, "latest_event_at", None) or latest_event.occurred_at,
+                        "timestamp": getattr(attempt_state, "updated_at", None) or latest_event.received_at,
                         "payload": latest_event.payload or {},
                     }
                     if latest_event is not None
-                    else None
+                    else (
+                        {
+                            "event_type": getattr(attempt_state, "latest_event_type", None),
+                            "occurred_at": getattr(attempt_state, "latest_event_at", None),
+                            "timestamp": getattr(attempt_state, "updated_at", None),
+                            "payload": {},
+                        }
+                        if attempt_state is not None
+                        else None
+                    )
                 ),
             }
         )
@@ -792,8 +977,7 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
         1
         for row in attempt_rows
         if (
-            not bool((row.get("features") or {}).get("has_submit_event"))
-            and row.get("latest_event_type") != "exam_submitted"
+            row.get("attempt_status") == "ONGOING"
             and _actionable_case_status(str(row.get("status") or "NEW"))
         )
     )
@@ -981,6 +1165,7 @@ def get_review_queue(
 
 
 def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
+    persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
     events = (
         db.query(RawExamEvent)
         .filter(RawExamEvent.attempt_id == attempt_id)
@@ -1001,7 +1186,7 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
     )
     current_risk = get_current_risk(attempt_id) or {}
 
-    if not events and not history and not latest_attempt_log and not current_risk:
+    if not events and not history and not latest_attempt_log and not current_risk and not persisted_state:
         return {}
 
     scoring_events = db_events_to_scoring_events(events)
@@ -1024,6 +1209,7 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
     latest_event = events[-1] if events else None
     assessment = build_final_risk_assessment(
         attempt_id=attempt_id,
+        persisted_state=persisted_state,
         latest_history=latest_history,
         latest_attempt_log=latest_attempt_log,
         latest_event=latest_event,
@@ -1042,12 +1228,14 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         }
         for event in events
     ]
-    evidence_items = normalize_evidence(
+    computed_evidence_items = normalize_evidence(
         events=event_payloads,
         features=features,
         risk_score=risk_score,
         risk_level=risk_level,
     )
+    persisted_evidence_items = list(getattr(persisted_state, "evidence_summary", None) or [])
+    evidence_items = persisted_evidence_items if persisted_evidence_items else computed_evidence_items
     metadata_source = fallback_result or current_risk or {}
     session_narrative = (
         metadata_source.get("session_intelligence", {}) or {}
@@ -1058,30 +1246,41 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         evidence_items=evidence_items,
         session_narrative=session_narrative,
     )
-    overview_counts = build_violation_overview_counts(events=event_payloads, features=features)
+    computed_overview_counts = build_violation_overview_counts(events=event_payloads, features=features)
+    persisted_overview_counts = dict(getattr(persisted_state, "violation_overview", None) or {})
+    overview_counts = persisted_overview_counts if persisted_overview_counts else computed_overview_counts
 
     first_event = events[0] if events else None
+    attempt_status = _derive_attempt_status(
+        existing_status=getattr(persisted_state, "status", None),
+        review_status=getattr(persisted_state, "review_status", None),
+        latest_event_type=getattr(persisted_state, "latest_event_type", None) or getattr(latest_event, "event_type", None),
+        features=(getattr(persisted_state, "features", None) or features),
+    )
 
     return {
         **summary,
         "attempt_id": attempt_id,
-        "event_count": len(events),
+        "event_count": max(len(events), int(getattr(persisted_state, "event_count", 0) or 0)),
         "evidence_items": evidence_items,
         "investigation_insights": summary.get("investigation_insights", []),
         "violation_overview_counts": overview_counts,
         "candidate_name": assessment.get("candidate_name") or "Unknown Candidate",
         "candidate_email": assessment.get("candidate_email") or "No email available",
         "assessment_name": assessment.get("assessment_name") or "Python Coding Assessment",
-        "latest_event_at": assessment.get("generated_at") or getattr(latest_event, "occurred_at", None),
+        "latest_event_at": getattr(persisted_state, "latest_event_at", None) or assessment.get("generated_at") or getattr(latest_event, "occurred_at", None),
         "started_at": getattr(first_event, "occurred_at", None),
         "raw_explanation": assessment.get("strongest_reason") or getattr(latest_history, "reason", None),
         "strongest_reason": assessment.get("strongest_reason") or summary.get("strongest_reason"),
+        "attempt_status": attempt_status,
+        "submitted_at": getattr(persisted_state, "submitted_at", None),
+        "updated_at": getattr(persisted_state, "updated_at", None) or assessment.get("generated_at"),
         "final_risk_assessment": {
             "combined_score": round(risk_score, 4),
             "risk_level": risk_level,
             "confidence": round(confidence, 4),
             "strongest_reason": assessment.get("strongest_reason") or summary.get("strongest_reason"),
-            "generated_at": assessment.get("generated_at"),
+            "generated_at": getattr(persisted_state, "updated_at", None) or assessment.get("generated_at"),
         },
     }
 
@@ -1150,6 +1349,15 @@ async def score(batch: EventBatch):
         timeline_points = list(result.get("timeline_points") or [])
         latest_timeline_point = _last_timeline_point(result)
         snapshot_timestamp = latest_timeline_point.get("timestamp") or utc_now()
+        features = result.get("features") or {}
+        signals = result.get("signals") or {}
+        evidence_items = normalize_evidence(
+            events=batch.events,
+            features=features,
+            risk_score=score_value,
+            risk_level=risk_level,
+        )
+        violation_overview = build_violation_overview_counts(events=batch.events, features=features)
 
         _persist_timeline_snapshots(
             db,
@@ -1179,7 +1387,39 @@ async def score(batch: EventBatch):
             timestamp=snapshot_timestamp,
             force=_risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
         )
-        _ensure_case_for_attempt(db, batch.attempt_id)
+        _upsert_attempt_log(
+            db,
+            attempt_id=batch.attempt_id,
+            risk_level=risk_level,
+            confidence=confidence_value,
+            score=score_value,
+            features=features,
+            signals=signals,
+            timestamp=snapshot_timestamp,
+        )
+        case_record = _ensure_case_for_attempt(db, batch.attempt_id)
+        _upsert_attempt_state(
+            db,
+            attempt_id=batch.attempt_id,
+            candidate_id=None,
+            candidate_name=None,
+            candidate_email=None,
+            assessment_id=None,
+            assessment_name=None,
+            review_status=getattr(case_record, "status", None),
+            latest_event_type=None,
+            latest_event_at=snapshot_timestamp,
+            event_count=len(batch.events),
+            risk_level=risk_level,
+            score=score_value,
+            confidence=confidence_value,
+            strongest_reason=reason,
+            violation_overview=violation_overview,
+            evidence_summary=evidence_items,
+            risk_history=_serialize_risk_history_points(timeline_points),
+            features=features,
+            signals=signals,
+        )
         db.commit()
 
         await manager.broadcast({
@@ -1265,6 +1505,15 @@ async def ingest_event(event: ExamEventIngest):
         timeline_points = list(result.get("timeline_points") or [])
         latest_timeline_point = _last_timeline_point(result)
         snapshot_timestamp = latest_timeline_point.get("timestamp") or event.occurred_at or received_at
+        features = result.get("features") or {}
+        signals = result.get("signals") or {}
+        evidence_items = normalize_evidence(
+            events=scoring_events,
+            features=features,
+            risk_score=score_value,
+            risk_level=risk_level,
+        )
+        violation_overview = build_violation_overview_counts(events=scoring_events, features=features)
 
         current_risk_state = {
             "attempt_id": event.attempt_id,
@@ -1277,9 +1526,12 @@ async def ingest_event(event: ExamEventIngest):
             "confidence": confidence_value,
             "combined_score": score_value,
             "explanation": result.get("explanation"),
+            "strongest_reason": reason,
             "event_count": len(scoring_events),
             "updated_at": received_at,
             "session_intelligence": result.get("session_intelligence") or {},
+            "features": features,
+            "signals": signals,
         }
 
         set_current_risk(event.attempt_id, current_risk_state)
@@ -1312,7 +1564,42 @@ async def ingest_event(event: ExamEventIngest):
             timestamp=snapshot_timestamp,
             force=_risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
         )
-        _ensure_case_for_attempt(db, event.attempt_id)
+        _upsert_attempt_log(
+            db,
+            attempt_id=event.attempt_id,
+            risk_level=risk_level,
+            confidence=confidence_value,
+            score=score_value,
+            features=features,
+            signals=signals,
+            timestamp=snapshot_timestamp,
+        )
+        case_record = _ensure_case_for_attempt(db, event.attempt_id)
+        attempt_state = _upsert_attempt_state(
+            db,
+            attempt_id=event.attempt_id,
+            candidate_id=event.candidate_id,
+            candidate_name=event.candidate_name,
+            candidate_email=event.candidate_email,
+            assessment_id=event.assessment_id,
+            assessment_name=event.assessment_name,
+            review_status=getattr(case_record, "status", None),
+            latest_event_type=event.event_type,
+            latest_event_at=event.occurred_at or received_at,
+            event_count=len(scoring_events),
+            risk_level=risk_level,
+            score=score_value,
+            confidence=confidence_value,
+            strongest_reason=reason,
+            violation_overview=violation_overview,
+            evidence_summary=evidence_items,
+            risk_history=_serialize_risk_history_points(timeline_points),
+            features=features,
+            signals=signals,
+        )
+        current_risk_state["attempt_status"] = getattr(attempt_state, "status", None)
+        current_risk_state["submitted_at"] = getattr(attempt_state, "submitted_at", None)
+        set_current_risk(event.attempt_id, current_risk_state)
         db.commit()
 
         broadcast_payload = {
@@ -1334,6 +1621,8 @@ async def ingest_event(event: ExamEventIngest):
             "combined_score": score_value,
             "explanation": result.get("explanation"),
             "event_count": len(scoring_events),
+            "attempt_status": getattr(attempt_state, "status", None),
+            "submitted_at": getattr(attempt_state, "submitted_at", None),
             "timeline_point": {
                 "risk": risk_level,
                 "combined_score": score_value,
@@ -1382,11 +1671,36 @@ def get_live_risk(attempt_id: str, _user=Depends(require_reviewer)):
     data = get_current_risk(attempt_id)
 
     if not data:
-        return {
-            "status": "not_found",
-            "attempt_id": attempt_id,
-            "data": None,
-        }
+        db = SessionLocal()
+        try:
+            persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+            if persisted_state is not None:
+                data = {
+                    "attempt_id": attempt_id,
+                    "candidate_id": persisted_state.candidate_id,
+                    "candidate_name": persisted_state.candidate_name,
+                    "candidate_email": persisted_state.candidate_email,
+                    "assessment_id": persisted_state.assessment_id,
+                    "assessment_name": persisted_state.assessment_name,
+                    "risk": persisted_state.final_risk_level,
+                    "confidence": safe_float(persisted_state.confidence, 0.0),
+                    "combined_score": safe_float(persisted_state.final_risk_score, 0.0),
+                    "explanation": persisted_state.strongest_reason,
+                    "event_count": int(persisted_state.event_count or 0),
+                    "updated_at": persisted_state.updated_at,
+                    "attempt_status": persisted_state.status,
+                    "submitted_at": persisted_state.submitted_at,
+                    "features": persisted_state.features or {},
+                    "signals": persisted_state.signals or {},
+                }
+            else:
+                return {
+                    "status": "not_found",
+                    "attempt_id": attempt_id,
+                    "data": None,
+                }
+        finally:
+            db.close()
 
     return {
         "status": "success",
@@ -1448,6 +1762,7 @@ def get_risk_history(attempt_id: str, _user=Depends(require_reviewer)):
     db = SessionLocal()
 
     try:
+        persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
         history = (
             db.query(RiskHistory)
             .filter(RiskHistory.attempt_id == attempt_id)
@@ -1476,6 +1791,8 @@ def get_risk_history(attempt_id: str, _user=Depends(require_reviewer)):
             }
             for h in history
         ]
+        if not data and persisted_state is not None:
+            data = list(getattr(persisted_state, "risk_history", None) or [])
 
         return {
             "status": "success",
