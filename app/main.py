@@ -66,6 +66,14 @@ def _attempt_data_exists(db) -> bool:
     return bool(db.query(AttemptLog.id).limit(1).first() or db.query(RawExamEvent.id).limit(1).first())
 
 
+def _startup_counts(db) -> Dict[str, int]:
+    return {
+        "attempts": int(db.query(AttemptLog.attempt_id).distinct().count()),
+        "events": int(db.query(RawExamEvent.id).count()),
+        "cases": int(db.query(InvestigationCase.id).count()),
+    }
+
+
 def _maybe_seed_hosted_demo_dataset() -> None:
     if not _is_controlled_demo_mode() or not PERSIST_DEMO_DATA:
         return
@@ -172,6 +180,7 @@ def startup_event():
         Base.metadata.create_all(bind=engine)
         ensure_demo_schema()
         print("[OK] Database tables created/verified")
+        print(f"[OK] Database backend: {current_database_mode()}")
         if should_verify_demo_admin_on_startup(APP_MODE):
             db = SessionLocal()
             try:
@@ -180,6 +189,12 @@ def startup_event():
             finally:
                 db.close()
         _maybe_seed_hosted_demo_dataset()
+        db = SessionLocal()
+        try:
+            counts = _startup_counts(db)
+            print(f"[OK] Startup records: attempts={counts['attempts']} cases={counts['cases']} events={counts['events']}")
+        finally:
+            db.close()
     except Exception as e:
         print("[WARN] Database initialization failed:", e)
 
@@ -640,11 +655,21 @@ def _latest_attempt_log_by_attempt(db) -> Dict[str, AttemptLog]:
     return by_attempt
 
 
-def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[str, Any]:
+def _event_counts_by_attempt(db) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for (attempt_id,) in db.query(RawExamEvent.attempt_id).all():
+        if not attempt_id:
+            continue
+        counts[attempt_id] = counts.get(attempt_id, 0) + 1
+    return counts
+
+
+def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None) -> List[Dict[str, Any]]:
     _sync_cases_from_attempts(db)
     latest_event_by_attempt = _latest_event_metadata(db)
     latest_history_by_attempt = _latest_risk_history_by_attempt(db)
     latest_logs_by_attempt = _latest_attempt_log_by_attempt(db)
+    event_counts = _event_counts_by_attempt(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     cutoff = _recent_cutoff(recent_hours)
     case_by_attempt = {case.attempt_id: case for case in cases if case.attempt_id}
@@ -692,17 +717,34 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
         attempt_rows.append(
             {
                 "attempt_id": attempt_id,
-                "candidate_name": assessment.get("candidate_name"),
-                "candidate_email": assessment.get("candidate_email"),
-                "assessment_name": assessment.get("assessment_name"),
-                "combined_score": assessment.get("combined_score"),
-                "confidence": assessment.get("confidence"),
-                "risk_level": assessment.get("risk_level"),
-                "strongest_reason": assessment.get("strongest_reason"),
+                "candidate_id": assessment.get("candidate_id"),
+                "candidate_name": assessment.get("candidate_name") or getattr(latest_event, "candidate_name", None),
+                "candidate_email": assessment.get("candidate_email") or getattr(latest_event, "candidate_email", None),
+                "assessment_id": assessment.get("assessment_id"),
+                "assessment_name": assessment.get("assessment_name") or getattr(latest_event, "assessment_name", None),
+                "combined_score": round(safe_float(assessment.get("combined_score"), 0.0), 4),
+                "confidence": round(safe_float(assessment.get("confidence"), 0.0), 4),
+                "risk": assessment.get("risk_level") or "LOW",
+                "risk_level": assessment.get("risk_level") or "LOW",
+                "strongest_reason": assessment.get("strongest_reason") or "",
+                "explanation": assessment.get("strongest_reason") or "",
+                "explanation_text": assessment.get("strongest_reason") or "",
                 "status": queue_status,
                 "timestamp": last_activity,
                 "features": getattr(latest_log, "features", None) or {},
+                "signals": getattr(latest_log, "signals", None) or {},
+                "event_count": event_counts.get(attempt_id, 0),
                 "latest_event_type": getattr(latest_event, "event_type", None),
+                "latest_event": (
+                    {
+                        "event_type": latest_event.event_type,
+                        "occurred_at": latest_event.occurred_at,
+                        "timestamp": latest_event.received_at,
+                        "payload": latest_event.payload or {},
+                    }
+                    if latest_event is not None
+                    else None
+                ),
             }
         )
 
@@ -713,13 +755,28 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
         ]
         if recent_rows:
             attempt_rows = recent_rows
-            recent_attempt_ids = {row.get("attempt_id") for row in attempt_rows if row.get("attempt_id")}
-            cases = [
-                case for case in cases
-                if case.attempt_id in recent_attempt_ids
-                or _is_recent_timestamp(getattr(case, "latest_event_at", None), cutoff)
-                or _is_recent_timestamp(getattr(case, "updated_at", None), cutoff)
-            ]
+
+    attempt_rows.sort(
+        key=lambda row: parse_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return attempt_rows
+
+
+def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[str, Any]:
+    _sync_cases_from_attempts(db)
+    latest_event_by_attempt = _latest_event_metadata(db)
+    cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
+    cutoff = _recent_cutoff(recent_hours)
+    attempt_rows = _build_persisted_attempt_rows(db, recent_hours=recent_hours)
+    if cutoff is not None and attempt_rows:
+        recent_attempt_ids = {row.get("attempt_id") for row in attempt_rows if row.get("attempt_id")}
+        cases = [
+            case for case in cases
+            if case.attempt_id in recent_attempt_ids
+            or _is_recent_timestamp(getattr(case, "latest_event_at", None), cutoff)
+            or _is_recent_timestamp(getattr(case, "updated_at", None), cutoff)
+        ]
 
     attempt_rows.sort(
         key=lambda row: parse_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
@@ -1052,6 +1109,12 @@ def health_deep():
     database = _database_health()
     redis = redis_health()
     overall = "ok" if database.get("reachable") and redis.get("reachable") else "degraded"
+    counts = {"attempts": 0, "cases": 0, "events": 0}
+    db = SessionLocal()
+    try:
+        counts = _startup_counts(db)
+    finally:
+        db.close()
 
     return {
         "status": overall,
@@ -1066,6 +1129,7 @@ def health_deep():
             "database": database,
             "redis": redis,
         },
+        "counts": counts,
         "timestamp": utc_now(),
     }
 
@@ -1468,33 +1532,20 @@ async def websocket_risk(websocket: WebSocket):
 
 @app.get("/v1/logs")
 def get_logs(_user=Depends(require_reviewer)):
-    LOG_FILE = "logs/attempt_logs.jsonl"
-
-    if not os.path.exists(LOG_FILE):
-        return {
-            "status": "no_logs",
-            "data": []
-        }
-
-    data = []
-
+    db = SessionLocal()
     try:
-        with open(LOG_FILE, "r") as f:
-            for line in f:
-                try:
-                    data.append(json.loads(line))
-                except Exception:
-                    continue
-
+        data = _build_persisted_attempt_rows(db, recent_hours=None)
+        return {
+            "status": "success",
+            "count": len(data),
+            "data": data,
+        }
     except Exception as e:
+        traceback.print_exc()
         return {
             "status": "error",
             "message": str(e),
-            "data": []
+            "data": [],
         }
-
-    return {
-        "status": "success",
-        "count": len(data),
-        "data": data
-    }
+    finally:
+        db.close()
