@@ -31,7 +31,7 @@ from app.auth.routes import router as auth_router
 from app.auth.demo_admin import ensure_demo_admin, should_verify_demo_admin_on_startup
 from app.auth.dependencies import require_reviewer
 from app.cases.routes import router as cases_router
-from app.cases.routes import _build_review_queue_payload, _sync_cases_from_attempts
+from app.cases.routes import _build_review_queue_payload, _ensure_case_for_attempt, _sync_cases_from_attempts
 from app.models.user import User  # noqa: F401 (ensures users table is registered on startup)
 from app.services.evidence_service import (
     build_violation_overview_counts,
@@ -181,6 +181,7 @@ def startup_event():
         ensure_demo_schema()
         print("[OK] Database tables created/verified")
         print(f"[OK] Database backend: {current_database_mode()}")
+        print("[OK] Connection pool initialized")
         if should_verify_demo_admin_on_startup(APP_MODE):
             db = SessionLocal()
             try:
@@ -191,6 +192,8 @@ def startup_event():
         _maybe_seed_hosted_demo_dataset()
         db = SessionLocal()
         try:
+            if _attempt_data_exists(db) and not db.query(InvestigationCase.id).limit(1).first():
+                _sync_cases_from_attempts(db)
             counts = _startup_counts(db)
             print(f"[OK] Startup records: attempts={counts['attempts']} cases={counts['cases']} events={counts['events']}")
         finally:
@@ -664,8 +667,9 @@ def _event_counts_by_attempt(db) -> Dict[str, int]:
     return counts
 
 
-def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None) -> List[Dict[str, Any]]:
-    _sync_cases_from_attempts(db)
+def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, sync_cases: bool = False) -> List[Dict[str, Any]]:
+    if sync_cases:
+        _sync_cases_from_attempts(db)
     latest_event_by_attempt = _latest_event_metadata(db)
     latest_history_by_attempt = _latest_risk_history_by_attempt(db)
     latest_logs_by_attempt = _latest_attempt_log_by_attempt(db)
@@ -764,11 +768,10 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None) -> 
 
 
 def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[str, Any]:
-    _sync_cases_from_attempts(db)
     latest_event_by_attempt = _latest_event_metadata(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     cutoff = _recent_cutoff(recent_hours)
-    attempt_rows = _build_persisted_attempt_rows(db, recent_hours=recent_hours)
+    attempt_rows = _build_persisted_attempt_rows(db, recent_hours=recent_hours, sync_cases=False)
     if cutoff is not None and attempt_rows:
         recent_attempt_ids = {row.get("attempt_id") for row in attempt_rows if row.get("attempt_id")}
         cases = [
@@ -777,6 +780,7 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
             or _is_recent_timestamp(getattr(case, "latest_event_at", None), cutoff)
             or _is_recent_timestamp(getattr(case, "updated_at", None), cutoff)
         ]
+    case_by_attempt = {case.attempt_id: case for case in cases if case.attempt_id}
 
     attempt_rows.sort(
         key=lambda row: parse_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
@@ -1175,6 +1179,7 @@ async def score(batch: EventBatch):
             timestamp=snapshot_timestamp,
             force=_risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
         )
+        _ensure_case_for_attempt(db, batch.attempt_id)
         db.commit()
 
         await manager.broadcast({
@@ -1307,6 +1312,7 @@ async def ingest_event(event: ExamEventIngest):
             timestamp=snapshot_timestamp,
             force=_risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
         )
+        _ensure_case_for_attempt(db, event.attempt_id)
         db.commit()
 
         broadcast_payload = {

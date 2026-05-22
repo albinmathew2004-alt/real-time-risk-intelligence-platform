@@ -89,6 +89,7 @@ const COMPLETED_CASE_STATUSES = ["CONFIRMED_RISK", "RESOLVED", "FALSE_POSITIVE",
 
 const TOKEN_KEY = "riskintel_access_token";
 const CLIENT_TIME_SKEW_GRACE_MS = 2 * 60 * 1000;
+let reviewerRefreshTimerId = null;
 
 function formatNumber(value, digits = 2) {
   return Number(value || 0).toFixed(digits);
@@ -1856,6 +1857,8 @@ export default function App() {
   }, [isPublicDemoRoute, themeMode]);
 
   const logout = useCallback(() => {
+    window.clearTimeout(reviewerRefreshTimerId);
+    reviewerRefreshTimerId = null;
     setStoredToken(null);
     setToken(null);
     setCurrentUser(null);
@@ -1951,6 +1954,16 @@ export default function App() {
     }
   }, [logout, token]);
 
+  const scheduleReviewerRefresh = useCallback((delayMs = 1200) => {
+    if (!token || reviewerRefreshTimerId !== null) return;
+    reviewerRefreshTimerId = window.setTimeout(() => {
+      reviewerRefreshTimerId = null;
+      void fetchCases();
+      void fetchDashboardSummary();
+      void fetchReviewQueue();
+    }, delayMs);
+  }, [fetchCases, fetchDashboardSummary, fetchReviewQueue, token]);
+
   const performCaseAction = useCallback(async ({ caseId, endpoint, body }) => {
     if (!caseId) {
       return { ok: false, error: "Missing case id" };
@@ -2043,9 +2056,7 @@ export default function App() {
     if (!token) return;
     const timeoutId = window.setTimeout(() => {
       if (token) void fetchLogs();
-      if (token) void fetchCases();
-      if (token) void fetchDashboardSummary();
-      if (token) void fetchReviewQueue();
+      scheduleReviewerRefresh(0);
     }, 0);
     if (!liveUpdatesEnabled) {
       setWsConnected(false);
@@ -2128,9 +2139,7 @@ export default function App() {
           });
 
           setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
-          void fetchCases();
-          void fetchDashboardSummary();
-          void fetchReviewQueue();
+          scheduleReviewerRefresh();
         } catch (err) {
           console.error("WS parse error:", err);
         }
@@ -2143,12 +2152,14 @@ export default function App() {
       disposed = true;
       window.clearTimeout(timeoutId);
       window.clearTimeout(reconnectTimerId);
+      window.clearTimeout(reviewerRefreshTimerId);
+      reviewerRefreshTimerId = null;
       setWsState("paused");
       if (ws && ws.readyState < WebSocket.CLOSING) {
         ws.close();
       }
     };
-  }, [fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, liveUpdatesEnabled, token]);
+  }, [fetchLogs, liveUpdatesEnabled, scheduleReviewerRefresh, token]);
 
   useEffect(() => {
     if (!token) return;

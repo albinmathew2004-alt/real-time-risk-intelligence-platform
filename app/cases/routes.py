@@ -239,6 +239,20 @@ def _sync_cases_from_attempts(db) -> None:
     db.commit()
 
 
+def _ensure_case_index_ready(db) -> None:
+    has_case = db.query(InvestigationCase.id).limit(1).first()
+    if has_case:
+        return
+
+    has_attempt_data = (
+        db.query(RawExamEvent.id).limit(1).first()
+        or db.query(RiskHistory.id).limit(1).first()
+        or db.query(AttemptLog.id).limit(1).first()
+    )
+    if has_attempt_data:
+        _sync_cases_from_attempts(db)
+
+
 def _serialize_action(db, action: ReviewerAction) -> ReviewerActionOut:
     reviewer = db.query(User).filter(User.id == action.reviewer_id).first()
     return ReviewerActionOut(
@@ -419,7 +433,7 @@ def _build_review_queue_payload(
     search: Optional[str],
     recent_hours: Optional[int] = None,
 ) -> Dict[str, object]:
-    _sync_cases_from_attempts(db)
+    _ensure_case_index_ready(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     users = {user.id: user for user in db.query(User).all()}
     event_counts = _event_counts_by_attempt(db)
@@ -608,7 +622,7 @@ def _record_action(
 def list_cases(_user: User = Depends(require_reviewer)):
     db = SessionLocal()
     try:
-        _sync_cases_from_attempts(db)
+        _ensure_case_index_ready(db)
         cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
         data = [_serialize_case(db, case) for case in cases]
         return CaseListResponse(count=len(data), data=data)
