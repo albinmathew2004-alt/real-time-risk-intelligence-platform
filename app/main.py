@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import os
+import subprocess
+import sys
 import traceback
 
 from engine.core.scorer import run_scoring
@@ -48,11 +50,57 @@ APP_VERSION = "2.2.0"
 APP_MODE = os.getenv("APP_MODE", "local-demo").strip() or "local-demo"
 ACTIONABLE_CASE_STATUSES = {"NEW", "TRIAGED", "UNDER_INVESTIGATION", "ESCALATED"}
 COMPLETED_CASE_STATUSES = {"CONFIRMED_RISK", "FALSE_POSITIVE", "CLEARED", "RESOLVED", "CLOSED", "COMPLETED"}
+PERSIST_DEMO_DATA = os.getenv("PERSIST_DEMO_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_local_mode() -> bool:
     mode = APP_MODE.strip().lower()
     return mode in {"local", "local-demo", "local-postgres-redis", "dev", "development", "docker-compose"}
+
+
+def _is_controlled_demo_mode() -> bool:
+    return APP_MODE.strip().lower() == "controlled-demo"
+
+
+def _attempt_data_exists(db) -> bool:
+    return bool(db.query(AttemptLog.id).limit(1).first() or db.query(RawExamEvent.id).limit(1).first())
+
+
+def _maybe_seed_hosted_demo_dataset() -> None:
+    if not _is_controlled_demo_mode() or not PERSIST_DEMO_DATA:
+        return
+
+    db = SessionLocal()
+    try:
+        if _attempt_data_exists(db):
+            print("[SKIP] Hosted demo dataset already exists")
+            print("[OK] Hosted demo dataset verified")
+            return
+    finally:
+        db.close()
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "seed_demo_dataset.py"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script_path), "--count", "100", "--seed", "42"],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:
+        print(f"[WARN] Hosted demo dataset seeding failed: {exc}")
+        return
+
+    if result.returncode == 0:
+        print("[OK] Hosted demo dataset seeded")
+        print("[OK] Hosted demo dataset verified")
+        return
+
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    details = stderr or stdout or f"exit code {result.returncode}"
+    print(f"[WARN] Hosted demo dataset seeding failed: {details}")
 
 
 def _docs_enabled() -> bool:
@@ -131,6 +179,7 @@ def startup_event():
                 print("[OK] Demo admin verified")
             finally:
                 db.close()
+        _maybe_seed_hosted_demo_dataset()
     except Exception as e:
         print("[WARN] Database initialization failed:", e)
 

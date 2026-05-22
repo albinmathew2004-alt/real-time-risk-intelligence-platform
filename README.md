@@ -743,6 +743,29 @@ VITE_API_BASE_URL=https://your-backend.example.com
 
 You can host the built `frontend/dist` on any static host that supports HTTPS.
 
+#### Render SPA routing
+
+If you deploy the frontend as a Render Static Site, configure a rewrite so client-side routes are served by `index.html`.
+
+This repo now ships `frontend/public/_redirects` with:
+
+```text
+/* /index.html 200
+```
+
+For an existing manually configured Render Static Site, also verify the rewrite rule in the Render dashboard:
+
+- Source: `/*`
+- Destination: `/index.html`
+- Action: `Rewrite`
+
+That ensures direct navigation and refresh both work for SPA paths such as:
+
+- `/`
+- `/demo`
+- `/review`
+- `/cases/123`
+
 ### Candidate SDK / assessment link
 
 The SDK and example assessment already support:
