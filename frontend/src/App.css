@@ -314,6 +314,12 @@ body::-webkit-scrollbar-thumb:hover,
   max-width: 1320px;
   margin: 0 auto 18px;
   padding: 0 6px;
+  position: sticky;
+  top: 14px;
+  z-index: 12;
+  border-radius: 18px;
+  backdrop-filter: blur(16px);
+  background: linear-gradient(180deg, rgba(5, 11, 22, 0.82), rgba(5, 11, 22, 0.58));
 }
 
 .public-candidate-report-brand {
@@ -331,15 +337,442 @@ body::-webkit-scrollbar-thumb:hover,
 .public-candidate-report-page {
   max-width: 1320px;
   margin: 0 auto;
+  gap: 22px;
+}
+
+.public-candidate-report-page .investigation-card,
+.public-candidate-report-page .report-main-row,
+.public-candidate-report-page .candidate-report-side-stack {
+  break-inside: avoid;
 }
 
 .candidate-report-main-grid {
   grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.82fr);
+  margin-top: 0;
 }
 
 .candidate-report-side-stack {
   display: grid;
   gap: 18px;
+}
+
+.candidate-report-executive-card,
+.candidate-report-scoreband-card {
+  margin-top: 0;
+}
+
+.candidate-report-executive-copy {
+  padding: 0 18px 18px;
+}
+
+.candidate-report-executive-copy > p {
+  margin: 0 0 16px;
+  color: #e6eefb;
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+.candidate-report-summary-list {
+  display: grid;
+  gap: 12px;
+}
+
+.candidate-report-summary-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.candidate-report-summary-item p {
+  margin: 0;
+  color: #d8e4f5;
+  line-height: 1.58;
+}
+
+.candidate-report-scoreband {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  padding: 0 18px 18px;
+}
+
+.candidate-report-scoreband-item {
+  padding: 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.candidate-report-scoreband-item span {
+  display: block;
+  color: #aab7cb;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.candidate-report-scoreband-item strong {
+  display: block;
+  margin-top: 9px;
+  color: #f8fbff;
+  font-size: 20px;
+  line-height: 1.28;
+}
+
+.candidate-report-scoreband-item.tone-high {
+  border-color: rgba(255, 77, 109, 0.22);
+  background: linear-gradient(180deg, rgba(47, 18, 25, 0.72), rgba(28, 14, 20, 0.62));
+}
+
+.candidate-report-scoreband-item.tone-medium {
+  border-color: rgba(255, 183, 3, 0.22);
+  background: linear-gradient(180deg, rgba(47, 31, 8, 0.7), rgba(28, 20, 8, 0.62));
+}
+
+.candidate-report-scoreband-item.tone-low {
+  border-color: rgba(79, 140, 255, 0.22);
+  background: linear-gradient(180deg, rgba(16, 38, 74, 0.72), rgba(11, 27, 55, 0.62));
+}
+
+.candidate-report-export-root {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 794px;
+  box-sizing: border-box;
+  padding: 0;
+  background: #ffffff;
+  color: #0f172a;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 1;
+  visibility: visible;
+  overflow: visible;
+}
+
+.pdf-export-mode .pdf-report-shell {
+  width: 794px;
+  box-sizing: border-box;
+  padding: 28px 26px 24px;
+  background: #ffffff;
+  color: #0f172a;
+  font-family: "Segoe UI", Arial, sans-serif;
+}
+
+.pdf-export-mode .pdf-report-header,
+.pdf-export-mode .pdf-report-section,
+.pdf-export-mode .pdf-report-panel {
+  border: 1px solid #dbe3f1;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.pdf-export-mode .pdf-report-header {
+  padding: 24px 24px 20px;
+}
+
+.pdf-export-mode .pdf-report-brand-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.pdf-export-mode .pdf-report-kicker {
+  display: inline-block;
+  color: #4f46e5;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.pdf-export-mode .pdf-report-brand-copy h1 {
+  margin: 8px 0 8px;
+  font-size: 30px;
+  line-height: 1.15;
+  color: #0f172a;
+}
+
+.pdf-export-mode .pdf-report-brand-copy p,
+.pdf-export-mode .pdf-report-lead,
+.pdf-export-mode .pdf-report-bullet p,
+.pdf-export-mode .pdf-report-preview-grid p,
+.pdf-export-mode .pdf-report-note {
+  margin: 0;
+  color: #475569;
+  line-height: 1.62;
+}
+
+.pdf-export-mode .pdf-report-badges {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pdf-export-mode .pdf-report-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pdf-export-mode .pdf-report-badge.status {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.pdf-export-mode .pdf-report-badge.risk.high {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.pdf-export-mode .pdf-report-badge.risk.medium {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.pdf-export-mode .pdf-report-badge.risk.low {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.pdf-export-mode .pdf-report-meta-grid,
+.pdf-export-mode .pdf-report-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 18px;
+}
+
+.pdf-export-mode .pdf-report-meta-grid {
+  margin-top: 18px;
+}
+
+.pdf-export-mode .pdf-report-meta-item span,
+.pdf-export-mode .pdf-report-detail-grid span,
+.pdf-export-mode .pdf-report-overview-card span,
+.pdf-export-mode .pdf-report-score-card span,
+.pdf-export-mode .pdf-report-preview-grid span {
+  display: block;
+  margin-bottom: 6px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pdf-export-mode .pdf-report-meta-item strong,
+.pdf-export-mode .pdf-report-detail-grid strong {
+  display: block;
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.pdf-export-mode .pdf-report-section,
+.pdf-export-mode .pdf-report-panel {
+  padding: 18px 20px;
+  margin-top: 16px;
+  break-inside: avoid;
+}
+
+.pdf-export-mode .pdf-report-section-head {
+  margin-bottom: 14px;
+}
+
+.pdf-export-mode .pdf-report-section-head h2 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 19px;
+}
+
+.pdf-export-mode .pdf-report-score-grid,
+.pdf-export-mode .pdf-report-overview-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.pdf-export-mode .pdf-report-score-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pdf-export-mode .pdf-report-overview-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.pdf-export-mode .pdf-report-score-card,
+.pdf-export-mode .pdf-report-overview-card {
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+.pdf-export-mode .pdf-report-score-card strong,
+.pdf-export-mode .pdf-report-overview-card strong {
+  display: block;
+  color: #0f172a;
+  font-size: 20px;
+  line-height: 1.28;
+}
+
+.pdf-export-mode .pdf-report-overview-card small {
+  display: block;
+  margin-top: 6px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.pdf-export-mode .pdf-report-score-card.tone-high,
+.pdf-export-mode .pdf-report-overview-card.high {
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.pdf-export-mode .pdf-report-score-card.tone-medium,
+.pdf-export-mode .pdf-report-overview-card.medium {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.pdf-export-mode .pdf-report-score-card.tone-low,
+.pdf-export-mode .pdf-report-overview-card.low {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.pdf-export-mode .pdf-report-score-card.tone-neutral {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.pdf-export-mode .pdf-report-bullet-list {
+  display: grid;
+  gap: 10px;
+}
+
+.pdf-export-mode .pdf-report-bullet {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.pdf-export-mode .pdf-report-bullet-dot {
+  width: 9px;
+  height: 9px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: #60a5fa;
+}
+
+.pdf-export-mode .pdf-report-bullet-dot.high { background: #ef4444; }
+.pdf-export-mode .pdf-report-bullet-dot.medium { background: #f59e0b; }
+.pdf-export-mode .pdf-report-bullet-dot.low { background: #3b82f6; }
+
+.pdf-export-mode .pdf-report-match-card {
+  padding-top: 14px;
+  margin-top: 14px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.pdf-export-mode .pdf-report-match-card:first-of-type {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.pdf-export-mode .pdf-report-match-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.pdf-export-mode .pdf-report-match-head strong {
+  display: block;
+  color: #0f172a;
+  font-size: 15px;
+}
+
+.pdf-export-mode .pdf-report-match-head small {
+  display: block;
+  margin-top: 5px;
+  color: #64748b;
+}
+
+.pdf-export-mode .pdf-report-preview-grid,
+.pdf-export-mode .pdf-report-grid-two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 16px;
+}
+
+.pdf-export-mode .pdf-report-preview-grid {
+  margin-top: 14px;
+}
+
+.pdf-export-mode .pdf-report-preview-grid article {
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+.pdf-export-mode .pdf-report-detail-grid {
+  margin-top: 14px;
+}
+
+.pdf-export-mode .pdf-report-detail-grid .span-2 {
+  grid-column: span 2;
+}
+
+.pdf-export-mode .pdf-report-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.pdf-export-mode .pdf-report-table th,
+.pdf-export-mode .pdf-report-table td {
+  padding: 10px 8px;
+  border-top: 1px solid #e2e8f0;
+  text-align: left;
+  vertical-align: top;
+  font-size: 13px;
+  color: #334155;
+}
+
+.pdf-export-mode .pdf-report-table th {
+  border-top: 0;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pdf-export-mode .pdf-report-note {
+  margin-top: 14px;
+  font-size: 12px;
+}
+
+@media (max-width: 980px) {
+  .candidate-report-scoreband {
+    grid-template-columns: 1fr;
+  }
 }
 
 .public-demo-card {
@@ -564,21 +997,21 @@ body::-webkit-scrollbar-thumb:hover,
 
 .public-demo-signal-toasts {
   position: fixed;
+  top: 24px;
   right: 24px;
-  bottom: 24px;
   z-index: 90;
   display: grid;
   gap: 10px;
-  width: min(340px, calc(100vw - 32px));
+  width: min(370px, calc(100vw - 32px));
   pointer-events: none;
 }
 
 .public-demo-signal-toast {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 12px;
   align-items: center;
-  padding: 13px 15px;
+  padding: 14px 16px;
   border-radius: 16px;
   border: 1px solid rgba(125, 162, 255, 0.22);
   background:
@@ -586,8 +1019,29 @@ body::-webkit-scrollbar-thumb:hover,
     radial-gradient(circle at top left, rgba(96, 165, 250, 0.16), transparent 40%);
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(255, 255, 255, 0.035) inset;
   color: #eef5ff;
-  animation: demoSignalToastIn 0.22s ease-out both;
+  animation: demoSignalToastIn 0.28s ease-out both;
   backdrop-filter: blur(16px);
+}
+
+/* ── Severity Variant: HIGH (red/danger) ──────────────────────────── */
+.public-demo-signal-toast.high {
+  border-color: rgba(255, 77, 109, 0.28);
+  background:
+    linear-gradient(135deg, rgba(30, 12, 16, 0.96), rgba(20, 8, 14, 0.94)),
+    radial-gradient(circle at top left, rgba(255, 77, 109, 0.14), transparent 40%);
+}
+
+/* ── Severity Variant: MEDIUM (amber/warning) ─────────────────────── */
+.public-demo-signal-toast.medium {
+  border-color: rgba(255, 183, 3, 0.28);
+  background:
+    linear-gradient(135deg, rgba(30, 22, 8, 0.96), rgba(20, 15, 6, 0.94)),
+    radial-gradient(circle at top left, rgba(255, 183, 3, 0.14), transparent 40%);
+}
+
+/* ── Severity Variant: LOW (blue/info – default) ──────────────────── */
+.public-demo-signal-toast.low {
+  /* Default blue styling already applied by base rule */
 }
 
 .public-demo-signal-toast strong {
@@ -611,12 +1065,59 @@ body::-webkit-scrollbar-thumb:hover,
   border-radius: 999px;
   background: #60a5fa;
   box-shadow: 0 0 0 5px rgba(96, 165, 250, 0.14), 0 0 18px rgba(96, 165, 250, 0.5);
+  flex-shrink: 0;
+}
+
+/* ── Severity-colored dots (matching violation-overview-icon tokens) ── */
+.public-demo-signal-dot.high {
+  background: #ff7d93;
+  box-shadow: 0 0 0 5px rgba(255, 77, 109, 0.14), 0 0 18px rgba(255, 77, 109, 0.5);
+}
+
+.public-demo-signal-dot.medium {
+  background: #ffbf45;
+  box-shadow: 0 0 0 5px rgba(255, 183, 3, 0.14), 0 0 18px rgba(255, 183, 3, 0.5);
+}
+
+.public-demo-signal-dot.low {
+  background: #60a5fa;
+  box-shadow: 0 0 0 5px rgba(96, 165, 250, 0.14), 0 0 18px rgba(96, 165, 250, 0.5);
+}
+
+/* ── Severity Badge (matches violation-overview-card em styling) ──── */
+.demo-toast-severity {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border-radius: 8px;
+  align-self: center;
+  flex-shrink: 0;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.demo-toast-severity.high {
+  color: #ff8ba1;
+  background: rgba(255, 77, 109, 0.14);
+}
+
+.demo-toast-severity.medium {
+  color: #ffc94f;
+  background: rgba(255, 183, 3, 0.14);
+}
+
+.demo-toast-severity.low {
+  color: #7ab2ff;
+  background: rgba(79, 140, 255, 0.14);
 }
 
 @keyframes demoSignalToastIn {
   from {
     opacity: 0;
-    transform: translate3d(10px, 8px, 0) scale(0.98);
+    transform: translate3d(10px, -8px, 0) scale(0.97);
   }
   to {
     opacity: 1;

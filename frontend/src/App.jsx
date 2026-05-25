@@ -68,9 +68,82 @@ const DEMO_SIGNAL_TOASTS_ENABLED = String(
   ?? import.meta.env.DEMO_SIGNAL_TOASTS_ENABLED
   ?? "true",
 ).toLowerCase() !== "false";
-const DEMO_SIGNAL_TOAST_DISMISS_MS = 4200;
+const DEMO_SIGNAL_TOAST_DISMISS_MS = 4800;
 const DEMO_SIGNAL_TOAST_COOLDOWN_MS = 4500;
 const DEMO_SIGNAL_TOAST_LIMIT = 2;
+
+/* ── Shared Demo Signal Map ─────────────────────────────────────────────
+   Maps telemetry signal keys → toast label, severity, and report-style
+   category.  The same categories appear in the Evidence Table and
+   Violation Overview so observers see narrative continuity.            */
+const DEMO_SIGNAL_MAP = {
+  visibility_hidden:   { key: "visibility_hidden",   group: "focus_shift",        label: "Focus changed away from assessment",         severity: "medium", category: "Focus Blur" },
+  visibility_visible:  { key: "visibility_visible",  group: "focus_recovery",     label: "Focus returned after interruption",           severity: "low",    category: "Focus Blur" },
+  focus_loss:          { key: "focus_loss",           group: "focus_shift",        label: "Focus changed away from assessment",         severity: "medium", category: "Focus Blur" },
+  focus_return:        { key: "focus_return",         group: "focus_recovery",     label: "Focus returned after interruption",           severity: "low",    category: "Focus Blur" },
+  clipboard_paste:     { key: "clipboard_paste",      group: "clipboard_activity", label: "Clipboard paste recorded",                   severity: "high",   category: "Clipboard" },
+  clipboard_copy:      { key: "clipboard_copy",       group: "clipboard_activity", label: "Clipboard copy recorded",                    severity: "low",    category: "Clipboard" },
+  large_answer_insert: { key: "large_answer_insert",  group: "answer_shift",       label: "Large answer block inserted",                severity: "high",   category: "Rapid Answer" },
+  rapid_answer_change: { key: "rapid_answer_change",  group: "answer_shift",       label: "Rapid answer rewrite detected",              severity: "medium", category: "Rapid Answer" },
+  idle_period:         { key: "idle_period",          group: "idle_transition",    label: "Long inactivity followed by answer activity", severity: "medium", category: "Idle" },
+  idle_recovery:       { key: "idle_recovery",        group: "idle_transition",    label: "Activity resumed after idle period",          severity: "low",    category: "Idle" },
+};
+
+/* ── Sequence Pattern Definitions ───────────────────────────────────────
+   Each pattern lists an ordered subset of signal keys that must ALL
+   appear within the recent-signal sliding window to trigger a sequence
+   toast.  `replacesKeys` lists individual toast keys that should be
+   dismissed if the sequence toast fires.                               */
+const DEMO_SEQUENCE_PATTERNS = [
+  {
+    id: "focus_paste_rapid",
+    keys: ["visibility_hidden", "clipboard_paste", "rapid_answer_change"],
+    label: "Sequence detected: tab switch \u2192 paste \u2192 rapid overwrite",
+    severity: "high",
+    category: "Correlated Pattern",
+    replacesKeys: ["visibility_hidden", "clipboard_paste", "rapid_answer_change"],
+  },
+  {
+    id: "focus_paste",
+    keys: ["visibility_hidden", "clipboard_paste"],
+    label: "Sequence detected: focus loss \u2192 clipboard paste",
+    severity: "high",
+    category: "Correlated Pattern",
+    replacesKeys: ["visibility_hidden", "clipboard_paste"],
+  },
+  {
+    id: "return_insert",
+    keys: ["visibility_visible", "large_answer_insert"],
+    label: "Sequence detected: focus return \u2192 large answer insertion",
+    severity: "high",
+    category: "Correlated Pattern",
+    replacesKeys: ["visibility_visible", "large_answer_insert"],
+  },
+  {
+    id: "idle_paste",
+    keys: ["idle_period", "clipboard_paste"],
+    label: "Sequence detected: idle period \u2192 paste \u2192 minimal editing",
+    severity: "high",
+    category: "Correlated Pattern",
+    replacesKeys: ["idle_period", "clipboard_paste"],
+  },
+  {
+    id: "idle_insert",
+    keys: ["idle_recovery", "large_answer_insert"],
+    label: "Sequence detected: idle period \u2192 large answer insertion",
+    severity: "high",
+    category: "Correlated Pattern",
+    replacesKeys: ["idle_recovery", "large_answer_insert"],
+  },
+  {
+    id: "focus_loss_paste",
+    keys: ["focus_loss", "clipboard_paste"],
+    label: "Sequence detected: focus loss \u2192 clipboard paste",
+    severity: "high",
+    category: "Correlated Pattern",
+    replacesKeys: ["focus_loss", "clipboard_paste"],
+  },
+];
 
 function toWsUrl(baseUrl, path) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
@@ -2297,32 +2370,40 @@ function getDemoSignalToast(event) {
   const pasteSize = String(payload.paste_size || payload.size || "").toLowerCase();
   const idleDuration = Number(payload.duration_seconds || 0);
 
-  if (eventType === "visibility_change" && state === "hidden") {
-    return { key: "visibility_hidden", group: "focus_shift", label: "Focus change observed" };
-  }
-  if (eventType === "visibility_change" && state === "visible") {
-    return { key: "visibility_visible", group: "focus_recovery", label: "Focus returned to assessment" };
-  }
-  if (eventType === "blur") {
-    return { key: "focus_loss", group: "focus_shift", label: "Focus change observed" };
-  }
-  if (eventType === "focus") {
-    return { key: "focus_return", group: "focus_recovery", label: "Focus returned to assessment" };
-  }
-  if (eventType === "clipboard" && action === "paste") {
-    return { key: "clipboard_paste", group: "clipboard_activity", label: "Clipboard activity recorded" };
-  }
-  if (eventType === "clipboard" && action === "copy") {
-    return { key: "clipboard_copy", group: "clipboard_activity", label: "Clipboard activity recorded" };
-  }
-  if (eventType === "answer_change" && changeType === "paste" && (answerLength >= 180 || pasteSize === "large")) {
-    return { key: "large_answer_insert", group: "answer_shift", label: "Large answer insertion noted" };
-  }
-  if (eventType === "idle_state" && state === "idle" && idleDuration >= 20) {
-    return { key: "idle_period", group: "idle_transition", label: "Long inactivity period observed" };
-  }
-  if (eventType === "idle_state" && state === "active") {
-    return { key: "idle_recovery", group: "idle_transition", label: "Assessment integrity signal logged" };
+  if (eventType === "visibility_change" && state === "hidden") return DEMO_SIGNAL_MAP.visibility_hidden;
+  if (eventType === "visibility_change" && state === "visible") return DEMO_SIGNAL_MAP.visibility_visible;
+  if (eventType === "blur") return DEMO_SIGNAL_MAP.focus_loss;
+  if (eventType === "focus") return DEMO_SIGNAL_MAP.focus_return;
+  if (eventType === "clipboard" && action === "paste") return DEMO_SIGNAL_MAP.clipboard_paste;
+  if (eventType === "clipboard" && action === "copy") return DEMO_SIGNAL_MAP.clipboard_copy;
+  if (eventType === "answer_change" && changeType === "paste" && (answerLength >= 180 || pasteSize === "large")) return DEMO_SIGNAL_MAP.large_answer_insert;
+  if (eventType === "idle_state" && state === "idle" && idleDuration >= 20) return DEMO_SIGNAL_MAP.idle_period;
+  if (eventType === "idle_state" && state === "active") return DEMO_SIGNAL_MAP.idle_recovery;
+  return null;
+}
+
+/* ── Sequence Detection ─────────────────────────────────────────────────
+   Checks the recent-signal sliding window for correlated patterns.
+   Returns the first matching sequence pattern, or null.                */
+function detectDemoSequence(recentSignals) {
+  const now = Date.now();
+  const windowMs = 8000;
+  const active = recentSignals.filter((s) => now - s.at < windowMs);
+  const activeKeys = active.map((s) => s.key);
+
+  for (const pattern of DEMO_SEQUENCE_PATTERNS) {
+    const allPresent = pattern.keys.every((k) => activeKeys.includes(k));
+    if (allPresent) {
+      return {
+        key: `seq_${pattern.id}`,
+        group: `sequence_${pattern.id}`,
+        label: pattern.label,
+        severity: pattern.severity,
+        category: pattern.category,
+        isSequence: true,
+        replacesKeys: pattern.replacesKeys,
+      };
+    }
   }
   return null;
 }
@@ -2335,6 +2416,7 @@ function PublicDemoPage({ apiBaseUrl }) {
     dismissTimers: {},
     lastAnswerChangeByQuestion: {},
     recentTelemetrySignatures: {},
+    recentSignals: [],
   });
   const [consented, setConsented] = useState(false);
   const [candidateName, setCandidateName] = useState(() => initialCompletion?.candidateName || "");
@@ -2414,7 +2496,13 @@ function PublicDemoPage({ apiBaseUrl }) {
 
     const toastId = `${toast.key}-${now}`;
     setSignalToasts((prev) => {
-      const next = [...prev, { ...toast, id: toastId, createdAt: now }];
+      let next = [...prev];
+      // If this is a sequence toast, replace weaker constituent toasts
+      if (toast.isSequence && toast.replacesKeys?.length) {
+        const replaceSet = new Set(toast.replacesKeys);
+        next = next.filter((t) => !replaceSet.has(t.key));
+      }
+      next.push({ ...toast, id: toastId, createdAt: now });
       return next.slice(-DEMO_SIGNAL_TOAST_LIMIT);
     });
     toastTracker.current.dismissTimers[toastId] = window.setTimeout(() => {
@@ -2503,6 +2591,25 @@ function PublicDemoPage({ apiBaseUrl }) {
       if (toast) {
         toastTracker.current.recentTelemetrySignatures[signature] = now;
       }
+
+      // Feed the sliding window for sequence detection
+      if (toast) {
+        toastTracker.current.recentSignals.push({ key: toast.key, at: now });
+        // Prune entries older than 8 seconds
+        toastTracker.current.recentSignals = toastTracker.current.recentSignals.filter(
+          (s) => now - s.at < 8000,
+        );
+
+        // Check for correlated sequences before showing the individual toast
+        const sequence = detectDemoSequence(toastTracker.current.recentSignals);
+        if (sequence) {
+          // Clear the window so the same sequence doesn't re-fire
+          toastTracker.current.recentSignals = [];
+          addDemoSignalToast(sequence);
+          return;
+        }
+      }
+
       if (toast) addDemoSignalToast(toast);
     }
 
@@ -2686,6 +2793,7 @@ function PublicDemoPage({ apiBaseUrl }) {
     toastTracker.current.lastShownAt = {};
     toastTracker.current.lastAnswerChangeByQuestion = {};
     toastTracker.current.recentTelemetrySignatures = {};
+    toastTracker.current.recentSignals = [];
     setTelemetryError("");
     tracker.visited.clear();
     tracker.lastSectionId = "";
@@ -2737,9 +2845,9 @@ function PublicDemoPage({ apiBaseUrl }) {
     };
 
     if (lengthDelta >= 140) {
-      addDemoSignalToast({ key: "large_answer_insert", label: "Large answer insertion noted" });
+      addDemoSignalToast(DEMO_SIGNAL_MAP.large_answer_insert);
     } else if (rapidBursts >= 4) {
-      addDemoSignalToast({ key: "rapid_answer_change", label: "Rapid answer change detected" });
+      addDemoSignalToast(DEMO_SIGNAL_MAP.rapid_answer_change);
     }
 
     setAnswers((prev) => ({ ...prev, [questionId]: value }));
@@ -2997,6 +3105,7 @@ function PublicDemoPage({ apiBaseUrl }) {
     toastTracker.current.lastShownAt = {};
     toastTracker.current.lastAnswerChangeByQuestion = {};
     toastTracker.current.recentTelemetrySignatures = {};
+    toastTracker.current.recentSignals = [];
     setStage("welcome");
     setTimeRemaining(selectedAssessment.durationMinutes * 60);
     tracker.visited.clear();
@@ -3746,12 +3855,15 @@ function PublicDemoPage({ apiBaseUrl }) {
         {DEMO_SIGNAL_TOASTS_ENABLED && signalToasts.length ? (
           <div className="public-demo-signal-toasts" aria-live="polite" aria-label="Assessment integrity signal notifications">
             {signalToasts.map((toast) => (
-              <div className="public-demo-signal-toast" key={toast.id}>
-                <span className="public-demo-signal-dot"></span>
+              <div className={`public-demo-signal-toast ${toast.severity || "low"}`} key={toast.id}>
+                <span className={`public-demo-signal-dot ${toast.severity || "low"}`}></span>
                 <div>
                   <strong>{toast.label}</strong>
-                  <small>Assessment integrity signal logged</small>
+                  <small>{toast.category || "Integrity Signal"}{toast.isSequence ? " \u00b7 Correlated Pattern" : ""}</small>
                 </div>
+                <em className={`demo-toast-severity ${toast.severity || "low"}`}>
+                  {(toast.severity || "low").toUpperCase()}
+                </em>
               </div>
             ))}
           </div>
@@ -6251,7 +6363,9 @@ function ProvenanceIntelligenceCard({
 function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
   const [reportState, setReportState] = useState({ loading: true, ready: false, data: null, error: "" });
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [pdfError, setPdfError] = useState("");
   const exportTargetRef = useRef(null);
+  const exportPdfRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -6408,28 +6522,82 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
     { label: "Submitted", value: formatDateTime(report?.submitted_at) },
     { label: "Status", value: status },
   ];
+  const executiveSummaryPoints = [
+    report?.summary_text,
+    report?.strongest_reason ? `Strongest reason: ${report.strongest_reason}` : "",
+    report?.behavioral_summary && report?.behavioral_summary !== report?.summary_text ? report.behavioral_summary : "",
+  ].filter(Boolean);
+  const scorebandItems = [
+    { label: "Risk Level", value: riskLevel, tone: riskLevel.toLowerCase() },
+    { label: "Risk Score", value: `${formatNumber(report?.risk_score, 2)} / 1.00`, tone: "neutral" },
+    { label: "Confidence", value: `${formatNumber(report?.confidence, 2)} • ${getConfidenceLabel(report?.confidence)}`, tone: "neutral" },
+  ];
   const handleDownloadPdf = useCallback(async () => {
-    if (!reportState.ready || !exportTargetRef.current || isGeneratingPdf) return;
+    if (!reportState.ready || !exportPdfRef.current || isGeneratingPdf) return;
 
     setIsGeneratingPdf(true);
+    setPdfError("");
     console.info("[Candidate Report]", {
-      event: "candidate_report_pdf_started",
+      event: "pdf_export_started",
       attemptId,
     });
 
     try {
-      const exportNode = exportTargetRef.current;
+      const exportNode = exportPdfRef.current;
+      console.info("[Candidate Report]", {
+        event: "pdf_export_target_found",
+        attemptId,
+        found: Boolean(exportNode),
+      });
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+      const targetRect = exportNode.getBoundingClientRect();
+      const targetWidth = Math.round(exportNode.scrollWidth || targetRect.width || 0);
+      const targetHeight = Math.round(exportNode.scrollHeight || targetRect.height || 0);
+      console.info("[Candidate Report]", {
+        event: "pdf_export_target_size",
+        attemptId,
+        width: targetWidth,
+        height: targetHeight,
+      });
+      if (!targetWidth || !targetHeight) {
+        const message = "PDF export could not render because the report surface is not ready yet. Please retry in a moment.";
+        setPdfError(message);
+        console.error("[Candidate Report]", {
+          event: "candidate_report_pdf_failed",
+          attemptId,
+          message,
+        });
+        return;
+      }
       const canvas = await html2canvas(exportNode, {
-        backgroundColor: "#07111f",
+        backgroundColor: "#ffffff",
         scale: Math.min(window.devicePixelRatio || 1, 2),
         useCORS: true,
         logging: false,
         scrollX: 0,
-        scrollY: -window.scrollY,
-        windowWidth: exportNode.scrollWidth,
-        windowHeight: exportNode.scrollHeight,
+        scrollY: 0,
+        windowWidth: targetWidth,
+        windowHeight: targetHeight,
         ignoreElements: (element) => element?.dataset?.pdfExclude === "true",
       });
+      console.info("[Candidate Report]", {
+        event: "pdf_export_canvas_created",
+        attemptId,
+        width: canvas.width,
+        height: canvas.height,
+      });
+      if (!canvas.width || !canvas.height) {
+        const message = "PDF export produced an empty canvas. Please retry the download.";
+        setPdfError(message);
+        console.error("[Candidate Report]", {
+          event: "candidate_report_pdf_failed",
+          attemptId,
+          message,
+        });
+        return;
+      }
 
       const pdf = new jsPDF({
         orientation: "p",
@@ -6483,15 +6651,17 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
 
       pdf.save(`ProctorIQ_Candidate_Report_${attemptId}.pdf`);
       console.info("[Candidate Report]", {
-        event: "candidate_report_pdf_success",
+        event: "pdf_export_saved",
         attemptId,
         pages: pageIndex,
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown PDF error";
+      setPdfError("Unable to generate the PDF right now. Please retry.");
       console.error("[Candidate Report]", {
         event: "candidate_report_pdf_failed",
         attemptId,
-        message: error instanceof Error ? error.message : "Unknown PDF error",
+        message,
       });
     } finally {
       setIsGeneratingPdf(false);
@@ -6524,6 +6694,14 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           </div>
         ) : null}
       </div>
+      {pdfError ? (
+        <section className="investigation-card provenance-empty-state" data-pdf-exclude="true">
+          <div className="report-card-head accent">
+            <h3>PDF export unavailable</h3>
+          </div>
+          <p>{pdfError}</p>
+        </section>
+      ) : null}
 
       <section className="investigation-page investigation-report-shell public-candidate-report-page" ref={exportTargetRef}>
         {!reportState.ready ? (
@@ -6560,6 +6738,37 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
               metadataItems={candidateMetadata}
             />
 
+            <section className="investigation-card candidate-report-executive-card">
+              <div className="report-card-head accent">
+                <h3>Executive Integrity Summary</h3>
+              </div>
+              <div className="candidate-report-executive-copy">
+                <p>{report?.summary_text || report?.behavioral_summary || "Behavioral signals were analyzed after submission."}</p>
+                <div className="candidate-report-summary-list">
+                  {executiveSummaryPoints.map((item) => (
+                    <article className="candidate-report-summary-item" key={item}>
+                      <span className={`insight-dot ${String(riskLevel || "LOW").toLowerCase()}`}></span>
+                      <p>{item}</p>
+                    </article>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            <section className="investigation-card candidate-report-scoreband-card">
+              <div className="report-card-head">
+                <h3>Risk Score & Confidence</h3>
+              </div>
+              <div className="candidate-report-scoreband">
+                {scorebandItems.map((item) => (
+                  <article className={`candidate-report-scoreband-item tone-${item.tone}`} key={item.label}>
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </article>
+                ))}
+              </div>
+            </section>
+
             <ViolationOverview items={overviewItems} />
 
             <InvestigationInsightsCard insights={candidateInsights} riskLevel={riskLevel} />
@@ -6583,6 +6792,238 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           </>
         )}
       </section>
+
+      {reportState.ready ? (
+        <section className="candidate-report-export-root pdf-export-mode" ref={exportPdfRef} aria-hidden="true">
+          <div className="pdf-report-shell">
+            <header className="pdf-report-header">
+              <div className="pdf-report-brand-row">
+                <div className="pdf-report-brand-copy">
+                  <span className="pdf-report-kicker">ProctorIQ</span>
+                  <h1>Candidate Assessment Integrity Report</h1>
+                  <p>
+                    Candidate-safe summary of telemetry, integrity analysis, evidence grouping, and answer provenance findings.
+                  </p>
+                </div>
+                <div className="pdf-report-badges">
+                  <span className={`pdf-report-badge risk ${String(riskLevel || "LOW").toLowerCase()}`}>{riskLevel} Risk</span>
+                  <span className="pdf-report-badge status">{status}</span>
+                </div>
+              </div>
+              <div className="pdf-report-meta-grid">
+                {candidateMetadata.map((item) => (
+                  <div className="pdf-report-meta-item" key={item.label}>
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
+                <div className="pdf-report-meta-item">
+                  <span>Candidate</span>
+                  <strong>{report?.candidate_name || "Unknown Candidate"}</strong>
+                </div>
+                <div className="pdf-report-meta-item">
+                  <span>Candidate Email</span>
+                  <strong>{report?.candidate_email || "No email available"}</strong>
+                </div>
+              </div>
+            </header>
+
+            <section className="pdf-report-section">
+              <div className="pdf-report-section-head">
+                <h2>Executive Integrity Summary</h2>
+              </div>
+              <p className="pdf-report-lead">{report?.summary_text || report?.behavioral_summary || "Behavioral signals were analyzed after submission."}</p>
+              <div className="pdf-report-bullet-list">
+                {executiveSummaryPoints.map((item) => (
+                  <div className="pdf-report-bullet" key={item}>
+                    <span className={`pdf-report-bullet-dot ${String(riskLevel || "LOW").toLowerCase()}`}></span>
+                    <p>{item}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="pdf-report-section">
+              <div className="pdf-report-section-head">
+                <h2>Risk Score & Confidence</h2>
+              </div>
+              <div className="pdf-report-score-grid">
+                {scorebandItems.map((item) => (
+                  <article className={`pdf-report-score-card tone-${item.tone}`} key={item.label}>
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="pdf-report-section">
+              <div className="pdf-report-section-head">
+                <h2>Violation Overview</h2>
+              </div>
+              <div className="pdf-report-overview-grid">
+                {overviewItems.map((item) => (
+                  <article className={`pdf-report-overview-card ${String(item.severity || "low").toLowerCase()}`} key={item.title}>
+                    <span>{item.title}</span>
+                    <strong>{item.value}</strong>
+                    <small>{item.severityLabel || severityLabel(item.severity)}</small>
+                  </article>
+                ))}
+              </div>
+            </section>
+
+            <section className="pdf-report-section">
+              <div className="pdf-report-section-head">
+                <h2>Most Suspicious Behaviors</h2>
+              </div>
+              <div className="pdf-report-bullet-list">
+                {candidateInsights.map((item) => (
+                  <div className="pdf-report-bullet" key={item}>
+                    <span className={`pdf-report-bullet-dot ${String(riskLevel || "LOW").toLowerCase()}`}></span>
+                    <p>{item}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="pdf-report-section">
+              <div className="pdf-report-section-head">
+                <h2>Answer Provenance Intelligence</h2>
+              </div>
+              {provenance ? (
+                <div className="pdf-report-provenance">
+                  <div className="pdf-report-score-grid">
+                    <article className={`pdf-report-score-card tone-${String(provenance.external_similarity_likelihood || "LOW").toLowerCase()}`}>
+                      <span>Potential Reference Overlap</span>
+                      <strong>{provenance.external_similarity_likelihood || "LOW"}</strong>
+                    </article>
+                    <article className="pdf-report-score-card tone-neutral">
+                      <span>Confidence</span>
+                      <strong>{formatNumber(provenance.confidence_score, 2)}</strong>
+                    </article>
+                    <article className="pdf-report-score-card tone-neutral">
+                      <span>Possible Matches</span>
+                      <strong>{(provenance.possible_reference_matches || []).length}</strong>
+                    </article>
+                  </div>
+                  <p className="pdf-report-lead">{provenance.summary || "No meaningful reference overlap was detected in submitted answers."}</p>
+                  {(provenance.possible_reference_matches || []).map((match, index) => (
+                    <article className="pdf-report-match-card" key={`${match.source_title || "match"}-${index}`}>
+                      <div className="pdf-report-match-head">
+                        <div>
+                          <strong>{match.source_title || "Possible source match"}</strong>
+                          <small>
+                            {match.source_type || "Reference"}
+                            {match.source_domain ? ` • ${match.source_domain}` : ""}
+                            {match.question_title ? ` • ${match.question_title}` : ""}
+                          </small>
+                        </div>
+                        <span className={`pdf-report-badge risk ${String(match.likelihood || "LOW").toLowerCase()}`}>{match.similarity_percent}% similarity</span>
+                      </div>
+                      <div className="pdf-report-detail-grid">
+                        <div>
+                          <span>Possible source match</span>
+                          <strong>{match.match_reason || match.confidence_label || "Observed similarity pattern"}</strong>
+                        </div>
+                        {match.retrieval_source ? (
+                          <div>
+                            <span>Retrieval source</span>
+                            <strong>{match.retrieval_source}</strong>
+                          </div>
+                        ) : null}
+                        {match.retrieval_confidence != null ? (
+                          <div>
+                            <span>Retrieval confidence</span>
+                            <strong>{formatNumber(match.retrieval_confidence, 2)}</strong>
+                          </div>
+                        ) : null}
+                        {match.retrieval_timestamp ? (
+                          <div>
+                            <span>Retrieved</span>
+                            <strong>{formatDateTime(match.retrieval_timestamp)}</strong>
+                          </div>
+                        ) : null}
+                        {match.source_url ? (
+                          <div className="span-2">
+                            <span>Source URL</span>
+                            <strong>{match.source_url}</strong>
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="pdf-report-preview-grid">
+                        <article>
+                          <span>Candidate excerpt</span>
+                          <p>{match.candidate_excerpt || "No candidate excerpt available."}</p>
+                        </article>
+                        <article>
+                          <span>Reference excerpt</span>
+                          <p>{match.reference_excerpt || "No reference excerpt available."}</p>
+                        </article>
+                      </div>
+                    </article>
+                  ))}
+                  {provenance.limitations_note ? <p className="pdf-report-note">{provenance.limitations_note}</p> : null}
+                  {provenance.web_retrieval_disclaimer ? <p className="pdf-report-note">{provenance.web_retrieval_disclaimer}</p> : null}
+                </div>
+              ) : (
+                <p className="pdf-report-lead">Answer provenance analysis was not available for this attempt.</p>
+              )}
+            </section>
+
+            <section className="pdf-report-section">
+              <div className="pdf-report-section-head">
+                <h2>Evidence & Violations</h2>
+              </div>
+              <table className="pdf-report-table">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Severity</th>
+                    <th>Count</th>
+                    <th>Impact</th>
+                    <th>Details</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {candidateEvidenceRows.map((row, index) => (
+                    <tr key={`${row.title || row.signalType || "evidence"}-${index}`}>
+                      <td>{row.title || row.signalType || "Evidence item"}</td>
+                      <td>{row.severity || "LOW"}</td>
+                      <td>{row.countDisplay || row.count || "0"}</td>
+                      <td>{row.impactLabel || "Context required"}</td>
+                      <td>{row.subtitle || row.details || row.explanation || "No additional details available."}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+
+            <section className="pdf-report-section pdf-report-grid-two">
+              <article className="pdf-report-panel">
+                <div className="pdf-report-section-head">
+                  <h2>Technical Details</h2>
+                </div>
+                <div className="pdf-report-detail-grid">
+                  {candidateTechnicalDetails.map((item) => (
+                    <div key={item.label}>
+                      <span>{item.label}</span>
+                      <strong>{item.value}</strong>
+                    </div>
+                  ))}
+                </div>
+              </article>
+              <article className="pdf-report-panel">
+                <div className="pdf-report-section-head">
+                  <h2>Privacy-safe Explanation</h2>
+                </div>
+                <p className="pdf-report-lead">
+                  {report?.privacy_note || "This summary uses metadata-based integrity analysis only."}
+                </p>
+              </article>
+            </section>
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }
