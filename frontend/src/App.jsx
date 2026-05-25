@@ -287,7 +287,7 @@ function riskClass(risk) {
 
 function formatTime(value) {
   const date = getDisplayDate(value);
-  if (!date) return "â€”";
+  if (!date) return "Not available";
   return date.toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
@@ -295,9 +295,9 @@ function formatTime(value) {
 }
 
 function formatDateTime(value) {
-  if (!value) return "â€”";
+  if (!value) return "Not available";
   const date = getDisplayDate(value);
-  if (!date) return "â€”";
+  if (!date) return "Not available";
 
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -319,9 +319,9 @@ function formatDateTime(value) {
 }
 
 function formatDuration(seconds) {
-  if (seconds === null || seconds === undefined) return "â€”";
+  if (seconds === null || seconds === undefined) return "Not available";
   const total = Number(seconds);
-  if (!Number.isFinite(total) || total <= 0) return "â€”";
+  if (!Number.isFinite(total) || total <= 0) return "Not available";
 
   const rounded = Math.floor(total);
   const h = Math.floor(rounded / 3600);
@@ -6361,7 +6361,15 @@ function ProvenanceIntelligenceCard({
 }
 
 function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
-  const [reportState, setReportState] = useState({ loading: true, ready: false, data: null, error: "" });
+  const [reportState, setReportState] = useState({
+    loading: true,
+    ready: false,
+    data: null,
+    error: "",
+    provenanceReady: false,
+    provenanceFinalized: false,
+    attemptStatus: "",
+  });
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const [pdfError, setPdfError] = useState("");
   const exportTargetRef = useRef(null);
@@ -6374,6 +6382,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
     async function loadReport() {
       const startedAt = Date.now();
       let transientFailureCount = 0;
+      let stableReadySeen = false;
       while (!cancelled && Date.now() - startedAt < 18000) {
         const requestUrl = `${apiBaseUrl.replace(/\/$/, "")}/v1/demo/attempts/${encodeURIComponent(attemptId)}/report`;
         console.info("[Candidate Report]", {
@@ -6429,14 +6438,40 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           )
         );
         if (hasReadyReport) {
+          const nextAttemptStatus = String(payload?.attempt_status || payload?.data?.attempt_status || "").toUpperCase();
+          const nextProvenanceReady = Boolean(payload?.provenance_ready ?? payload?.data?.provenance_ready);
+          const nextProvenanceFinalized = Boolean(payload?.provenance_finalized ?? payload?.data?.provenance_finalized);
+          const nextState = {
+            loading: !nextProvenanceFinalized,
+            ready: true,
+            data: payload.data,
+            error: "",
+            provenanceReady: nextProvenanceReady,
+            provenanceFinalized: nextProvenanceFinalized,
+            attemptStatus: nextAttemptStatus,
+          };
           console.info("[Candidate Report]", {
             event: "candidate_report_fetch_success",
             attemptId,
             ready: payload?.ready,
             status: payload?.status,
+            attemptStatus: nextAttemptStatus,
+            provenanceReady: nextProvenanceReady,
+            provenanceFinalized: nextProvenanceFinalized,
           });
-          setReportState({ loading: false, ready: true, data: payload.data, error: "" });
-          return;
+          console.info("[Candidate Report]", {
+            event: "candidate_report_ready_state",
+            attemptId,
+            ready: nextState.ready,
+            attemptStatus: nextAttemptStatus,
+            provenanceReady: nextProvenanceReady,
+            provenanceFinalized: nextProvenanceFinalized,
+          });
+          setReportState(nextState);
+          if (nextProvenanceFinalized) {
+            stableReadySeen = true;
+            return;
+          }
         }
         transientFailureCount = 0;
 
@@ -6451,7 +6486,12 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
         }
 
         if (response?.ok && payload?.ready === false && payload?.status === "processing") {
-          setReportState((prev) => ({ ...prev, loading: true, ready: false, error: "" }));
+          setReportState((prev) => ({
+            ...prev,
+            loading: true,
+            ready: stableReadySeen ? prev.ready : false,
+            error: "",
+          }));
         } else if (!response?.ok) {
           console.error("[Candidate Report]", {
             event: "candidate_report_fetch_failed",
@@ -6474,11 +6514,31 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
       }
 
       if (!cancelled) {
-        setReportState({
-          loading: false,
-          ready: false,
-          data: null,
-          error: "Generating your report is taking longer than expected. Please refresh and try again shortly.",
+        setReportState((prev) => {
+          if (prev.ready && prev.data) {
+            console.info("[Candidate Report]", {
+              event: "candidate_report_ready_state",
+              attemptId,
+              ready: prev.ready,
+              attemptStatus: prev.attemptStatus,
+              provenanceReady: prev.provenanceReady,
+              provenanceFinalized: true,
+            });
+            return {
+              ...prev,
+              loading: false,
+              provenanceFinalized: true,
+            };
+          }
+          return {
+            loading: false,
+            ready: false,
+            data: null,
+            error: "Generating your report is taking longer than expected. Please refresh and try again shortly.",
+            provenanceReady: false,
+            provenanceFinalized: false,
+            attemptStatus: "",
+          };
         });
       }
     }
@@ -6493,16 +6553,30 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
   useEffect(() => {
     if (!reportState.ready || !reportState.data) return;
     console.info("[Candidate Report]", {
+      event: "candidate_report_ready_state",
+      attemptId,
+      ready: reportState.ready,
+      attemptStatus: reportState.attemptStatus,
+      provenanceReady: reportState.provenanceReady,
+      provenanceFinalized: reportState.provenanceFinalized,
+    });
+    console.info("[Candidate Report]", {
       event: "candidate_report_rendered",
       attemptId,
       riskLevel: reportState.data.risk_level || "LOW",
     });
-  }, [attemptId, reportState.data, reportState.ready]);
+  }, [attemptId, reportState.attemptStatus, reportState.data, reportState.provenanceFinalized, reportState.provenanceReady, reportState.ready]);
 
   const report = reportState.data;
   const provenance = report?.answer_provenance || null;
   const riskLevel = report?.risk_level || "LOW";
-  const status = report?.attempt_status || "SUBMITTED";
+  const status = String(reportState.attemptStatus || report?.attempt_status || "SUBMITTED").toUpperCase();
+  const statusReadyForExport = !["ONGOING", "IN_PROGRESS", ""].includes(status);
+  const provenanceStatus = report?.provenance_status || provenance?.provenance_status || "processing";
+  const provenanceWaitingMessage = provenanceStatus === "processing"
+    ? "Answer provenance analysis is still finalizing."
+    : "Answer provenance analysis was not available for this attempt.";
+  const pdfExportReady = Boolean(reportState.ready && report && statusReadyForExport && reportState.provenanceFinalized);
   const overviewItems = buildViolationOverviewFromCounts(report?.violation_summary || {});
   const candidateInsights = (report?.most_suspicious_behaviors || []).length
     ? report.most_suspicious_behaviors
@@ -6533,13 +6607,29 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
     { label: "Confidence", value: `${formatNumber(report?.confidence, 2)} • ${getConfidenceLabel(report?.confidence)}`, tone: "neutral" },
   ];
   const handleDownloadPdf = useCallback(async () => {
-    if (!reportState.ready || !exportPdfRef.current || isGeneratingPdf) return;
+    if (isGeneratingPdf) return;
+    if (!pdfExportReady || !exportPdfRef.current) {
+      const message = "Preparing report and provenance data before PDF export.";
+      setPdfError(message);
+      console.info("[Candidate Report]", {
+        event: "pdf_export_blocked_report_not_ready",
+        attemptId,
+        ready: reportState.ready,
+        attemptStatus: status,
+        provenanceReady: reportState.provenanceReady,
+        provenanceFinalized: reportState.provenanceFinalized,
+      });
+      return;
+    }
 
     setIsGeneratingPdf(true);
     setPdfError("");
     console.info("[Candidate Report]", {
-      event: "pdf_export_started",
+      event: "pdf_export_started_with_ready_data",
       attemptId,
+      attemptStatus: status,
+      provenanceReady: reportState.provenanceReady,
+      provenanceFinalized: reportState.provenanceFinalized,
     });
 
     try {
@@ -6666,7 +6756,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
     } finally {
       setIsGeneratingPdf(false);
     }
-  }, [attemptId, isGeneratingPdf, reportState.ready]);
+  }, [attemptId, isGeneratingPdf, pdfExportReady, reportState.provenanceFinalized, reportState.provenanceReady, reportState.ready, status]);
 
   return (
     <div className="report-scroll-container public-candidate-report-shell">
@@ -6682,12 +6772,12 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           <div className="report-toolbar-actions">
             <button
               className="panel-header-action"
-              disabled={isGeneratingPdf}
+              disabled={isGeneratingPdf || !pdfExportReady}
               onClick={() => void handleDownloadPdf()}
               type="button"
             >
               <FileDown size={16} />
-              {isGeneratingPdf ? "Generating PDF..." : "Download PDF Report"}
+              {isGeneratingPdf ? "Generating PDF..." : pdfExportReady ? "Download PDF Report" : "Preparing report..."}
             </button>
             <a className="workflow-action-btn primary" href="/demo">Start New Demo</a>
             <a className="workflow-action-btn" href="/">Open Reviewer Console</a>
@@ -6773,7 +6863,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
 
             <InvestigationInsightsCard insights={candidateInsights} riskLevel={riskLevel} />
 
-            <ProvenanceIntelligenceCard provenanceAnalysis={provenance} waitingMessage="Answer provenance analysis was not available for this attempt." />
+            <ProvenanceIntelligenceCard provenanceAnalysis={provenance} waitingMessage={provenanceWaitingMessage} />
 
             <div className="report-main-row candidate-report-main-grid">
               <EvidenceTable rows={candidateEvidenceRows} loading={reportState.loading} />

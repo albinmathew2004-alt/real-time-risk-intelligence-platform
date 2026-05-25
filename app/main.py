@@ -1540,6 +1540,7 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         "submitted_at": getattr(persisted_state, "submitted_at", None),
         "updated_at": getattr(persisted_state, "updated_at", None) or assessment.get("generated_at"),
         "provenance_analysis": provenance_result or None,
+        "signals": dict(getattr(persisted_state, "signals", None) or {}),
         "final_risk_assessment": {
             "combined_score": round(risk_score, 4),
             "risk_level": risk_level,
@@ -1557,6 +1558,20 @@ def _is_public_demo_attempt_id(attempt_id: str) -> bool:
 
 def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
     provenance = dict(report.get("provenance_analysis") or {})
+    submitted_answers = list((((report.get("signals") or {}) if isinstance(report.get("signals"), dict) else {}) or {}).get("submitted_answers") or [])
+    provenance_ready = bool(
+        provenance
+        and (
+            "summary" in provenance
+            or "possible_reference_matches" in provenance
+            or "external_similarity_likelihood" in provenance
+        )
+    )
+    provenance_status = "processing"
+    if provenance_ready:
+        provenance_status = "ready"
+    elif submitted_answers == []:
+        provenance_status = "unavailable"
     possible_matches = [
         {
             "source_title": match.get("source_title"),
@@ -1597,6 +1612,7 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "reviewer_summary": provenance.get("reviewer_summary") or provenance.get("summary") or "",
             "limitations_note": provenance.get("limitations_note") or "",
             "web_retrieval_disclaimer": provenance.get("web_retrieval_disclaimer") or "",
+            "provenance_status": provenance_status,
         }
 
     return {
@@ -1621,6 +1637,9 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "violation_summary": dict(report.get("violation_overview_counts") or {}),
         "evidence_items": list(report.get("evidence_items") or []),
         "answer_provenance": provenance_summary,
+        "provenance_status": provenance_status,
+        "provenance_ready": provenance_ready,
+        "provenance_finalized": provenance_status in {"ready", "unavailable"},
         "privacy_note": "This summary reflects metadata-based integrity analysis only. It does not use webcam, microphone, screen recording, or clipboard contents.",
     }
 
@@ -2447,16 +2466,26 @@ def get_public_demo_attempt_report(attempt_id: str):
                 or "external_similarity_likelihood" in provenance
             )
         )
+        attempt_status = str(report.get("attempt_status") or getattr(persisted_state, "status", None) or "").upper()
+        status_ready = attempt_status in {"SUBMITTED", "UNDER_REVIEW", "RESOLVED", "COMPLETED"}
+        submitted_answers = list((dict(getattr(persisted_state, "signals", None) or {}).get("submitted_answers") or []))
+        provenance_finalized = provenance_ready or submitted_answers == []
         report_ready = bool(
-            report.get("submitted_at")
-            or report.get("event_count")
-            or report.get("final_risk_assessment")
+            status_ready
+            and (
+                report.get("submitted_at")
+                or report.get("event_count")
+                or report.get("final_risk_assessment")
+            )
         )
         if not report_ready:
             return {
                 "ready": False,
                 "status": "processing",
                 "attempt_id": attempt_id,
+                "provenance_ready": provenance_ready,
+                "provenance_finalized": provenance_finalized,
+                "attempt_status": attempt_status or None,
             }
 
         return {
@@ -2464,6 +2493,8 @@ def get_public_demo_attempt_report(attempt_id: str):
             "status": "success",
             "attempt_id": attempt_id,
             "provenance_ready": provenance_ready,
+            "provenance_finalized": provenance_finalized,
+            "attempt_status": attempt_status or None,
             "data": _build_candidate_safe_demo_report(report),
         }
     finally:
