@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -41,6 +41,14 @@ import {
   Play,
   Lock,
   TimerReset,
+  Maximize2,
+  Minimize2,
+  CheckCheck,
+  BookOpen,
+  FileCode2,
+  Brain,
+  Shield,
+  WifiOff,
 } from "lucide-react";
 
 import "../../sdk/risk-telemetry-sdk.js";
@@ -90,6 +98,47 @@ const COMPLETED_CASE_STATUSES = ["CONFIRMED_RISK", "RESOLVED", "FALSE_POSITIVE",
 const TOKEN_KEY = "riskintel_access_token";
 const CLIENT_TIME_SKEW_GRACE_MS = 2 * 60 * 1000;
 let reviewerRefreshTimerId = null;
+let reviewerRefreshDueAtMs = 0;
+const SIDEBAR_EXPANDED_WIDTH = 248;
+const SIDEBAR_COLLAPSED_WIDTH = 80;
+
+function getReportAttemptIdFromLocation() {
+  if (typeof window === "undefined") return "";
+  try {
+    return new URLSearchParams(window.location.search).get("attemptId") || "";
+  } catch {
+    return "";
+  }
+}
+
+function replaceReportAttemptIdInLocation(attemptId) {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (attemptId) {
+    url.searchParams.set("attemptId", attemptId);
+  } else {
+    url.searchParams.delete("attemptId");
+  }
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function buildReportSelectionFallback(source, attemptIdOverride = "") {
+  if (!source && !attemptIdOverride) return null;
+  const attemptId = attemptIdOverride || source?.attempt_id || source?.attemptId || "";
+  if (!attemptId) return null;
+  return {
+    attempt_id: attemptId,
+    candidate_name: source?.candidate_name || source?.candidateName || attemptId,
+    candidate_email: source?.candidate_email || source?.candidateEmail || "",
+    assessment_name: source?.assessment_name || source?.assessmentName || "",
+    combined_score: source?.combined_score ?? source?.risk_score ?? source?.score ?? 0,
+    confidence: source?.confidence ?? 0,
+    risk: source?.risk || source?.risk_level || "LOW",
+    timestamp: source?.timestamp || source?.last_activity || source?.updated_at || source?.created_at || null,
+    event_count: source?.event_count ?? source?.eventCount ?? 0,
+    attempt_status: source?.attempt_status || source?.status || null,
+  };
+}
 
 function formatNumber(value, digits = 2) {
   return Number(value || 0).toFixed(digits);
@@ -167,11 +216,51 @@ function getAssessmentName(item) {
   return item?.assessment_name || "Python Coding Assessment";
 }
 
+function getDashboardAssessmentLabel(item) {
+  const rawValue = String(item?.assessmentName || item?.assessment_name || item?.assessmentId || item?.assessment_id || item?.attempt_id || "").trim();
+  const normalized = rawValue.toLowerCase();
+
+  if (!normalized) return "Assessment";
+  if (normalized.includes("frontend")) return "Frontend Debugging";
+  if (normalized.includes("sql")) return "SQL Analysis";
+  if (normalized.includes("reason") || normalized.includes("logical")) return "Logical Reasoning";
+  if (normalized.includes("security") || normalized.includes("investigation")) return "Security Investigation";
+  if (normalized.includes("coding") || normalized.includes("python")) return "Coding Assessment";
+
+  const cleaned = rawValue
+    .replace(/^assessment[_\s-]*/i, "")
+    .replace(/^demo[_\s-]public[_\s-]*/i, "")
+    .replace(/\b(assessment|demo|public)\b/gi, "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) return "Assessment";
+
+  return cleaned
+    .split(" ")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function getDashboardReviewStatus(row) {
+  const status = normalizeQueueStatus(row?.queueStatus || row?.status || "NEW");
+  if (status === "ESCALATED") return "Escalated for reviewer attention";
+  if (status === "UNDER_INVESTIGATION") return "Under active review";
+  if (status === "TRIAGED") return "Triaged for follow-up";
+  if (status === "NEW") return "Awaiting initial review";
+  return formatWorkflowStatus(status);
+}
+
 function getExamStatus(item, events = []) {
   const f = getFeatures(item);
   const latestEvent = item?.latest_event?.event_type;
   const canonicalStatus = String(item?.attempt_status || item?.status || "").toUpperCase();
   const hasSubmit = events.some((e) => ["exam_submitted", "assessment_submitted", "submit", "completed"].includes(String(e.event_type || "").toLowerCase()));
+
+  if (canonicalStatus === "EXPIRED" || canonicalStatus === "ABANDONED") {
+    return canonicalStatus;
+  }
 
   if (canonicalStatus === "SUBMITTED" || canonicalStatus === "UNDER_REVIEW" || canonicalStatus === "RESOLVED" || canonicalStatus === "COMPLETED") {
     return "COMPLETED";
@@ -185,6 +274,7 @@ function getExamStatus(item, events = []) {
 
 function statusClass(status) {
   if (status === "COMPLETED") return "status completed";
+  if (status === "EXPIRED" || status === "ABANDONED") return "status review";
   return "status ongoing";
 }
 
@@ -235,6 +325,7 @@ function primaryIssue(attempt) {
   const f = getFeatures(attempt);
   const paste = Number(f.paste_count || 0);
   const tab = Number(f.tab_hidden_count || 0);
+  const blur = Number(f.focus_blur_count || 0);
   const idle = Number(f.idle_spike_count || 0);
   const avgTime = Number(f.time_per_question_mean_s || 0);
 
@@ -244,6 +335,7 @@ function primaryIssue(attempt) {
   if (paste > 0 && tab > 0) return "Clipboard and tab switching detected";
   if (paste > 0) return "Clipboard activity detected";
   if (tab > 0) return "Tab switching detected";
+  if (blur > 0) return "Minor focus interruptions observed";
   if (idle > 0) return "Idle activity gap detected";
   if (avgTime > 0 && avgTime <= 12) return "Fast answering pattern";
 
@@ -266,6 +358,7 @@ function buildEvidence(attempt) {
   const f = getFeatures(attempt);
   const paste = Number(f.paste_count || 0);
   const tab = Number(f.tab_hidden_count || 0);
+  const blur = Number(f.focus_blur_count || 0);
   const idle = Number(f.idle_spike_count || 0);
   const avgTime = Number(f.time_per_question_mean_s || 0);
   const score = Number(attempt?.combined_score || 0);
@@ -349,6 +442,18 @@ function buildEvidence(attempt) {
     });
   }
 
+  if (blur > 0) {
+    evidence.push({
+      title: "Focus Loss Events",
+      icon: <CircleDot size={21} />,
+      severity: blur >= 7 ? "HIGH" : blur >= 4 ? "MEDIUM" : "LOW",
+      finding: `${blur} focus interruption${blur === 1 ? "" : "s"} observed`,
+      explanation: blur >= 4
+        ? "Window focus was interrupted repeatedly and should be reviewed in context with nearby answer activity."
+        : "Minor focus interruptions were observed without sustained suspicious progression.",
+    });
+  }
+
   return evidence;
 }
 
@@ -368,6 +473,85 @@ function getLatestActivity(item) {
   if (item?.latest_event?.event_type) return eventLabel(item.latest_event);
   if (item?.explanation) return item.explanation;
   return primaryIssue(item);
+}
+
+function getDashboardStrongestReason(item) {
+  const candidates = [
+    item?.strongest_reason,
+    item?.strongest_signal,
+    item?.attempt_summary,
+    item?.explanation_text,
+    item?.explanation,
+    getLatestActivity(item),
+    primaryIssue(item),
+  ];
+
+  const rawReason = candidates.find((value) => typeof value === "string" && value.trim()) || "Review signals detected";
+  const cleanedReason = rawReason
+    .replace(/^behavioral irregularities were detected and warrant reviewer attention\.?\s*/i, "")
+    .replace(/^review recommended due to\s*/i, "")
+    .replace(/^candidate\s+/i, "")
+    .trim();
+
+  const firstSegment = cleanedReason
+    .split(/(?:\.\s+|;\s+|\s+\|\s+|\s+and\s+then\s+)/)
+    .map((segment) => segment.trim())
+    .find(Boolean) || cleanedReason;
+
+  if (firstSegment.length <= 72) return firstSegment;
+  return `${firstSegment.slice(0, 69).trimEnd()}...`;
+}
+
+function getDashboardFeedTimestamp(item) {
+  return item?.latest_event?.occurred_at || item?.latest_event?.timestamp || item?.submitted_at || item?.timestamp || item?.last_activity || null;
+}
+
+function isMeaningfulDashboardFeedItem(item) {
+  const risk = String(item?.risk || item?.risk_level || "LOW").toUpperCase();
+  const latestEventType = String(item?.latest_event?.event_type || item?.latest_event_type || "").toLowerCase();
+  const reason = String(item?.strongest_reason || item?.explanation || item?.attempt_summary || "").toLowerCase();
+  const features = getFeatures(item);
+  const suspiciousSequences = Number(features?.suspicious_sequence_count || features?.correlated_pattern_count || 0);
+  const clipboardCount = Number(features?.clipboard_count || 0);
+  const focusLossCount = Number(features?.focus_blur_count || features?.tab_hidden_count || 0);
+  const typingAnomalies = Number(features?.typing_behavior_anomaly_count || 0);
+  const rapidAnswers = Number(features?.rapid_answer_count || features?.rapid_answer_burst_count || 0);
+
+  const suspiciousEventTypes = new Set(["clipboard", "visibility_change", "idle_state", "rapid_answer_burst", "typing_burst", "typing_pause", "backspace_activity"]);
+  const genericReasonPhrases = [
+    "stable engagement observed",
+    "normal behavior pattern",
+    "review signals detected",
+    "no major violation detected",
+    "minor focus interruptions observed",
+  ];
+  const reasonKeywords = [
+    "clipboard",
+    "focus loss",
+    "focus recovery",
+    "tab switch",
+    "visibility",
+    "paste",
+    "rapid answer",
+    "typing",
+    "idle",
+    "correlated",
+    "suspicious sequence",
+    "review recommended",
+    "escalat",
+    "confidence spike",
+    "overwrite",
+  ];
+
+  const hasReasonKeyword = reasonKeywords.some((keyword) => reason.includes(keyword));
+  const isGenericReason = genericReasonPhrases.some((phrase) => reason.includes(phrase));
+  const hasBehavioralCounts = suspiciousSequences > 0 || clipboardCount > 0 || focusLossCount >= 3 || typingAnomalies > 0 || rapidAnswers > 0;
+
+  if (risk === "HIGH" && (hasReasonKeyword || suspiciousEventTypes.has(latestEventType) || hasBehavioralCounts)) return true;
+  if (risk === "MEDIUM" && (hasReasonKeyword || suspiciousEventTypes.has(latestEventType) || hasBehavioralCounts || Number(item?.confidence || 0) >= 0.55)) return true;
+  if (suspiciousSequences > 0 || clipboardCount > 0) return true;
+  if (hasReasonKeyword && !isGenericReason) return true;
+  return false;
 }
 
 function getLastActivityAt(item) {
@@ -622,24 +806,21 @@ function getTypingBehaviorAnomalyCount(events, attempt) {
 
 function getBlurEventCount(events) {
   return events.filter((event) => {
-    if (event.event_type === "window_blur" || event.event_type === "blur") return true;
-    if (event.event_type !== "visibility_change") return false;
-    const state = String(findNestedPayloadValue(event.payload, ["state", "visibility_state", "visibility"]) || "").toLowerCase();
-    return state.includes("hidden") || state.includes("blur");
+    return event.event_type === "window_blur" || event.event_type === "blur";
   }).length;
 }
 
 function getFocusLossRate(events) {
   if (!events.length) return 0;
-  const focusLoss = events.filter((event) => event.event_type === "visibility_change" || event.event_type === "window_blur").length;
+  const focusLoss = events.filter((event) => event.event_type === "window_blur" || event.event_type === "blur").length;
   return Math.round((focusLoss / events.length) * 100);
 }
 
 function buildViolationOverview(attempt, events) {
   const features = getFeatures(attempt);
   const clipboardCount = Number(features.paste_count || events.filter((event) => event.event_type === "clipboard").length || 0);
-  const tabSwitchCount = Number(features.tab_hidden_count || events.filter((event) => event.event_type === "visibility_change").length || 0);
-  const blurEvents = getBlurEventCount(events) || tabSwitchCount;
+  const tabSwitchCount = Number(features.tab_hidden_count || 0);
+  const blurEvents = Number(features.focus_blur_count || getBlurEventCount(events) || 0);
   const idleMaxSeconds = getIdleMaxSeconds(events, attempt);
   const rapidAnswerBursts = getRapidAnswerBurstCount(events);
   const suspiciousSequences = getSuspiciousSequenceCount(events);
@@ -664,7 +845,7 @@ function buildViolationOverview(attempt, events) {
     {
       key: "blur_events",
       title: "Blur Events",
-      subtitle: "Window Focus Loss",
+      subtitle: "Focus Loss Count",
       value: String(blurEvents),
       severity: getSeverityFromCount(blurEvents, 2, 6),
     },
@@ -737,7 +918,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
     {
       key: "blur_events",
       title: "Blur Events",
-      subtitle: "Window Focus Loss",
+      subtitle: "Focus Loss Count",
       value: String(blurEvents),
       severity: getSeverityFromCount(blurEvents, 2, 6),
     },
@@ -1279,128 +1460,582 @@ async function authJsonFetch(url, { token, method = "GET", body } = {}) {
   }
 }
 
+const DEMO_MONACO_LOADER_URL = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js";
+let demoMonacoLoaderPromise = null;
+
+function loadDemoMonaco() {
+  if (typeof window === "undefined") return Promise.reject(new Error("Monaco requires a browser environment."));
+  if (window.monaco?.editor) return Promise.resolve(window.monaco);
+  if (demoMonacoLoaderPromise) return demoMonacoLoaderPromise;
+
+  demoMonacoLoaderPromise = new Promise((resolve, reject) => {
+    const finishLoad = () => {
+      const requireLoader = window.require;
+      if (!requireLoader) {
+        reject(new Error("Monaco loader is unavailable."));
+        return;
+      }
+      requireLoader.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" } });
+      requireLoader(["vs/editor/editor.main"], () => {
+        if (window.monaco?.editor) resolve(window.monaco);
+        else reject(new Error("Monaco editor failed to initialize."));
+      });
+    };
+
+    const existing = document.querySelector('script[data-proctoriq-monaco="true"]');
+    if (existing) {
+      if (window.monaco?.editor || window.require) {
+        finishLoad();
+        return;
+      }
+      existing.addEventListener("load", finishLoad, { once: true });
+      existing.addEventListener("error", () => reject(new Error("Unable to load Monaco assets.")), { once: true });
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = DEMO_MONACO_LOADER_URL;
+    script.async = true;
+    script.dataset.proctoriqMonaco = "true";
+    script.onload = finishLoad;
+    script.onerror = () => reject(new Error("Unable to load Monaco assets."));
+    document.head.appendChild(script);
+  });
+
+  return demoMonacoLoaderPromise;
+}
+
+function getDemoSectionVisual(sectionId) {
+  if (sectionId === "provenance") {
+    return {
+      icon: Search,
+      label: "Provenance Validation",
+      accent: "knowledge",
+      estimate: "2 prompts",
+    };
+  }
+  if (sectionId === "frontend") {
+    return {
+      icon: BookOpen,
+      label: "Knowledge Assessment",
+      accent: "knowledge",
+      estimate: "2 prompts",
+    };
+  }
+  if (sectionId === "sql") {
+    return {
+      icon: FileCode2,
+      label: "Coding Challenge",
+      accent: "coding",
+      estimate: "2 prompts",
+    };
+  }
+  if (sectionId === "logic") {
+    return {
+      icon: Brain,
+      label: "Analytical Thinking",
+      accent: "thinking",
+      estimate: "2 prompts",
+    };
+  }
+  return {
+    icon: Shield,
+    label: "Security Investigation Scenario",
+    accent: "security",
+    estimate: "2 prompts",
+  };
+}
+
+function getQuestionCompletionState(question, answer, isCurrent, isMarked) {
+  if (isCurrent) return "current";
+  if (isDemoAnswerFilled(question, answer)) return "answered";
+  if (isMarked) return "marked";
+  return "pending";
+}
+
+function DemoMonacoEditor({ language, value, onChange, readOnly = false }) {
+  const containerRef = useRef(null);
+  const editorRef = useRef(null);
+  const latestOnChangeRef = useRef(onChange);
+
+  useEffect(() => {
+    latestOnChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    let disposed = false;
+    let localEditor = null;
+
+    async function initEditor() {
+      try {
+        const monaco = await loadDemoMonaco();
+        if (disposed || !containerRef.current) return;
+
+        localEditor = monaco.editor.create(containerRef.current, {
+          value: value || "",
+          language: language || "javascript",
+          theme: "vs-dark",
+          minimap: { enabled: false },
+          scrollBeyondLastLine: false,
+          wordWrap: "on",
+          automaticLayout: true,
+          fontSize: 13,
+          fontFamily: "'JetBrains Mono', 'Fira Code', Consolas, monospace",
+          lineHeight: 20,
+          smoothScrolling: true,
+          padding: { top: 16, bottom: 16 },
+          overviewRulerLanes: 0,
+          renderLineHighlight: "gutter",
+          tabSize: 2,
+          readOnly,
+        });
+
+        localEditor.onDidChangeModelContent(() => {
+          latestOnChangeRef.current?.(localEditor.getValue());
+        });
+        editorRef.current = localEditor;
+      } catch {
+        editorRef.current = null;
+      }
+    }
+
+    initEditor();
+    return () => {
+      disposed = true;
+      if (localEditor) {
+        localEditor.dispose();
+      }
+      editorRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const model = editor.getModel();
+    if (model && model.getLanguageId() !== language) {
+      window.monaco?.editor?.setModelLanguage(model, language || "javascript");
+    }
+  }, [language]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const nextValue = value || "";
+    if (editor.getValue() !== nextValue) {
+      editor.setValue(nextValue);
+    }
+  }, [value]);
+
+  return <div className="public-demo-monaco" ref={containerRef} />;
+}
+
 const PUBLIC_DEMO_ASSESSMENTS = [
   {
-    id: "assessment_coding_01",
-    name: "Coding Assessment",
-    durationMinutes: 14,
-    icon: Code2,
-    intro: "Demonstrate implementation thinking, debugging discipline, and short-form coding judgement.",
-    questions: [
-      {
-        id: "code_q1",
-        title: "Python Data Handling",
-        prompt: "Describe how you would safely parse a CSV file with missing values and normalize the rows before analysis.",
-        type: "textarea",
-        placeholder: "Outline the parsing steps, validation approach, and how you would handle missing fields.",
-      },
-      {
-        id: "code_q2",
-        title: "Algorithm Tradeoff",
-        prompt: "A teammate proposes a nested loop solution over 100k rows. What would you review before approving it?",
-        type: "textarea",
-        placeholder: "Discuss time complexity, memory, edge cases, and operational implications.",
-      },
-      {
-        id: "code_q3",
-        title: "Function Signature",
-        prompt: "Write a concise function signature for validating and scoring a browser telemetry event batch.",
-        type: "input",
-        placeholder: "def score_batch(events: list[dict], attempt_id: str) -> dict:",
-      },
-    ],
+    id: "assessment_integrity_showcase",
+    name: "Assessment Integrity Showcase",
+    durationMinutes: 10,
+    icon: ShieldAlert,
+    intro: "A full enterprise assessment simulation spanning frontend debugging, SQL reasoning, logical analysis, and a security investigation scenario.",
+    sectionOrder: ["frontend", "sql", "logic", "security"],
   },
   {
-    id: "assessment_reasoning_01",
-    name: "Logical Reasoning",
-    durationMinutes: 12,
-    icon: BrainCircuit,
-    intro: "Assess structured reasoning, prioritization, and concise decision making under time pressure.",
-    questions: [
-      {
-        id: "reason_q1",
-        title: "Incident Triage",
-        prompt: "Three assessment integrity alerts arrive at once. How would you prioritize them and why?",
-        type: "textarea",
-        placeholder: "Explain your triage sequence and the signals that would drive escalation.",
-      },
-      {
-        id: "reason_q2",
-        title: "Evidence Review",
-        prompt: "What combination of signals would make a MEDIUM-risk case worth manual review instead of automatic clearance?",
-        type: "textarea",
-        placeholder: "Discuss ambiguity, evidence correlation, and reviewer judgement.",
-      },
-      {
-        id: "reason_q3",
-        title: "Decision Note",
-        prompt: "Summarize a final reviewer decision in one sentence for the audit trail.",
-        type: "input",
-        placeholder: "Example: Repeated focus loss and paste recovery justified escalation for manual action.",
-      },
-    ],
-  },
-  {
-    id: "assessment_frontend_01",
-    name: "Frontend Debugging",
-    durationMinutes: 13,
+    id: "assessment_frontend_debugging",
+    name: "Frontend Debugging Track",
+    durationMinutes: 9,
     icon: Bug,
-    intro: "Evaluate debugging clarity, frontend diagnosis, and risk-based prioritization of UI issues.",
+    intro: "A developer-oriented assessment flow that still culminates in reviewer-visible behavioral intelligence.",
+    sectionOrder: ["frontend", "logic", "sql", "security"],
+  },
+  {
+    id: "assessment_sql_analysis",
+    name: "SQL Analysis Track",
+    durationMinutes: 9,
+    icon: DatabaseZap,
+    intro: "A data-and-analytics flavored assessment that creates realistic hesitation, answer rewrites, and navigation patterns.",
+    sectionOrder: ["sql", "logic", "frontend", "security"],
+  },
+  {
+    id: "assessment_logical_reasoning",
+    name: "Logical Reasoning Track",
+    durationMinutes: 8,
+    icon: BrainCircuit,
+    intro: "A compact reasoning assessment with timing pressure, revisits, and explainable reviewer-side telemetry.",
+    sectionOrder: ["logic", "frontend", "sql", "security"],
+  },
+  {
+    id: "assessment_provenance_validation",
+    name: "Testing Post-Submission Answer Provenance Analysis",
+    durationMinutes: 8,
+    icon: Search,
+    intro: "An internal validation track used to test external similarity detection, behavioral correlation, clipboard correlation, and reviewer evidence rendering after submission.",
+    sectionOrder: ["provenance"],
+    isProvenanceValidation: true,
+    internalBadge: "Provenance Validation Mode",
+    questionCount: 2,
+  },
+];
+
+const PROVENANCE_VALIDATION_QUESTION_BANK = [
+  {
+    id: "prov_react_sync",
+    title: "React State Synchronization After WebSocket Refresh",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "React debugging",
+    assessmentType: "Frontend Debugging",
+    provenance_test_intent: "Encourage tutorial-style explanations about stale state, canonical data sources, and effect-driven refetch issues.",
+    expected_reference_style: ["react_docs", "stackoverflow", "engineering_blog"],
+    tags: ["React", "State", "WebSocket", "Source of Truth"],
+    placeholder: "Explain the likely synchronization issue, how React state can be overwritten after a refresh, and the safest production fix.",
+    promptVariants: [
+      "A reviewer dashboard re-renders stale rows after a WebSocket refresh even though local state updates correctly. Explain the most likely synchronization issue and describe a production-safe fix.",
+      "A case table looks correct immediately after a local update, but older rows return as soon as a WebSocket-driven refresh runs. Explain the most likely React synchronization mistake and how you would fix it safely in production.",
+    ],
+    expectedBehavior: "Designed to produce research-style written answers, copy/paste temptation, short idle periods, and limited edits after a large insertion.",
+  },
+  {
+    id: "prov_react_keys",
+    title: "React Reconciliation and Stable Keys",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "React debugging",
+    assessmentType: "Frontend Debugging",
+    provenance_test_intent: "Generate long-form explanations that closely resemble React docs and tutorial-style list rendering guidance.",
+    expected_reference_style: ["react_docs", "geeksforgeeks", "mdn_docs"],
+    tags: ["React", "Reconciliation", "Keys", "List Rendering"],
+    placeholder: "Explain reconciliation, why keys matter, how unstable keys cause stale UI, and how you would debug or prevent the issue.",
+    promptVariants: [
+      "Explain React reconciliation and why unstable keys in dynamic lists can cause stale UI rendering issues after updates. Your answer should cover how React compares trees, why keys matter, what goes wrong with index-based keys, and how you would debug or prevent stale row reuse.",
+      "Describe how React reconciliation works and why unstable or index-based keys in dynamic lists can produce stale rows or reused component state. Include how React matches list items and a practical prevention approach.",
+    ],
+    expectedBehavior: "Designed to produce hesitation, answer rewrites, copy/paste temptation, idle time before response, and minimal edits after a large insertion.",
+  },
+  {
+    id: "prov_sql_triage_indexing",
+    title: "Operational Review Queue Index Redesign",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "SQL optimization",
+    assessmentType: "SQL Analysis",
+    provenance_test_intent: "Encourage reference-like explanations about indexing strategy, filtered query plans, and large queue workloads.",
+    expected_reference_style: ["postgres_docs", "sql_blog", "stackoverflow"],
+    tags: ["SQL", "Indexing", "Query Plan", "Triage"],
+    placeholder: "Describe how you would redesign indexing and filtering for a large triage queue query, including actionable case filters and ordering by meaningful activity.",
+    promptVariants: [
+      "A review queue query becomes slow after the case table grows beyond 2 million rows. Explain how indexing and query filtering should be redesigned to support operational triage workloads.",
+      "An operational review queue now scans millions of rows and reviewer pages feel slow. Explain how indexing, filtering, and ordering should be reworked so triage queries stay fast at scale.",
+    ],
+    expectedBehavior: "Often produces long tutorial-style SQL reasoning, answer revisions, and research-like pasted phrasing.",
+  },
+  {
+    id: "prov_sql_latest_activity",
+    title: "Latest Meaningful Activity Ordering",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "SQL optimization",
+    assessmentType: "SQL Analysis",
+    provenance_test_intent: "Produce blog-style explanations about joins, COALESCE ordering, and operational queue relevance.",
+    expected_reference_style: ["sql_blog", "stackoverflow", "postgres_docs"],
+    tags: ["SQL", "Ordering", "Queue Logic", "COALESCE"],
+    placeholder: "Explain how you would join case and attempt state data and order by the latest meaningful activity rather than generic updates.",
+    promptVariants: [
+      "Explain how a review queue query should join case data with attempt state data and order results by the latest meaningful behavioral activity instead of generic updated timestamps.",
+      "A dashboard feed is showing stale ordering because it sorts by generic updates. Explain how you would redesign the SQL join and ordering logic so reviewer queues prioritize the most recent meaningful activity.",
+    ],
+    expectedBehavior: "Creates thoughtful paragraph responses that resemble SQL tutorials and production design notes.",
+  },
+  {
+    id: "prov_fastapi_pooling",
+    title: "FastAPI and SQLAlchemy Session Safety",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "FastAPI backend design",
+    assessmentType: "FastAPI Backend Design",
+    provenance_test_intent: "Encourage documentation-like explanations about dependency-scoped sessions, connection pools, and request safety.",
+    expected_reference_style: ["fastapi_docs", "sqlalchemy_docs", "engineering_blog"],
+    tags: ["FastAPI", "SQLAlchemy", "Connection Pool", "Session Scope"],
+    placeholder: "Explain how FastAPI should scope SQLAlchemy sessions safely, avoid pool exhaustion, and keep read endpoints from triggering heavy sync work.",
+    promptVariants: [
+      "A FastAPI service begins hitting SQLAlchemy pool timeouts during dashboard refreshes and websocket reconnects. Explain how request-scoped sessions and backend read paths should be designed to avoid connection exhaustion.",
+      "A reviewer dashboard causes intermittent SQLAlchemy QueuePool timeouts under load. Explain how you would structure FastAPI session handling, request lifecycles, and expensive sync operations to prevent pool exhaustion.",
+    ],
+    expectedBehavior: "Produces long-form technical prose similar to docs, issue threads, and backend design references.",
+  },
+  {
+    id: "prov_auth_rotation",
+    title: "Demo Admin Credential Drift Recovery",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "Authentication security",
+    assessmentType: "Authentication Security",
+    provenance_test_intent: "Generate explanations similar to auth setup guides about env-driven credentials, password rotation, and idempotent seeding.",
+    expected_reference_style: ["fastapi_docs", "security_writeup", "stackoverflow"],
+    tags: ["Authentication", "Password Hashing", "Env Config", "Seeding"],
+    placeholder: "Explain how you would safely keep demo admin credentials synchronized with environment values without bypassing password hashing.",
+    promptVariants: [
+      "A seeded demo admin user already exists in the database with an outdated password hash. Explain how a secure FastAPI seeding routine should update credentials from environment variables while keeping hashing and role enforcement intact.",
+      "A local demo environment drifts because the admin account was created with an old password. Explain how an idempotent seeding workflow should repair the account from env configuration without introducing insecure login shortcuts.",
+    ],
+    expectedBehavior: "Encourages reference-like security explanations, paste temptation, and minimal edits after insertion.",
+  },
+  {
+    id: "prov_investigation_notes",
+    title: "Reviewer Investigation Narrative Design",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "Investigation workflow reasoning",
+    assessmentType: "Investigation Workflow Reasoning",
+    provenance_test_intent: "Encourage playbook-like explanations about reviewer judgement, escalation notes, and evidence-backed summaries.",
+    expected_reference_style: ["operational_playbook", "security_writeup", "internal_runbook"],
+    tags: ["Investigation", "Reviewer Workflow", "Escalation", "Summary"],
+    placeholder: "Describe how an investigation summary should connect evidence, ambiguity, and escalation decisions without making unsupported accusations.",
+    promptVariants: [
+      "Explain how an investigation report should summarize suspicious behavior so a reviewer can understand the evidence, ambiguity, and escalation path without making unsupported accusations.",
+      "A reviewer needs to hand off a medium-to-high risk case to another analyst. Explain how the investigation summary should connect behavioral evidence, uncertainty, and the escalation decision in a credible enterprise style.",
+    ],
+    expectedBehavior: "Produces policy-style prose and reviewer-language that often resembles internal runbooks and security notes.",
+  },
+  {
+    id: "prov_explainability",
+    title: "Explainable Risk Reasoning Without Black-Box Claims",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "Explainable AI reasoning",
+    assessmentType: "Explainable AI Reasoning",
+    provenance_test_intent: "Generate article-style answers about explainability, reviewer-assisted decisions, and confidence communication.",
+    expected_reference_style: ["ai_governance_note", "enterprise_blog", "product_docs"],
+    tags: ["Explainability", "Risk Scoring", "Reviewer Judgment", "Confidence"],
+    placeholder: "Explain how a risk system can remain explainable and reviewer-assisted without pretending to offer certainty.",
+    promptVariants: [
+      "Explain how an assessment integrity platform can communicate risk scores, confidence, and reviewer guidance without making black-box or certainty claims.",
+      "Describe how a deterministic integrity system should explain its decisions to reviewers so that confidence, evidence, and uncertainty remain clear without pretending the platform knows intent.",
+    ],
+    expectedBehavior: "Often leads to polished paragraph answers similar to enterprise product docs and explainability writeups.",
+  },
+  {
+    id: "prov_telemetry_metadata",
+    title: "Privacy-Preserving Browser Telemetry Interpretation",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "Browser telemetry interpretation",
+    assessmentType: "Browser Telemetry Interpretation",
+    provenance_test_intent: "Encourage doc-style explanations about metadata-only browser signals and how they can be interpreted safely.",
+    expected_reference_style: ["mdn_docs", "security_writeup", "product_docs"],
+    tags: ["Browser Telemetry", "Clipboard", "Focus", "Privacy"],
+    placeholder: "Explain how metadata-only focus, visibility, clipboard, and typing signals can be interpreted without collecting sensitive content.",
+    promptVariants: [
+      "Explain how a browser telemetry system can analyze focus changes, visibility state, clipboard metadata, and typing rhythm without storing clipboard contents or raw keystrokes.",
+      "A product promises privacy-preserving telemetry rather than invasive surveillance. Explain how browser focus, visibility, clipboard metadata, and typing signals can still support reviewer intelligence without capturing sensitive content.",
+    ],
+    expectedBehavior: "Produces documentation-like language with clear technical phrasing and potential reference overlap.",
+  },
+  {
+    id: "prov_queue_priority",
+    title: "Reviewer Queue Prioritization Logic",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "Queue prioritization",
+    assessmentType: "Queue Prioritization",
+    provenance_test_intent: "Generate triage-style explanations about actionable statuses, escalation relevance, and reviewer ordering logic.",
+    expected_reference_style: ["operational_playbook", "sql_blog", "security_writeup"],
+    tags: ["Queue", "Priority", "Review", "Triage"],
+    placeholder: "Explain how reviewer queues should prioritize new and escalated cases while avoiding stale or already resolved activity.",
+    promptVariants: [
+      "Explain how a review queue should prioritize new, triaged, under-investigation, and escalated cases while avoiding stale historical items that are no longer actionable.",
+      "A reviewer queue is mixing live escalations with resolved history. Explain how queue prioritization should separate actionable work from stale records so analysts focus on the right cases first.",
+    ],
+    expectedBehavior: "Encourages paragraph answers that resemble triage playbooks and operational guidance.",
+  },
+  {
+    id: "prov_event_correlation",
+    title: "Behavioral Event Correlation Narrative",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "Event correlation",
+    assessmentType: "Event Correlation",
+    provenance_test_intent: "Encourage security-writeup style explanations about linked behavioral sequences and why correlation matters more than isolated events.",
+    expected_reference_style: ["security_writeup", "incident_review", "internal_runbook"],
+    tags: ["Correlation", "Timeline", "Clipboard", "Focus Loss"],
+    placeholder: "Explain why a focus loss followed by clipboard activity and rapid overwrites should be treated as a correlated sequence rather than isolated events.",
+    promptVariants: [
+      "Explain why the sequence focus loss, visibility hidden, clipboard activity, and rapid answer overwrite is more meaningful than isolated events when deciding whether a case warrants escalation.",
+      "A candidate leaves the page, returns, pastes a large answer, and immediately overwrites a response. Explain why this should be interpreted as a correlated behavioral sequence rather than a set of unrelated events.",
+    ],
+    expectedBehavior: "Produces analyst-style narratives that often resemble public incident writeups or security escalation notes.",
+  },
+  {
+    id: "prov_risk_thresholds",
+    title: "Deterministic Risk Scoring and False Positive Control",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "Risk scoring logic",
+    assessmentType: "Risk Scoring Logic",
+    provenance_test_intent: "Generate reference-style answers about thresholds, corroboration, and not escalating solely on one suspicious signal.",
+    expected_reference_style: ["product_docs", "security_writeup", "engineering_blog"],
+    tags: ["Risk Scoring", "Thresholds", "False Positives", "Deterministic Logic"],
+    placeholder: "Explain how a deterministic scoring system should use corroboration and thresholds to avoid escalating cases solely because one suspicious signal exists.",
+    promptVariants: [
+      "Explain how a deterministic integrity scoring system should combine thresholds, corroborating telemetry, and reviewer judgement so that one suspicious signal does not automatically create a high-risk outcome.",
+      "A platform wants strong explainability without flooding reviewers with false positives. Explain how deterministic thresholds, corroboration, and reviewer oversight should work together in the final risk decision.",
+    ],
+    expectedBehavior: "Encourages polished long-form technical responses similar to product explainability docs and engineering essays.",
+  },
+];
+
+const PUBLIC_DEMO_SECTION_LIBRARY = {
+  frontend: {
+    id: "frontend",
+    title: "Knowledge Assessment",
+    subtitle: "Frontend systems reasoning, diagnosis, and implementation judgement",
+    telemetryFocus: ["Hesitation", "Answer rewrites", "Copy/paste temptation"],
     questions: [
       {
         id: "front_q1",
-        title: "Layout Bug",
-        prompt: "A dashboard table is clipping its action buttons on 1440px screens. What would you inspect first?",
-        type: "textarea",
-        placeholder: "Mention containers, overflow, min-width, flex/grid constraints, and responsive checks.",
+        title: "React Re-render Bug",
+        difficulty: "Medium",
+        inputType: "mcq",
+        prompt: "A review table updates correctly in local state, but stale rows reappear after a WebSocket refresh. Which root cause should you inspect first?",
+        snippetLanguage: "jsx",
+        snippet: `const [rows, setRows] = useState([])\n\nuseEffect(() => {\n  fetchRows().then(setRows)\n}, [selectedCaseId])`,
+        options: [
+          "The page is refetching from a stale API source of truth after local updates.",
+          "The CSS grid is clipping state updates visually.",
+          "The table key prop is too short for React reconciliation.",
+          "The rows are sorted alphabetically instead of by time.",
+        ],
+        expectedBehavior: "Often triggers careful reading, brief idling, and option changes before committing.",
       },
       {
         id: "front_q2",
-        title: "State Bug",
-        prompt: "A reviewer page shows stale risk levels after an action. How would you isolate the source of truth issue?",
-        type: "textarea",
-        placeholder: "Describe how you would trace state, API payloads, and refresh/update timing.",
-      },
-      {
-        id: "front_q3",
-        title: "Quick Fix Note",
-        prompt: "Write a short engineering note describing the likely cause of a blank export popup.",
-        type: "input",
-        placeholder: "Example: popup opened before printable content finished rendering.",
+        title: "React Reconciliation and Stable Keys",
+        difficulty: "Medium",
+        inputType: "textarea",
+        prompt: "Explain React reconciliation and why unstable keys in dynamic lists can cause stale UI rendering issues after updates.\n\nYour answer should include:\n- how React compares component trees during rendering\n- why list keys matter\n- what happens when index-based or unstable keys are used\n- how stale UI or incorrect row reuse can appear\n- a practical debugging or prevention approach",
+        tags: ["React", "Reconciliation", "Keys", "List Rendering"],
+        placeholder: "Explain how React compares trees, why stable keys matter, what can go wrong with index-based keys, and how you would debug or prevent stale row reuse.",
+        expectedBehavior: "Designed to produce hesitation, answer rewrites, copy/paste temptation, idle time before response, and minimal edits after a large insertion.",
       },
     ],
   },
-  {
-    id: "assessment_sql_01",
-    name: "SQL Basics",
-    durationMinutes: 11,
-    icon: DatabaseZap,
-    intro: "Measure database reasoning, filtering logic, and confidence with simple analytics tasks.",
+  sql: {
+    id: "sql",
+    title: "Coding Challenge",
+    subtitle: "Operational SQL reasoning, lifecycle filtering, and queue prioritization",
+    telemetryFocus: ["Idle thinking", "Answer rewrites", "Navigation revisits"],
     questions: [
       {
         id: "sql_q1",
-        title: "Query Intent",
-        prompt: "How would you retrieve the latest review case per attempt without showing stale statuses?",
-        type: "textarea",
-        placeholder: "Describe the SQL shape or logic you would use.",
+        title: "Latest Actionable Cases",
+        difficulty: "Medium",
+        inputType: "code",
+        prompt: "Write a SQL query shape that returns only actionable review cases ordered by the most recent meaningful activity.",
+        snippetLanguage: "sql",
+        tags: ["SQL", "PostgreSQL", "Queue Logic"],
+        constraints: [
+          "Return only actionable cases.",
+          "Sort by newest meaningful activity first.",
+          "Preserve risk and reviewer status visibility.",
+        ],
+        examples: [
+          "Use an IN filter for NEW, TRIAGED, UNDER_INVESTIGATION, and ESCALATED.",
+          "Prefer the most recent risk-history or behavioral-event timestamp over generic updates.",
+        ],
+        starterCode: {
+          sql: "SELECT\n  c.id,\n  c.attempt_id,\n  c.status,\n  s.final_risk_level,\n  s.final_risk_score\nFROM investigation_cases c\nJOIN attempt_states s ON s.attempt_id = c.attempt_id\nWHERE c.status IN ('NEW', 'TRIAGED', 'UNDER_INVESTIGATION', 'ESCALATED')\nORDER BY COALESCE(s.latest_event_at, s.updated_at) DESC;\n",
+        },
+        languageOptions: ["sql"],
+        placeholder: "SELECT ... FROM investigation_cases ... WHERE status IN ('NEW', 'UNDER_INVESTIGATION', 'ESCALATED') ORDER BY ...",
+        expectedBehavior: "Often causes pauses, text edits, and navigation between question and section summaries.",
       },
       {
         id: "sql_q2",
-        title: "Operational Metric",
-        prompt: "How would you count only actionable HIGH-risk cases for a dashboard KPI?",
-        type: "textarea",
-        placeholder: "Explain the filters or case lifecycle rules you would apply.",
-      },
-      {
-        id: "sql_q3",
-        title: "Index Hint",
-        prompt: "Name one index that would help a review queue ordered by last activity.",
-        type: "input",
-        placeholder: "Example: index on (status, updated_at desc)",
+        title: "Aggregation Check",
+        difficulty: "Easy",
+        inputType: "mcq",
+        prompt: "Which metric should back 'High Risk Now' on the dashboard?",
+        options: [
+          "All historical HIGH attempts regardless of status",
+          "Only unresolved/actionable HIGH attempts",
+          "All attempts with any clipboard activity",
+          "Any case opened in the last week",
+        ],
+        expectedBehavior: "Encourages a quick choice, then second-guessing and answer changes.",
       },
     ],
   },
-];
+  logic: {
+    id: "logic",
+    title: "Analytical Thinking",
+    subtitle: "Decision patterns, ambiguity handling, and prioritization",
+    telemetryFocus: ["Hesitation", "Rapid answer changes", "Question revisits"],
+    questions: [
+      {
+        id: "logic_q1",
+        title: "Priority Sequence",
+        difficulty: "Medium",
+        inputType: "mcq",
+        prompt: "Three cases arrive: one escalated HIGH with correlated clipboard evidence, one MEDIUM with repeated focus loss, and one LOW with minor blur noise. Which should be reviewed first?",
+        options: [
+          "The LOW case, because it has the fewest events and is quickest to close",
+          "The MEDIUM case, because ambiguity always beats severity",
+          "The escalated HIGH case with correlated evidence",
+          "Review them in candidate-name order",
+        ],
+        expectedBehavior: "Creates clear reviewer prioritization reasoning and quick answer toggles.",
+      },
+      {
+        id: "logic_q2",
+        title: "Reviewer Decision Note",
+        difficulty: "Medium",
+        inputType: "textarea",
+        prompt: "A candidate shows moderate focus loss, one clipboard sequence, and inconsistent typing after idle recovery. Explain why this should remain a reviewer decision instead of being auto-escalated.",
+        placeholder: "Keep it concise and operational. Mention ambiguity, corroboration, and why explainability matters.",
+        expectedBehavior: "Generates uneven timing, rewrites, and deliberate thinking pauses.",
+      },
+    ],
+  },
+  security: {
+    id: "security",
+    title: "Security Investigation Scenario",
+    subtitle: "Event correlation, analyst notes, and escalation reasoning",
+    telemetryFocus: ["Careful reading", "Idle analysis", "Reasoning text input"],
+    questions: [
+      {
+        id: "sec_q1",
+        title: "Event Log Correlation",
+        difficulty: "Hard",
+        inputType: "mcq",
+        prompt: "Review the behavioral timeline and choose the strongest correlated suspicious sequence.",
+        snippetLanguage: "log",
+        snippet: `12:03:10  focus_lost\n12:03:18  visibility_hidden\n12:03:24  clipboard_paste(size=large)\n12:03:29  answer_change(length=184)\n12:03:35  rapid_answer_burst`,
+        options: [
+          "Normal hesitation followed by a harmless answer save",
+          "Focus loss -> clipboard activity -> rapid overwrite sequence",
+          "Pure typing inconsistency without any corroboration",
+          "A completed submission with no prior behavioral risk",
+        ],
+        expectedBehavior: "Designed to create careful reading, copy temptation, and section revisit behavior.",
+      },
+      {
+        id: "sec_q2",
+        title: "Escalation Recommendation",
+        difficulty: "Hard",
+        inputType: "textarea",
+        prompt: "Write the escalation note you would place into an investigation report for the timeline above.",
+        placeholder: "Example: Candidate returned from focus loss and performed large paste-driven overwrites within seconds, repeating a correlated suspicious pattern that warrants escalation.",
+        expectedBehavior: "Creates longer reasoning input, edits, and strong reviewer-style telemetry.",
+      },
+    ],
+  },
+  provenance: {
+    id: "provenance",
+    title: "Provenance Validation",
+    subtitle: "Internal validation prompts designed to test post-submission external similarity analysis",
+    telemetryFocus: ["Research-style answers", "Copy/paste temptation", "Minimal edits after insertion"],
+    questions: [],
+  },
+};
 
 function slugify(value) {
   return String(value || "")
@@ -1421,37 +2056,159 @@ function createDemoCandidateId(name, email) {
   return `candidate_${source}_${Math.floor(Date.now() / 1000)}`;
 }
 
+function stableHash(value) {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function buildProvenanceValidationQuestions(sessionSeed, count = 2) {
+  const seedText = String(sessionSeed || "default");
+  return [...PROVENANCE_VALIDATION_QUESTION_BANK]
+    .sort((left, right) => stableHash(`${seedText}:${left.id}`) - stableHash(`${seedText}:${right.id}`))
+    .slice(0, Math.max(1, Math.min(count, PROVENANCE_VALIDATION_QUESTION_BANK.length)))
+    .map((question) => {
+      const variants = question.promptVariants?.length ? question.promptVariants : [question.prompt];
+      const variantIndex = stableHash(`${seedText}:${question.id}:variant`) % variants.length;
+      return {
+        ...question,
+        prompt: variants[variantIndex],
+      };
+    });
+}
+
+function buildDemoAssessment(trackId, sessionSeed = "default") {
+  const track = PUBLIC_DEMO_ASSESSMENTS.find((item) => item.id === trackId) || PUBLIC_DEMO_ASSESSMENTS[0];
+  const sections = track.sectionOrder.map((sectionId, sectionIndex) => {
+    const section = PUBLIC_DEMO_SECTION_LIBRARY[sectionId];
+    const sourceQuestions = track.isProvenanceValidation && sectionId === "provenance"
+      ? buildProvenanceValidationQuestions(sessionSeed, track.questionCount || 2)
+      : section.questions;
+    return {
+      ...section,
+      order: sectionIndex + 1,
+      questions: sourceQuestions.map((question, questionIndex) => ({
+        ...question,
+        sectionId: section.id,
+        sectionTitle: section.title,
+        sectionSubtitle: section.subtitle,
+        displayNumber: `${sectionIndex + 1}.${questionIndex + 1}`,
+      })),
+    };
+  });
+  return {
+    ...track,
+    sections,
+    questions: sections.flatMap((section) => section.questions),
+  };
+}
+
+function getDemoQuestionAssessmentType(question) {
+  if (question?.assessmentType) return question.assessmentType;
+  const sectionId = String(question?.sectionId || "").toLowerCase();
+  if (sectionId === "frontend") return "Frontend Debugging";
+  if (sectionId === "sql") return "SQL Analysis";
+  if (sectionId === "logic") return "Logical Reasoning";
+  if (sectionId === "security") return "Security Investigation";
+  return "Assessment Response";
+}
+
+function isDemoAnswerFilled(question, value) {
+  return Boolean(String(value || "").trim());
+}
+
 function PublicDemoPage({ apiBaseUrl }) {
+  const tracker = useMemo(() => ({ visited: new Set(), lastSectionId: "" }), []);
   const [consented, setConsented] = useState(false);
   const [candidateName, setCandidateName] = useState("");
   const [candidateEmail, setCandidateEmail] = useState("");
   const [assessmentId, setAssessmentId] = useState(PUBLIC_DEMO_ASSESSMENTS[0].id);
+  const [assessmentSessionSeed, setAssessmentSessionSeed] = useState(() => `${Date.now()}`);
   const [stage, setStage] = useState("welcome");
   const [attemptId, setAttemptId] = useState("");
   const [candidateId, setCandidateId] = useState("");
   const [answers, setAnswers] = useState({});
+  const [markedForReview, setMarkedForReview] = useState({});
   const [questionIndex, setQuestionIndex] = useState(0);
   const [timeRemaining, setTimeRemaining] = useState(PUBLIC_DEMO_ASSESSMENTS[0].durationMinutes * 60);
-  const [telemetryStatus, setTelemetryStatus] = useState("Telemetry inactive");
+  const [telemetryStatus, setTelemetryStatus] = useState("Session not started");
   const [telemetryError, setTelemetryError] = useState("");
   const [submittedAt, setSubmittedAt] = useState("");
+  const [submissionMessage, setSubmissionMessage] = useState("");
+  const [submissionBusy, setSubmissionBusy] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [connectionStable, setConnectionStable] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine !== false));
+  const [editorLanguageByQuestion, setEditorLanguageByQuestion] = useState({});
+  const [sectionCompletion, setSectionCompletion] = useState(null);
+  const [editorConsoleByQuestion, setEditorConsoleByQuestion] = useState({});
+  const [customInputByQuestion, setCustomInputByQuestion] = useState({});
 
   const selectedAssessment = useMemo(
-    () => PUBLIC_DEMO_ASSESSMENTS.find((item) => item.id === assessmentId) || PUBLIC_DEMO_ASSESSMENTS[0],
-    [assessmentId],
+    () => buildDemoAssessment(assessmentId, assessmentSessionSeed),
+    [assessmentId, assessmentSessionSeed],
   );
-  const currentQuestion = selectedAssessment.questions[questionIndex] || selectedAssessment.questions[0];
-  const totalQuestions = selectedAssessment.questions.length;
-  const progressPercent = totalQuestions > 0 ? ((questionIndex + 1) / totalQuestions) * 100 : 0;
+  const flatQuestions = selectedAssessment.questions;
+  const totalQuestions = flatQuestions.length;
+  const currentQuestion = flatQuestions[questionIndex] || flatQuestions[0];
+  const currentSection = selectedAssessment.sections.find((section) => section.id === currentQuestion?.sectionId) || selectedAssessment.sections[0];
+  const answeredCount = flatQuestions.filter((question) => isDemoAnswerFilled(question, answers[question.id])).length;
+  const markedCount = Object.values(markedForReview).filter(Boolean).length;
+  const unansweredCount = Math.max(0, totalQuestions - answeredCount);
+  const progressPercent = totalQuestions > 0 ? (answeredCount / totalQuestions) * 100 : 0;
+  const sectionSummaries = selectedAssessment.sections.map((section) => ({
+    ...section,
+    ...getDemoSectionVisual(section.id),
+    answered: section.questions.filter((question) => isDemoAnswerFilled(question, answers[question.id])).length,
+    marked: section.questions.filter((question) => markedForReview[question.id]).length,
+    total: section.questions.length,
+  }));
+  const currentSectionSummary = sectionSummaries.find((section) => section.id === currentSection?.id) || sectionSummaries[0];
+  const currentQuestionAnswer = answers[currentQuestion?.id] || "";
+  const currentEditorLanguage = editorLanguageByQuestion[currentQuestion?.id]
+    || currentQuestion?.languageOptions?.[0]
+    || currentQuestion?.snippetLanguage
+    || "javascript";
+  const currentSectionIndex = sectionSummaries.findIndex((section) => section.id === currentSection?.id);
+  const currentSectionProgress = currentSectionSummary?.total ? ((currentSectionSummary.answered || 0) / currentSectionSummary.total) * 100 : 0;
+  const demoDataReady = Boolean(selectedAssessment?.sections?.length && flatQuestions.length && currentQuestion);
 
   useEffect(() => {
-    if (stage !== "assessment") {
+    if (stage !== "assessment" && stage !== "review") {
       setTimeRemaining(selectedAssessment.durationMinutes * 60);
     }
   }, [selectedAssessment.durationMinutes, stage]);
 
   useEffect(() => {
-    if (stage !== "assessment") return undefined;
+    if (typeof window === "undefined") return;
+    window.__PROVENANCE_TEST_MODE__ = Boolean(selectedAssessment?.isProvenanceValidation);
+  }, [selectedAssessment?.isProvenanceValidation]);
+
+  useEffect(() => {
+    function syncFullscreenState() {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    }
+
+    function syncConnectionState() {
+      setConnectionStable(navigator.onLine !== false);
+    }
+
+    if (typeof window === "undefined") return undefined;
+    document.addEventListener("fullscreenchange", syncFullscreenState);
+    window.addEventListener("online", syncConnectionState);
+    window.addEventListener("offline", syncConnectionState);
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFullscreenState);
+      window.removeEventListener("online", syncConnectionState);
+      window.removeEventListener("offline", syncConnectionState);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (stage !== "assessment" && stage !== "review") return undefined;
     const intervalId = window.setInterval(() => {
       setTimeRemaining((prev) => {
         if (prev <= 1) {
@@ -1464,8 +2221,42 @@ function PublicDemoPage({ apiBaseUrl }) {
     return () => window.clearInterval(intervalId);
   }, [stage]);
 
+  const emitDemoEvent = useCallback((eventType, payload = {}) => {
+    if (!attemptId) return;
+    void authJsonFetch(`${apiBaseUrl.replace(/\/$/, "")}/v1/events/ingest`, {
+      method: "POST",
+      body: {
+        attempt_id: attemptId,
+        candidate_id: candidateId,
+        candidate_name: candidateName.trim(),
+        candidate_email: candidateEmail.trim(),
+        assessment_id: selectedAssessment.id,
+        assessment_name: selectedAssessment.name,
+        event_type: eventType,
+        payload,
+        occurred_at: new Date().toISOString(),
+      },
+    });
+  }, [apiBaseUrl, attemptId, candidateId, candidateName, candidateEmail, selectedAssessment.id, selectedAssessment.name]);
+
   useEffect(() => {
     if (stage !== "assessment" || !currentQuestion || typeof window === "undefined" || !window.RiskTelemetry) return undefined;
+    if (currentQuestion.sectionId && tracker.lastSectionId !== currentQuestion.sectionId) {
+      tracker.lastSectionId = currentQuestion.sectionId;
+      emitDemoEvent("section_entered", {
+        section_id: currentQuestion.sectionId,
+        section_title: currentSection?.title || currentQuestion.sectionId,
+        question_id: currentQuestion.id,
+      });
+    }
+    if (tracker.visited.has(currentQuestion.id)) {
+      emitDemoEvent("question_revisited", {
+        question_id: currentQuestion.id,
+        section_id: currentQuestion.sectionId,
+      });
+    } else {
+      tracker.visited.add(currentQuestion.id);
+    }
     window.RiskTelemetry.enterQuestion(currentQuestion.id);
     return () => {
       try {
@@ -1474,10 +2265,10 @@ function PublicDemoPage({ apiBaseUrl }) {
         // ignore SDK cleanup issues
       }
     };
-  }, [currentQuestion, stage]);
+  }, [currentQuestion, currentSection?.title, emitDemoEvent, stage, tracker]);
 
   useEffect(() => {
-    if (timeRemaining !== 0 || stage !== "assessment") return;
+    if (timeRemaining !== 0 || (stage !== "assessment" && stage !== "review")) return;
     void handleSubmit();
   }, [stage, timeRemaining]);
 
@@ -1493,7 +2284,35 @@ function PublicDemoPage({ apiBaseUrl }) {
     };
   }, []);
 
-  const handleStart = useCallback(() => {
+  useEffect(() => {
+    if (!currentQuestion?.id || currentQuestion.inputType !== "code") return;
+    setEditorLanguageByQuestion((prev) => {
+      if (prev[currentQuestion.id]) return prev;
+      return {
+        ...prev,
+        [currentQuestion.id]: currentQuestion.languageOptions?.[0] || currentQuestion.snippetLanguage || "javascript",
+      };
+    });
+  }, [currentQuestion]);
+
+  const goToQuestion = useCallback((nextIndex) => {
+    setQuestionIndex(Math.max(0, Math.min(totalQuestions - 1, nextIndex)));
+  }, [totalQuestions]);
+
+  const handleToggleFullscreen = useCallback(async () => {
+    if (typeof document === "undefined") return;
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await document.documentElement.requestFullscreen();
+      }
+    } catch {
+      // ignore browser fullscreen errors
+    }
+  }, []);
+
+  const handleContinueToInstructions = useCallback(() => {
     if (!candidateName.trim() || !candidateEmail.trim()) {
       setTelemetryError("Enter a candidate name and email to begin the demo assessment.");
       return;
@@ -1502,15 +2321,28 @@ function PublicDemoPage({ apiBaseUrl }) {
       setTelemetryError("Candidate consent is required before telemetry can begin.");
       return;
     }
+    setTelemetryError("");
+    setStage("instructions");
+  }, [candidateEmail, candidateName, consented]);
 
+  const handleStart = useCallback(() => {
     const nextAttemptId = createDemoAttemptId(candidateName, selectedAssessment.id);
     const nextCandidateId = createDemoCandidateId(candidateName, candidateEmail);
     setAttemptId(nextAttemptId);
     setCandidateId(nextCandidateId);
     setAnswers({});
+    setMarkedForReview({});
     setQuestionIndex(0);
     setSubmittedAt("");
+    setSubmissionMessage("");
+    setSubmissionBusy(false);
+    setSectionCompletion(null);
+    setEditorLanguageByQuestion({});
+    setEditorConsoleByQuestion({});
+    setCustomInputByQuestion({});
     setTelemetryError("");
+    tracker.visited.clear();
+    tracker.lastSectionId = "";
 
     try {
       if (!window.RiskTelemetry) {
@@ -1535,12 +2367,12 @@ function PublicDemoPage({ apiBaseUrl }) {
         devMode: false,
       });
       window.RiskTelemetry.startExam();
-      setTelemetryStatus("Telemetry active");
+      setTelemetryStatus("Live telemetry active");
       setStage("assessment");
     } catch (error) {
       setTelemetryError(error instanceof Error ? error.message : "Unable to initialize assessment telemetry.");
     }
-  }, [apiBaseUrl, assessmentId, candidateEmail, candidateName, consented, selectedAssessment.id, selectedAssessment.name]);
+  }, [apiBaseUrl, candidateEmail, candidateName, selectedAssessment.id, selectedAssessment.name, tracker]);
 
   const handleAnswerChange = useCallback((questionId, value) => {
     setAnswers((prev) => ({ ...prev, [questionId]: value }));
@@ -1551,16 +2383,187 @@ function PublicDemoPage({ apiBaseUrl }) {
     }
   }, []);
 
-  const handleSubmit = useCallback(async () => {
-    try {
-      window.RiskTelemetry?.endExam();
-      setTelemetryStatus("Assessment submitted");
-    } catch (error) {
-      setTelemetryError(error instanceof Error ? error.message : "Unable to submit telemetry cleanly.");
+  const handleMcqKeyDown = useCallback((event, question, optionIndex) => {
+    if (!question?.options?.length) return;
+    const optionCount = question.options.length;
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      handleAnswerChange(question.id, question.options[optionIndex]);
+      return;
     }
+    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const next = (optionIndex + 1) % optionCount;
+      handleAnswerChange(question.id, question.options[next]);
+      return;
+    }
+    if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      const next = (optionIndex - 1 + optionCount) % optionCount;
+      handleAnswerChange(question.id, question.options[next]);
+    }
+  }, [handleAnswerChange]);
+
+  const handleToggleReview = useCallback((question) => {
+    setMarkedForReview((prev) => {
+      const nextValue = !prev[question.id];
+      emitDemoEvent("question_marked_for_review", {
+        question_id: question.id,
+        section_id: question.sectionId,
+        marked: nextValue,
+      });
+      return { ...prev, [question.id]: nextValue };
+    });
+  }, [emitDemoEvent]);
+
+  const handleOpenReview = useCallback(() => {
+    emitDemoEvent("assessment_review_started", {
+      answered_count: answeredCount,
+      unanswered_count: unansweredCount,
+      marked_for_review_count: markedCount,
+      time_remaining_seconds: timeRemaining,
+    });
+    setTelemetryStatus("Reviewing before submission");
+    setStage("review");
+  }, [answeredCount, emitDemoEvent, markedCount, timeRemaining, unansweredCount]);
+
+  const handleAdvanceQuestion = useCallback(() => {
+    if (!currentQuestion) return;
+    if (questionIndex >= totalQuestions - 1) {
+      handleOpenReview();
+      return;
+    }
+
+    const nextQuestion = flatQuestions[questionIndex + 1];
+    if (nextQuestion?.sectionId && nextQuestion.sectionId !== currentQuestion.sectionId) {
+      const completedSection = sectionSummaries.find((section) => section.id === currentQuestion.sectionId);
+      const upcomingSection = sectionSummaries.find((section) => section.id === nextQuestion.sectionId);
+      setSectionCompletion({
+        completedSection,
+        upcomingSection,
+        answered: completedSection?.answered || 0,
+        skipped: Math.max(0, (completedSection?.total || 0) - (completedSection?.answered || 0)),
+        nextIndex: questionIndex + 1,
+      });
+      return;
+    }
+
+    goToQuestion(questionIndex + 1);
+  }, [currentQuestion, flatQuestions, goToQuestion, handleOpenReview, questionIndex, sectionSummaries, totalQuestions]);
+
+  const handleSubmit = useCallback(async () => {
+    if (submissionBusy) return;
+
+    const progressTimers = [];
+    const submitStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const clearProgressTimers = () => {
+      progressTimers.forEach((timerId) => window.clearTimeout(timerId));
+    };
+    const queueSubmissionMessage = (message, delayMs = 0) => {
+      const timerId = window.setTimeout(() => {
+        setSubmissionMessage(message);
+        setTelemetryStatus(message);
+      }, delayMs);
+      progressTimers.push(timerId);
+    };
+
+    setSubmissionBusy(true);
+    setTelemetryError("");
+    setSubmissionMessage("Submitting assessment...");
+    setTelemetryStatus("Submitting assessment...");
+    setStage("submitting");
+    queueSubmissionMessage("Analyzing behavioral signals...", 450);
+    queueSubmissionMessage("Generating reviewer report...", 1400);
+
+    try {
+      const flushBeforeSubmitStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const preSubmitFlush = await window.RiskTelemetry?.flush?.({ timeoutMs: 6000, settleMs: 100 });
+      const flushBeforeSubmitDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - flushBeforeSubmitStartedAt;
+
+      window.RiskTelemetry?.endExam();
+
+      const flushAfterSubmitStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const finalFlush = await window.RiskTelemetry?.flush?.({ timeoutMs: 12000, settleMs: 125 });
+      const flushAfterSubmitDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - flushAfterSubmitStartedAt;
+
+      if (finalFlush && finalFlush.ok === false) {
+        throw new Error("Final telemetry sync timed out before the reviewer report was ready.");
+      }
+
+      const submittedAnswersPayload = {
+        attempt_id: attemptId,
+        candidate_id: candidateId,
+        candidate_name: candidateName.trim(),
+        candidate_email: candidateEmail.trim(),
+        assessment_id: selectedAssessment.id,
+        assessment_name: selectedAssessment.name,
+        answers: flatQuestions
+          .filter((question) => isDemoAnswerFilled(question, answers[question.id]))
+          .map((question) => ({
+            question_id: question.id,
+            question_title: question.title,
+            section_id: question.sectionId,
+            section_title: question.sectionTitle,
+            assessment_type: getDemoQuestionAssessmentType(question),
+            input_type: question.inputType,
+            answer_text: String(answers[question.id] || "").trim(),
+            marked_for_review: Boolean(markedForReview[question.id]),
+          })),
+      };
+      const provenancePersistStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const provenancePersistResult = await authJsonFetch(
+        `${apiBaseUrl.replace(/\/$/, "")}/v1/attempts/${attemptId}/answers`,
+        {
+          method: "POST",
+          body: submittedAnswersPayload,
+        },
+      );
+      const provenancePersistDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - provenancePersistStartedAt;
+      if (!provenancePersistResult.ok) {
+        console.warn("[Demo Provenance Persist]", provenancePersistResult.data?.detail || "Unable to persist submitted answers for provenance analysis.");
+      }
+
+      clearProgressTimers();
+      setSubmissionMessage("Assessment submitted successfully");
+      setTelemetryStatus("Assessment submitted successfully");
+      console.info("[Demo Submit Timing]", {
+        attemptId,
+        flushBeforeSubmitMs: Math.round(flushBeforeSubmitDurationMs),
+        flushAfterSubmitMs: Math.round(flushAfterSubmitDurationMs),
+        provenancePersistMs: Math.round(provenancePersistDurationMs),
+        pendingEventsBeforeSubmit: preSubmitFlush?.queueLength ?? 0,
+        pendingEventsAfterSubmit: finalFlush?.queueLength ?? 0,
+        totalSubmitMs: Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - submitStartedAt),
+      });
+    } catch (error) {
+      clearProgressTimers();
+      setSubmissionBusy(false);
+      setStage("review");
+      setSubmissionMessage("");
+      setTelemetryError(error instanceof Error ? error.message : "Unable to submit telemetry cleanly.");
+      setTelemetryStatus("Submission delayed — retry required");
+      return;
+    }
+
     setSubmittedAt(new Date().toISOString());
+    setSubmissionBusy(false);
     setStage("submitted");
-  }, []);
+  }, [answers, apiBaseUrl, attemptId, candidateEmail, candidateId, candidateName, flatQuestions, markedForReview, selectedAssessment.id, selectedAssessment.name, submissionBusy]);
+
+  const handleDemoRun = useCallback(() => {
+    if (!currentQuestion?.id) return;
+    const answerLength = String(currentQuestionAnswer || "").trim().length;
+    const customInput = String(customInputByQuestion[currentQuestion.id] || "").trim();
+    setEditorConsoleByQuestion((prev) => ({
+      ...prev,
+      [currentQuestion.id]: {
+        ranAt: new Date().toISOString(),
+        message: answerLength > 0
+          ? `Execution preview captured locally for the ${currentEditorLanguage.toUpperCase()} draft. ${customInput ? "Custom input attached." : "No custom input was provided."}`
+          : "Add a response draft before running the local execution preview.",
+      },
+    }));
+  }, [currentEditorLanguage, currentQuestion?.id, currentQuestionAnswer, customInputByQuestion]);
 
   const handleRestart = useCallback(() => {
     try {
@@ -1568,27 +2571,39 @@ function PublicDemoPage({ apiBaseUrl }) {
     } catch {
       // ignore
     }
+    if (selectedAssessment?.isProvenanceValidation) {
+      setAssessmentSessionSeed(`${Date.now()}`);
+    }
     setTelemetryStatus("Telemetry inactive");
     setTelemetryError("");
     setAttemptId("");
     setCandidateId("");
     setAnswers({});
+    setMarkedForReview({});
     setQuestionIndex(0);
     setSubmittedAt("");
+    setSubmissionMessage("");
+    setSubmissionBusy(false);
+    setSectionCompletion(null);
+    setEditorLanguageByQuestion({});
+    setEditorConsoleByQuestion({});
+    setCustomInputByQuestion({});
     setStage("welcome");
     setTimeRemaining(selectedAssessment.durationMinutes * 60);
-  }, [selectedAssessment.durationMinutes]);
+    tracker.visited.clear();
+    tracker.lastSectionId = "";
+  }, [selectedAssessment?.isProvenanceValidation, selectedAssessment.durationMinutes, tracker]);
 
   return (
     <div className="public-demo-shell">
-      <div className="public-demo-page">
+      <div className={`public-demo-page demo-experience stage-${stage}`}>
         <section className="public-demo-hero">
           <div className="public-demo-hero-copy">
             <span className="page-kicker">PUBLIC DEMO</span>
-            <h1>Experience a live ProctorIQ assessment</h1>
+            <h1>Experience an enterprise ProctorIQ assessment</h1>
             <p>
-              ProctorIQ analyzes privacy-preserving behavioral telemetry in real time to produce deterministic,
-              explainable assessment integrity signals without webcam, audio, or content capture.
+              ProctorIQ converts privacy-preserving behavioral telemetry into explainable reviewer intelligence,
+              showing how real assessment sessions become operational investigation workflows without webcam or audio monitoring.
             </p>
           </div>
           <div className="public-demo-hero-actions">
@@ -1596,31 +2611,54 @@ function PublicDemoPage({ apiBaseUrl }) {
           </div>
         </section>
 
-        <section className="public-demo-grid">
+        <section className={`public-demo-grid${stage === "assessment" ? " assessment-stage" : ""}`}>
           <div className="public-demo-main">
-            {stage === "welcome" && (
-              <section className="public-demo-card">
+            {!demoDataReady ? (
+              <section className="public-demo-card public-demo-stage-card">
                 <div className="public-demo-card-head">
-                  <h2>Welcome</h2>
-                  <span className="demo-status-chip neutral">Metadata-only telemetry</span>
+                  <h2>Assessment setup unavailable</h2>
+                  <span className="demo-status-chip warning">Retry required</span>
                 </div>
                 <div className="public-demo-copy-block">
-                  <p>
-                    This interactive demo sends the same assessment telemetry used by the reviewer console: answer timing,
-                    focus changes, clipboard metadata, idle recovery, and typing behavior patterns.
-                  </p>
-                  <ul className="public-demo-bullets">
-                    <li>No webcam or audio capture</li>
-                    <li>No answer text stored</li>
-                    <li>No clipboard contents stored</li>
-                    <li>No screen recording</li>
-                    <li>Deterministic and explainable risk analysis</li>
-                  </ul>
+                  <p>The demo assessment content could not be loaded safely. Refresh the page to reinitialize the session shell.</p>
+                </div>
+              </section>
+            ) : null}
+
+            {demoDataReady && stage === "welcome" && (
+              <section className="public-demo-card public-demo-stage-card">
+                <div className="public-demo-card-head">
+                  <h2>Welcome</h2>
+                  <span className="demo-status-chip neutral">Privacy-preserving telemetry</span>
+                </div>
+                <div className="public-demo-notice-grid">
+                  <div className="public-demo-copy-block">
+                    <p>
+                      This demo mirrors a real enterprise assessment session. The reviewer console will receive the same
+                      telemetry stream used to build explainable behavioral evidence, correlated suspicious sequences,
+                      and investigation-ready reviewer workflows.
+                    </p>
+                    <ul className="public-demo-bullets">
+                      <li>No webcam or microphone monitoring</li>
+                      <li>No clipboard contents stored</li>
+                      <li>No answer text stored as telemetry</li>
+                      <li>Only metadata from timing, focus, typing rhythm, navigation, and clipboard behavior is analyzed</li>
+                    </ul>
+                  </div>
+                  <div className="public-demo-telemetry-panel">
+                    <div className="public-demo-mini-kicker">Telemetry inputs</div>
+                    <div className="public-demo-mini-grid">
+                      <div className="public-demo-mini-stat"><strong>Focus</strong><span>Blur, return, visibility cycles</span></div>
+                      <div className="public-demo-mini-stat"><strong>Typing</strong><span>Bursts, pauses, recovery timing</span></div>
+                      <div className="public-demo-mini-stat"><strong>Clipboard</strong><span>Metadata only, never contents</span></div>
+                      <div className="public-demo-mini-stat"><strong>Navigation</strong><span>Question revisits and sequencing</span></div>
+                    </div>
+                  </div>
                 </div>
                 <div className="public-demo-consent">
                   <label className="public-demo-checkbox">
                     <input checked={consented} onChange={(event) => setConsented(event.target.checked)} type="checkbox" />
-                    <span>I understand this demo collects behavioral telemetry metadata and does not capture sensitive content.</span>
+                    <span>I understand this demo analyzes behavioral telemetry metadata only and does not capture sensitive content, webcam, audio, or clipboard contents.</span>
                   </label>
                 </div>
                 <div className="public-demo-card-head compact">
@@ -1644,11 +2682,17 @@ function PublicDemoPage({ apiBaseUrl }) {
                       <button
                         className={`public-demo-assessment-card ${active ? "active" : ""}`}
                         key={assessment.id}
-                        onClick={() => setAssessmentId(assessment.id)}
+                        onClick={() => {
+                          setAssessmentId(assessment.id);
+                          if (assessment.isProvenanceValidation) {
+                            setAssessmentSessionSeed(`${Date.now()}`);
+                          }
+                        }}
                         type="button"
                       >
                         <span className="public-demo-assessment-icon"><Icon size={18} /></span>
                         <strong>{assessment.name}</strong>
+                        {assessment.internalBadge ? <span className="demo-status-chip provenance">{assessment.internalBadge}</span> : null}
                         <small>{assessment.intro}</small>
                       </button>
                     );
@@ -1656,93 +2700,575 @@ function PublicDemoPage({ apiBaseUrl }) {
                 </div>
                 {telemetryError ? <div className="workflow-message workflow-message-warning">{telemetryError}</div> : null}
                 <div className="public-demo-actions">
-                  <button className="workflow-action-btn primary" onClick={handleStart} type="button">
+                  <button className="workflow-action-btn primary" onClick={handleContinueToInstructions} type="button">
                     <Play size={16} />
-                    Begin Assessment
+                    Continue to Instructions
                   </button>
                 </div>
               </section>
             )}
 
-            {stage === "assessment" && (
-              <section className="public-demo-card">
+            {demoDataReady && stage === "instructions" && (
+              <section className="public-demo-card public-demo-stage-card">
                 <div className="public-demo-card-head">
                   <div>
                     <span className="report-section-kicker">{selectedAssessment.name}</span>
-                    <h2>{currentQuestion.title}</h2>
+                    <h2>Assessment Instructions</h2>
                   </div>
-                  <span className="demo-status-chip active">{telemetryStatus}</span>
-                </div>
-                <div className="public-demo-progress-head">
-                  <div>
-                    <strong>Question {questionIndex + 1} of {totalQuestions}</strong>
-                    <p>{selectedAssessment.intro}</p>
-                  </div>
-                  <div className="public-demo-timer">
-                    <TimerReset size={16} />
-                    <strong>{formatDuration(timeRemaining)}</strong>
+                  <div className="public-demo-head-badges">
+                    {selectedAssessment.internalBadge ? <span className="demo-status-chip provenance">{selectedAssessment.internalBadge}</span> : null}
+                    <span className="demo-status-chip neutral">Review before submit enabled</span>
                   </div>
                 </div>
-                <div className="public-demo-progress-bar">
-                  <span style={{ width: `${progressPercent}%` }}></span>
+                <div className="public-demo-instructions-grid">
+                  <p>
+                    {selectedAssessment.intro}
+                  </p>
+                  <ul className="public-demo-bullets">
+                    <li>{selectedAssessment.durationMinutes} minute guided demo session</li>
+                    <li>{selectedAssessment.sections.length} sections and {totalQuestions} questions</li>
+                    <li>Use next/back navigation and mark items for review before final submission</li>
+                    <li>Telemetry is generated from timing, focus shifts, clipboard metadata, typing rhythm, and question navigation</li>
+                  </ul>
+                  <div className="public-demo-summary-grid single">
+                    <div className="public-demo-summary-item">
+                      <span>Sections</span>
+                      <strong>{selectedAssessment.sections.map((section) => section.title).join(" • ")}</strong>
+                    </div>
+                    <div className="public-demo-summary-item">
+                      <span>Submit rule</span>
+                      <strong>Review screen appears before final submission</strong>
+                    </div>
+                    <div className="public-demo-summary-item">
+                      <span>Assessment timer</span>
+                      <strong>{selectedAssessment.durationMinutes} minutes</strong>
+                    </div>
+                  </div>
                 </div>
-                <div className="public-demo-question">
-                  <p>{currentQuestion.prompt}</p>
-                  {currentQuestion.type === "textarea" ? (
-                    <textarea
-                      rows={6}
-                      value={answers[currentQuestion.id] || ""}
-                      onChange={(event) => handleAnswerChange(currentQuestion.id, event.target.value)}
-                      placeholder={currentQuestion.placeholder}
-                    />
-                  ) : (
-                    <input
-                      value={answers[currentQuestion.id] || ""}
-                      onChange={(event) => handleAnswerChange(currentQuestion.id, event.target.value)}
-                      placeholder={currentQuestion.placeholder}
-                    />
-                  )}
-                </div>
-                <div className="public-demo-actions spread">
-                  <button
-                    className="workflow-action-btn"
-                    disabled={questionIndex === 0}
-                    onClick={() => setQuestionIndex((prev) => Math.max(0, prev - 1))}
-                    type="button"
-                  >
-                    Previous
+                <div className="public-demo-actions">
+                  <button className="workflow-action-btn" onClick={() => setStage("welcome")} type="button">
+                    Back
                   </button>
-                  <div className="public-demo-inline-hint">
-                    <Lock size={14} />
-                    Try copy/paste, tab switching, short idle gaps, or rapid answering to see reviewer-side telemetry evolve.
-                  </div>
-                  {questionIndex < totalQuestions - 1 ? (
-                    <button
-                      className="workflow-action-btn primary"
-                      onClick={() => setQuestionIndex((prev) => Math.min(totalQuestions - 1, prev + 1))}
-                      type="button"
-                    >
-                      Next
-                    </button>
-                  ) : (
-                    <button className="workflow-action-btn warning" onClick={() => void handleSubmit()} type="button">
-                      Submit Assessment
-                    </button>
-                  )}
+                  <button className="workflow-action-btn primary" onClick={handleStart} type="button">
+                    <Play size={16} />
+                    Start Assessment
+                  </button>
                 </div>
               </section>
             )}
 
-            {stage === "submitted" && (
-              <section className="public-demo-card">
+            {demoDataReady && stage === "assessment" && currentQuestion && (
+              <section className="public-demo-assessment-shell immersive">
+                <header className="public-demo-topbar">
+                  <div className="public-demo-topbar-left">
+                    <div className="public-demo-candidate-pill">
+                      <span className="public-demo-candidate-avatar">{(candidateName || "PQ").slice(0, 2).toUpperCase()}</span>
+                      <div>
+                        <strong>{candidateName || "Demo Candidate"}</strong>
+                        <small>{selectedAssessment.name}</small>
+                      </div>
+                    </div>
+                    <div className="public-demo-compact-progress">
+                      <span>Assessment Progress</span>
+                      <strong>{questionIndex + 1} / {totalQuestions}</strong>
+                      <div className="public-demo-progress-track slim">
+                        <span style={{ width: `${((questionIndex + 1) / Math.max(1, totalQuestions)) * 100}%` }}></span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="public-demo-topbar-right">
+                    <div className="public-demo-topbar-chip">
+                      {connectionStable ? <Wifi size={15} /> : <WifiOff size={15} />}
+                      <span>{connectionStable ? "Connection stable" : "Reconnecting"}</span>
+                    </div>
+                    <div className="public-demo-topbar-chip">
+                      <Activity size={15} />
+                      <span>Assessment integrity active</span>
+                    </div>
+                    <div className="public-demo-topbar-chip">
+                      <CheckCheck size={15} />
+                      <span>Auto-save enabled</span>
+                    </div>
+                    {selectedAssessment.internalBadge ? (
+                      <div className="public-demo-topbar-chip provenance">
+                        <Lock size={15} />
+                        <span>{selectedAssessment.internalBadge}</span>
+                      </div>
+                    ) : null}
+                    <div className="public-demo-timer premium">
+                      <TimerReset size={16} />
+                      <strong>{formatDuration(timeRemaining)}</strong>
+                    </div>
+                    <button className="public-demo-icon-btn" onClick={() => void handleToggleFullscreen()} type="button">
+                      {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                    </button>
+                  </div>
+                </header>
+
+                <div className="public-demo-assessment-body">
+                  <aside className="public-demo-assessment-sidebar">
+                    <section className="public-demo-sidebar-panel">
+                      <div className="public-demo-sidebar-heading">
+                        <span>Section progress</span>
+                        <strong>{currentSectionSummary?.label || currentSection?.title}</strong>
+                      </div>
+                      <div className="public-demo-section-list">
+                        {sectionSummaries.map((section) => {
+                          const Icon = section.icon;
+                          const firstQuestionIndex = flatQuestions.findIndex((question) => question.sectionId === section.id);
+                          const active = currentSection?.id === section.id;
+                          return (
+                            <button
+                              key={section.id}
+                              className={`public-demo-section-card ${active ? "active" : ""} ${section.accent || ""}`}
+                              onClick={() => goToQuestion(firstQuestionIndex)}
+                              type="button"
+                            >
+                              <span className="public-demo-section-icon"><Icon size={16} /></span>
+                              <div>
+                                <strong>{section.label}</strong>
+                                <small>{section.subtitle}</small>
+                              </div>
+                              <div className="public-demo-section-stats">
+                                <span>{section.estimate}</span>
+                                <span>{section.answered}/{section.total}</span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+
+                    <section className="public-demo-sidebar-panel">
+                      <div className="public-demo-sidebar-heading">
+                        <span>Question navigator</span>
+                        <strong>{answeredCount} answered</strong>
+                      </div>
+                      <div className="public-demo-question-strip">
+                        {flatQuestions.map((question, index) => {
+                          const chipState = getQuestionCompletionState(question, answers[question.id], index === questionIndex, Boolean(markedForReview[question.id]));
+                          return (
+                            <button
+                              key={question.id}
+                              className={`public-demo-question-index ${chipState}`}
+                              onClick={() => goToQuestion(index)}
+                              type="button"
+                              title={`${question.displayNumber} · ${question.title}`}
+                            >
+                              {index + 1}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+
+                    <section className="public-demo-sidebar-panel subtle">
+                      <div className="public-demo-sidebar-heading">
+                        <span>Session overview</span>
+                        <strong>{telemetryStatus}</strong>
+                      </div>
+                      <div className="public-demo-session-grid">
+                        <div className="public-demo-session-stat">
+                          <span>Attempt ID</span>
+                          <strong>{attemptId}</strong>
+                        </div>
+                        <div className="public-demo-session-stat">
+                          <span>Current section</span>
+                          <strong>{currentSectionSummary?.label || currentSection?.title}</strong>
+                        </div>
+                        <div className="public-demo-session-stat">
+                          <span>Review flags</span>
+                          <strong>{markedCount}</strong>
+                        </div>
+                      </div>
+                    </section>
+                  </aside>
+
+                  <div className="public-demo-workspace">
+                    <div className={`public-demo-workspace-header ${currentSectionSummary?.accent || ""}`}>
+                      <div>
+                        <span className="report-section-kicker">{currentSectionSummary?.label || currentSection?.title}</span>
+                        <h2>{currentQuestion.title}</h2>
+                        <p>{currentSection?.subtitle}</p>
+                        {currentQuestion?.category ? <small>{currentQuestion.category}</small> : null}
+                      </div>
+                      <div className="public-demo-workspace-meta">
+                        <span>{currentQuestion.displayNumber}</span>
+                        <span>{currentQuestion.difficulty}</span>
+                        <span>{currentSectionSummary?.answered || 0}/{currentSectionSummary?.total || 0} complete</span>
+                      </div>
+                    </div>
+
+                    <div className="public-demo-progress-track">
+                      <span style={{ width: `${currentSectionProgress}%` }}></span>
+                    </div>
+
+                    {currentQuestion.inputType === "code" ? (
+                      <div className="public-demo-coding-shell">
+                        <section className="public-demo-problem-panel">
+                          <div className="public-demo-problem-block">
+                            <div className="public-demo-question-meta premium">
+                              <span>{currentQuestion.displayNumber}</span>
+                              <span>{currentSectionSummary?.label || currentSection?.title}</span>
+                              <span>{currentQuestion.difficulty}</span>
+                            </div>
+                            <p>{currentQuestion.prompt}</p>
+                          </div>
+                          {currentQuestion.snippet ? (
+                            <div className="public-demo-problem-block">
+                              <div className="public-demo-problem-label">Reference context</div>
+                              <pre className={`public-demo-snippet language-${currentQuestion.snippetLanguage || "text"}`}>
+                                <code>{currentQuestion.snippet}</code>
+                              </pre>
+                            </div>
+                          ) : null}
+                          <div className="public-demo-problem-grid">
+                            <div className="public-demo-problem-block">
+                              <div className="public-demo-problem-label">Constraints</div>
+                              <ul className="public-demo-bullets compact">
+                                {(currentQuestion.constraints || []).map((item) => <li key={item}>{item}</li>)}
+                              </ul>
+                            </div>
+                            <div className="public-demo-problem-block">
+                              <div className="public-demo-problem-label">Examples</div>
+                              <ul className="public-demo-bullets compact">
+                                {(currentQuestion.examples || []).map((item) => <li key={item}>{item}</li>)}
+                              </ul>
+                            </div>
+                          </div>
+                          <div className="public-demo-tag-row">
+                            {(currentQuestion.tags || []).map((tag) => <span className="public-demo-chip" key={tag}>{tag}</span>)}
+                          </div>
+                          <div className="public-demo-answer-signals coding">
+                            <span className="public-demo-mini-kicker">Expected behavioral signals</span>
+                            <div className="public-demo-chip-row">
+                              {(currentSection?.telemetryFocus || []).map((item) => (
+                                <span className="public-demo-chip" key={item}>{item}</span>
+                              ))}
+                            </div>
+                            <p>{currentQuestion.expectedBehavior}</p>
+                          </div>
+                        </section>
+
+                        <section className="public-demo-editor-panel">
+                          <div className="public-demo-editor-toolbar">
+                            <div className="public-demo-editor-toolbar-group">
+                              <span className="public-demo-problem-label">Language</span>
+                              <select
+                                value={currentEditorLanguage}
+                                onChange={(event) => setEditorLanguageByQuestion((prev) => ({ ...prev, [currentQuestion.id]: event.target.value }))}
+                              >
+                                {(currentQuestion.languageOptions || [currentQuestion.snippetLanguage || "javascript"]).map((lang) => (
+                                  <option key={lang} value={lang}>{lang.toUpperCase()}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="public-demo-editor-toolbar-group status">
+                              <span>Session active</span>
+                              <span>Auto-save enabled</span>
+                            </div>
+                          </div>
+                          <DemoMonacoEditor
+                            language={currentEditorLanguage}
+                            value={currentQuestionAnswer || currentQuestion.starterCode?.[currentEditorLanguage] || ""}
+                            onChange={(nextValue) => handleAnswerChange(currentQuestion.id, nextValue)}
+                          />
+                          <div className="public-demo-editor-footer">
+                            <div className="public-demo-editor-console">
+                              <strong>Execution panel</strong>
+                              <small>{editorConsoleByQuestion[currentQuestion.id]?.message || "Use this space to reason through the prompt and validate your final response before continuing."}</small>
+                              <input
+                                className="public-demo-custom-input"
+                                value={customInputByQuestion[currentQuestion.id] || ""}
+                                onChange={(event) => setCustomInputByQuestion((prev) => ({ ...prev, [currentQuestion.id]: event.target.value }))}
+                                placeholder="Optional custom input for your local execution preview"
+                              />
+                            </div>
+                            <div className="public-demo-editor-actions">
+                              <button className="workflow-action-btn" onClick={() => handleToggleReview(currentQuestion)} type="button">
+                                {markedForReview[currentQuestion.id] ? "Unmark Review" : "Mark for Review"}
+                              </button>
+                              <button className="workflow-action-btn" onClick={handleDemoRun} type="button">Run</button>
+                              {questionIndex < totalQuestions - 1 ? (
+                                <button className="workflow-action-btn primary" onClick={handleAdvanceQuestion} type="button">
+                                  Save & Next
+                                </button>
+                              ) : (
+                                <button className="workflow-action-btn warning" onClick={handleOpenReview} type="button">
+                                  Review Before Submit
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        </section>
+                      </div>
+                    ) : (
+                      <div className="public-demo-question-stage">
+                        <div className="public-demo-question-card premium">
+                          <div className="public-demo-question-meta premium">
+                            <span>{currentQuestion.displayNumber}</span>
+                            <span>{currentSectionSummary?.label || currentSection?.title}</span>
+                            <span>{currentQuestion.difficulty}</span>
+                          </div>
+                          <div className="public-demo-question">
+                            <p>{currentQuestion.prompt}</p>
+                            {currentQuestion.snippet ? (
+                              <pre className={`public-demo-snippet language-${currentQuestion.snippetLanguage || "text"}`}>
+                                <code>{currentQuestion.snippet}</code>
+                              </pre>
+                            ) : null}
+                            {currentQuestion.inputType === "mcq" ? (
+                              <div className="public-demo-option-list premium" role="radiogroup" aria-label={currentQuestion.title}>
+                                {currentQuestion.options.map((option, optionIndex) => {
+                                  const checked = answers[currentQuestion.id] === option;
+                                  return (
+                                    <label
+                                      className={`public-demo-option premium ${checked ? "active" : ""}`}
+                                      key={option}
+                                      onKeyDown={(event) => handleMcqKeyDown(event, currentQuestion, optionIndex)}
+                                      tabIndex={0}
+                                    >
+                                      <input
+                                        checked={checked}
+                                        name={currentQuestion.id}
+                                        onChange={() => handleAnswerChange(currentQuestion.id, option)}
+                                        type="radio"
+                                      />
+                                      <span className="public-demo-option-marker">{String.fromCharCode(65 + optionIndex)}</span>
+                                      <span>{option}</span>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            ) : currentQuestion.inputType === "textarea" ? (
+                              <textarea
+                                rows={8}
+                                value={currentQuestionAnswer}
+                                onChange={(event) => handleAnswerChange(currentQuestion.id, event.target.value)}
+                                placeholder={currentQuestion.placeholder}
+                              />
+                            ) : (
+                              <input
+                                value={currentQuestionAnswer}
+                                onChange={(event) => handleAnswerChange(currentQuestion.id, event.target.value)}
+                                placeholder={currentQuestion.placeholder}
+                              />
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="public-demo-answer-footer elevated">
+                          <div className="public-demo-answer-signals">
+                            <span className="public-demo-mini-kicker">Expected behavioral signals</span>
+                            <div className="public-demo-chip-row">
+                              {(currentSection?.telemetryFocus || []).map((item) => (
+                                <span className="public-demo-chip" key={item}>{item}</span>
+                              ))}
+                            </div>
+                            <p>{currentQuestion.expectedBehavior}</p>
+                          </div>
+                          <div className="public-demo-actions">
+                            <button className="workflow-action-btn" onClick={() => handleToggleReview(currentQuestion)} type="button">
+                              {markedForReview[currentQuestion.id] ? "Unmark Review" : "Mark for Review"}
+                            </button>
+                            <button className="workflow-action-btn" disabled={questionIndex === 0} onClick={() => goToQuestion(questionIndex - 1)} type="button">
+                              Previous
+                            </button>
+                            {questionIndex < totalQuestions - 1 ? (
+                              <button className="workflow-action-btn primary" onClick={handleAdvanceQuestion} type="button">
+                                Save & Next
+                              </button>
+                            ) : (
+                              <button className="workflow-action-btn warning" onClick={handleOpenReview} type="button">
+                                Review Before Submit
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <aside className="public-demo-assessment-info-rail">
+                    <DemoInfoRail
+                      telemetryStatus={telemetryStatus}
+                      candidateId={candidateId}
+                      apiBaseUrl={apiBaseUrl}
+                      selectedAssessment={selectedAssessment}
+                      totalQuestions={totalQuestions}
+                      telemetryError={telemetryError}
+                    />
+                  </aside>
+                </div>
+
+                {sectionCompletion ? (
+                  <div className="public-demo-section-modal-backdrop">
+                    <div className="public-demo-section-modal">
+                      <span className="report-section-kicker">Section completed</span>
+                      <h3>{sectionCompletion.completedSection?.label || sectionCompletion.completedSection?.title}</h3>
+                      <p>
+                        You’ve completed this section. Review your progress, then continue into the next phase of the assessment.
+                      </p>
+                      <div className="public-demo-summary-grid">
+                        <div className="public-demo-summary-item">
+                          <span>Answered</span>
+                          <strong>{sectionCompletion.answered}</strong>
+                        </div>
+                        <div className="public-demo-summary-item">
+                          <span>Skipped</span>
+                          <strong>{sectionCompletion.skipped}</strong>
+                        </div>
+                        <div className="public-demo-summary-item">
+                          <span>Upcoming</span>
+                          <strong>{sectionCompletion.upcomingSection?.label || sectionCompletion.upcomingSection?.title}</strong>
+                        </div>
+                        <div className="public-demo-summary-item">
+                          <span>Remaining Time</span>
+                          <strong>{formatDuration(timeRemaining)}</strong>
+                        </div>
+                      </div>
+                      <div className="public-demo-progress-track completion">
+                        <span style={{ width: `${((sectionCompletion.nextIndex) / Math.max(1, totalQuestions)) * 100}%` }}></span>
+                      </div>
+                      <div className="public-demo-actions">
+                        <button className="workflow-action-btn" onClick={() => setSectionCompletion(null)} type="button">
+                          Stay Here
+                        </button>
+                        <button
+                          className="workflow-action-btn primary"
+                          onClick={() => {
+                            goToQuestion(sectionCompletion.nextIndex);
+                            setSectionCompletion(null);
+                          }}
+                          type="button"
+                        >
+                          Continue to Next Section
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+            )}
+
+            {demoDataReady && stage === "review" && (
+              <section className="public-demo-card public-demo-stage-card">
+                <div className="public-demo-card-head">
+                  <div>
+                    <span className="report-section-kicker">{selectedAssessment.name}</span>
+                    <h2>Review Before Submit</h2>
+                  </div>
+                  <span className="demo-status-chip active">Final check</span>
+                </div>
+                <div className="public-demo-summary-grid">
+                  <div className="public-demo-summary-item">
+                    <span>Answered</span>
+                    <strong>{answeredCount} / {totalQuestions}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Unanswered</span>
+                    <strong>{unansweredCount}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Marked for Review</span>
+                    <strong>{markedCount}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Time Remaining</span>
+                    <strong>{formatDuration(timeRemaining)}</strong>
+                  </div>
+                </div>
+                <div className="public-demo-review-board">
+                  {sectionSummaries.map((section) => (
+                    <div className="public-demo-review-section" key={section.id}>
+                      <div className="public-demo-review-head">
+                        <div>
+                          <strong>{section.order}. {section.title}</strong>
+                          <small>{section.answered}/{section.total} answered</small>
+                        </div>
+                        <span>{section.marked} marked</span>
+                      </div>
+                      <div className="public-demo-review-list">
+                        {section.questions.map((question) => {
+                          const answered = isDemoAnswerFilled(question, answers[question.id]);
+                          return (
+                            <button
+                              className={`public-demo-review-row ${answered ? "answered" : ""}`}
+                              key={question.id}
+                              onClick={() => {
+                                goToQuestion(flatQuestions.findIndex((item) => item.id === question.id));
+                                setStage("assessment");
+                              }}
+                              type="button"
+                            >
+                              <div>
+                                <strong>{question.displayNumber} · {question.title}</strong>
+                                <small>{question.difficulty}</small>
+                              </div>
+                              <div className="public-demo-review-tags">
+                                {!answered ? <span className="public-demo-review-chip warning">Unanswered</span> : null}
+                                {markedForReview[question.id] ? <span className="public-demo-review-chip">Marked</span> : null}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="public-demo-actions">
+                  <button className="workflow-action-btn" onClick={() => setStage("assessment")} type="button">
+                    Back to Questions
+                  </button>
+                  <button className="workflow-action-btn warning" disabled={submissionBusy} onClick={() => void handleSubmit()} type="button">
+                    {submissionBusy ? "Submitting..." : "Submit Final Attempt"}
+                  </button>
+                </div>
+              </section>
+            )}
+
+            {demoDataReady && stage === "submitting" && (
+              <section className="public-demo-card public-demo-stage-card">
+                <div className="public-demo-card-head">
+                  <h2>Submitting assessment</h2>
+                  <span className="demo-status-chip active">Processing</span>
+                </div>
+                <div className="public-demo-copy-block">
+                  <p>
+                    ProctorIQ is finalizing telemetry delivery, analyzing behavioral signals, and preparing the reviewer-facing investigation record.
+                  </p>
+                </div>
+                <div className="public-demo-summary-grid">
+                  <div className="public-demo-summary-item">
+                    <span>Attempt ID</span>
+                    <strong>{attemptId}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Current Step</span>
+                    <strong>{submissionMessage || "Submitting assessment..."}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Assessment Track</span>
+                    <strong>{selectedAssessment.name}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Status</span>
+                    <strong>{telemetryStatus}</strong>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {demoDataReady && stage === "submitted" && (
+              <section className="public-demo-card public-demo-stage-card">
                 <div className="public-demo-card-head">
                   <h2>Assessment submitted</h2>
                   <span className="demo-status-chip success">Telemetry delivered</span>
                 </div>
                 <div className="public-demo-copy-block">
                   <p>
-                    The assessment session has been submitted. Reviewer dashboards can now inspect the attempt,
-                    generated evidence, and real-time risk history.
+                    The assessment session is now available to the reviewer console. Risk history, evidence, and any
+                    correlated suspicious sequences will appear in the Command Center, Review Queue, and Investigation Report if generated by the session.
                   </p>
                 </div>
                 <div className="public-demo-summary-grid">
@@ -1755,12 +3281,16 @@ function PublicDemoPage({ apiBaseUrl }) {
                     <strong>{candidateName || "—"}</strong>
                   </div>
                   <div className="public-demo-summary-item">
-                    <span>Assessment</span>
+                    <span>Assessment Track</span>
                     <strong>{selectedAssessment.name}</strong>
                   </div>
                   <div className="public-demo-summary-item">
                     <span>Submitted</span>
                     <strong>{formatDateTime(submittedAt)}</strong>
+                  </div>
+                  <div className="public-demo-summary-item">
+                    <span>Submission Status</span>
+                    <strong>{submissionMessage || "Assessment submitted successfully"}</strong>
                   </div>
                 </div>
                 <div className="public-demo-actions">
@@ -1776,54 +3306,18 @@ function PublicDemoPage({ apiBaseUrl }) {
             )}
           </div>
 
-          <aside className="public-demo-sidebar">
-            <section className="public-demo-card compact">
-              <div className="public-demo-card-head compact">
-                <h3>What telemetry is collected?</h3>
-              </div>
-              <ul className="public-demo-bullets compact">
-                <li>Focus loss and visibility changes</li>
-                <li>Clipboard copy/paste metadata</li>
-                <li>Question timing and answer change timing</li>
-                <li>Idle recovery and typing rhythm metadata</li>
-                <li>Correlated suspicious event sequences</li>
-              </ul>
-            </section>
-
-            <section className="public-demo-card compact">
-              <div className="public-demo-card-head compact">
-                <h3>Privacy notice</h3>
-              </div>
-              <ul className="public-demo-bullets compact">
-                <li>No webcam monitoring</li>
-                <li>No microphone recording</li>
-                <li>No answer text stored</li>
-                <li>No clipboard contents stored</li>
-                <li>No screen recording</li>
-              </ul>
-            </section>
-
-            <section className="public-demo-card compact">
-              <div className="public-demo-card-head compact">
-                <h3>Demo session</h3>
-              </div>
-              <div className="public-demo-summary-grid single">
-                <div className="public-demo-summary-item">
-                  <span>Telemetry Status</span>
-                  <strong>{telemetryStatus}</strong>
-                </div>
-                <div className="public-demo-summary-item">
-                  <span>Candidate ID</span>
-                  <strong>{candidateId || "Generated on start"}</strong>
-                </div>
-                <div className="public-demo-summary-item">
-                  <span>Backend</span>
-                  <strong>{apiBaseUrl}</strong>
-                </div>
-              </div>
-              {telemetryError ? <div className="workflow-message workflow-message-warning">{telemetryError}</div> : null}
-            </section>
-          </aside>
+          {stage !== "assessment" ? (
+            <aside className="public-demo-sidebar">
+              <DemoInfoRail
+                telemetryStatus={telemetryStatus}
+                candidateId={candidateId}
+                apiBaseUrl={apiBaseUrl}
+                selectedAssessment={selectedAssessment}
+                totalQuestions={totalQuestions}
+                telemetryError={telemetryError}
+              />
+            </aside>
+          ) : null}
         </section>
       </div>
     </div>
@@ -1832,13 +3326,15 @@ function PublicDemoPage({ apiBaseUrl }) {
 
 export default function App() {
   const isPublicDemoRoute = typeof window !== "undefined" && window.location.pathname.replace(/\/+$/, "") === "/demo";
-  const [page, setPage] = useState("dashboard");
+  const initialReportAttemptId = !isPublicDemoRoute ? getReportAttemptIdFromLocation() : "";
+  const [page, setPage] = useState(() => (initialReportAttemptId ? "report" : "dashboard"));
   const [logs, setLogs] = useState([]);
   const [cases, setCases] = useState([]);
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [reviewQueuePayload, setReviewQueuePayload] = useState(null);
   const [caseAccessError, setCaseAccessError] = useState("");
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(() => (initialReportAttemptId ? { attempt_id: initialReportAttemptId } : null));
+  const [reportAttemptId, setReportAttemptId] = useState(initialReportAttemptId);
   const [loading, setLoading] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [wsState, setWsState] = useState("paused");
@@ -1849,17 +3345,16 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
-  const [themeMode, setThemeMode] = useState(() => getStoredSetting("riskintel_theme_mode", "dark"));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => getStoredSetting("riskintel_sidebar_collapsed", "false") === "true");
   const [autoRefreshInterval, setAutoRefreshInterval] = useState(() => getStoredSetting("riskintel_auto_refresh", "30"));
   const [liveUpdatesEnabled, setLiveUpdatesEnabled] = useState(() => getStoredSetting("riskintel_live_updates", "true") === "true");
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => getStoredSetting("riskintel_notifications", "true") === "true");
 
   useEffect(() => {
-    document.documentElement.dataset.theme = isPublicDemoRoute ? "dark" : themeMode;
-    if (!isPublicDemoRoute) {
-      setStoredSetting("riskintel_theme_mode", themeMode);
-    }
-  }, [isPublicDemoRoute, themeMode]);
+    document.documentElement.dataset.theme = "dark";
+    document.documentElement.classList.add("dark");
+    document.documentElement.classList.remove("light");
+  }, []);
 
   const logout = useCallback(() => {
     window.clearTimeout(reviewerRefreshTimerId);
@@ -1869,11 +3364,17 @@ export default function App() {
     setCurrentUser(null);
     setCases([]);
     setReviewQueuePayload(null);
+    setReportAttemptId("");
     setSelected(null);
     setPage("dashboard");
   }, []);
 
   const fetchLogs = useCallback(async () => {
+    if (!token || !liveUpdatesEnabled) {
+      setLogs([]);
+      setLoading(false);
+      return;
+    }
     try {
       setLoading(true);
       const res = await fetch(API_URL, {
@@ -1957,16 +3458,94 @@ export default function App() {
       console.error("Failed to fetch review queue:", err);
       setReviewQueuePayload(null);
     }
-  }, [logout, token]);
+  }, [liveUpdatesEnabled, logout, token]);
+
+  const caseByAttemptId = useMemo(() => {
+    return Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
+  }, [cases]);
+
+  const reviewQueueAttemptById = useMemo(() => {
+    if (!Array.isArray(reviewQueuePayload?.data)) return {};
+    return Object.fromEntries(
+      reviewQueuePayload.data.map((row) => [
+        row.attempt_id,
+        buildReportSelectionFallback({
+          attempt_id: row.attempt_id,
+          candidate_name: row.candidate_name,
+          candidate_email: row.candidate_email,
+          assessment_name: row.assessment_name,
+          risk_score: row.risk_score,
+          confidence: row.confidence,
+          risk_level: row.risk_level,
+          last_activity: row.last_activity,
+          event_count: row.event_count,
+          status: row.case_status,
+        }),
+      ]),
+    );
+  }, [reviewQueuePayload]);
+
+  const resolveAttemptSelection = useCallback((target, explicitAttemptId = "") => {
+    const attemptId = explicitAttemptId
+      || (typeof target === "string" ? target : "")
+      || target?.attempt_id
+      || target?.attemptId
+      || target?.item?.attempt_id
+      || target?.caseRecord?.attempt_id
+      || "";
+    if (!attemptId) return null;
+    return (
+      target?.item
+      || (target?.attempt_id ? target : null)
+      || logs.find((item) => item.attempt_id === attemptId)
+      || reviewQueueAttemptById[attemptId]
+      || buildReportSelectionFallback(caseByAttemptId[attemptId], attemptId)
+      || buildReportSelectionFallback(target, attemptId)
+      || { attempt_id: attemptId }
+    );
+  }, [caseByAttemptId, logs, reviewQueueAttemptById]);
+
+  const openReportForAttempt = useCallback((target, explicitAttemptId = "") => {
+    const resolved = resolveAttemptSelection(target, explicitAttemptId);
+    const attemptId = resolved?.attempt_id || explicitAttemptId || (typeof target === "string" ? target : "");
+    setReportAttemptId(attemptId || "");
+    setSelected(resolved);
+    setPage("report");
+  }, [resolveAttemptSelection]);
+
+  const navigateToPage = useCallback((nextPage) => {
+    if (nextPage !== "report") {
+      setReportAttemptId("");
+    }
+    setPage(nextPage);
+  }, []);
 
   const scheduleReviewerRefresh = useCallback((delayMs = 1200) => {
-    if (!token || reviewerRefreshTimerId !== null) return;
+    if (!token) return;
+    const requestedDelayMs = Math.max(0, Number(delayMs) || 0);
+    const nextDueAt = Date.now() + requestedDelayMs;
+    if (reviewerRefreshTimerId !== null) {
+      if (reviewerRefreshDueAtMs <= nextDueAt) return;
+      window.clearTimeout(reviewerRefreshTimerId);
+      reviewerRefreshTimerId = null;
+    }
+    reviewerRefreshDueAtMs = nextDueAt;
     reviewerRefreshTimerId = window.setTimeout(() => {
       reviewerRefreshTimerId = null;
-      void fetchCases();
-      void fetchDashboardSummary();
-      void fetchReviewQueue();
-    }, delayMs);
+      reviewerRefreshDueAtMs = 0;
+      const refreshStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+      void Promise.allSettled([
+        fetchCases(),
+        fetchDashboardSummary(),
+        fetchReviewQueue(),
+      ]).then(() => {
+        const refreshDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - refreshStartedAt;
+        console.info("[Reviewer Refresh Timing]", {
+          durationMs: Math.round(refreshDurationMs),
+          triggerDelayMs: requestedDelayMs,
+        });
+      });
+    }, requestedDelayMs);
   }, [fetchCases, fetchDashboardSummary, fetchReviewQueue, token]);
 
   const performCaseAction = useCallback(async ({ caseId, endpoint, body }) => {
@@ -2030,8 +3609,55 @@ export default function App() {
   }, [liveUpdatesEnabled]);
 
   useEffect(() => {
+    if (!liveUpdatesEnabled) {
+      setLogs([]);
+    }
+  }, [liveUpdatesEnabled]);
+
+  useEffect(() => {
     setStoredSetting("riskintel_notifications", notificationsEnabled);
   }, [notificationsEnabled]);
+
+  useEffect(() => {
+    if (isPublicDemoRoute) return undefined;
+    const handlePopState = () => {
+      const nextAttemptId = getReportAttemptIdFromLocation();
+      setReportAttemptId(nextAttemptId);
+      if (nextAttemptId) {
+        setPage("report");
+      }
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [isPublicDemoRoute]);
+
+  useEffect(() => {
+    if (isPublicDemoRoute) return;
+    const activeAttemptId = page === "report" ? (selected?.attempt_id || reportAttemptId) : "";
+    replaceReportAttemptIdInLocation(activeAttemptId);
+  }, [isPublicDemoRoute, page, reportAttemptId, selected?.attempt_id]);
+
+  useEffect(() => {
+    if (isPublicDemoRoute) return;
+    if (!reportAttemptId) return;
+    if (page !== "report") return;
+    if (selected?.attempt_id === reportAttemptId && selected?.candidate_name) return;
+    const resolved = resolveAttemptSelection(reportAttemptId, reportAttemptId);
+    if (resolved) {
+      setSelected((prev) => {
+        if (prev?.attempt_id === reportAttemptId && prev?.candidate_name && resolved?.candidate_name) {
+          return prev;
+        }
+        return resolved;
+      });
+    }
+  }, [isPublicDemoRoute, page, reportAttemptId, resolveAttemptSelection, selected?.attempt_id, selected?.candidate_name]);
+
+  useEffect(() => {
+    setStoredSetting("riskintel_sidebar_collapsed", sidebarCollapsed ? "true" : "false");
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2060,7 +3686,7 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
     const timeoutId = window.setTimeout(() => {
-      if (token) void fetchLogs();
+      if (token && liveUpdatesEnabled) void fetchLogs();
       scheduleReviewerRefresh(0);
     }, 0);
     if (!liveUpdatesEnabled) {
@@ -2113,10 +3739,14 @@ export default function App() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          if (data.type === "attempt_submitted" || data.type === "case_created_or_updated") {
+            scheduleReviewerRefresh(250);
+            return;
+          }
           if (data.type !== "risk_update") return;
 
           const newLog = {
-            timestamp: new Date().toISOString(),
+            timestamp: data.latest_event?.occurred_at || data.timeline_point?.timestamp || new Date().toISOString(),
             attempt_id: data.attempt_id,
             candidate_id: data.candidate_id,
             candidate_name: data.candidate_name,
@@ -2134,6 +3764,7 @@ export default function App() {
             features: data.features || {},
             signals: data.signals || {},
           };
+          const latestEventType = String(data.latest_event?.event_type || "").toLowerCase();
 
           setLogs((prev) => {
             const exists = prev.some((x) => x.attempt_id === newLog.attempt_id);
@@ -2144,7 +3775,9 @@ export default function App() {
           });
 
           setSelected((prev) => (prev?.attempt_id === newLog.attempt_id ? { ...prev, ...newLog } : prev || newLog));
-          scheduleReviewerRefresh();
+          scheduleReviewerRefresh(
+            ["exam_submitted", "assessment_submitted", "submit", "completed"].includes(latestEventType) ? 250 : 900,
+          );
         } catch (err) {
           console.error("WS parse error:", err);
         }
@@ -2159,6 +3792,7 @@ export default function App() {
       window.clearTimeout(reconnectTimerId);
       window.clearTimeout(reviewerRefreshTimerId);
       reviewerRefreshTimerId = null;
+      reviewerRefreshDueAtMs = 0;
       setWsState("paused");
       if (ws && ws.readyState < WebSocket.CLOSING) {
         ws.close();
@@ -2171,7 +3805,9 @@ export default function App() {
     const seconds = Number(autoRefreshInterval);
     if (!Number.isFinite(seconds) || seconds <= 0) return;
     const intervalId = window.setInterval(() => {
-      void fetchLogs();
+      if (liveUpdatesEnabled) {
+        void fetchLogs();
+      }
       void fetchCases();
       void fetchDashboardSummary();
       void fetchReviewQueue();
@@ -2179,11 +3815,7 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [autoRefreshInterval, fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, token]);
-
-  const caseByAttemptId = useMemo(() => {
-    return Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
-  }, [cases]);
+  }, [autoRefreshInterval, fetchCases, fetchDashboardSummary, fetchLogs, fetchReviewQueue, liveUpdatesEnabled, token]);
 
   const selectedCase = useMemo(() => {
     if (!selected?.attempt_id) return null;
@@ -2246,8 +3878,11 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
+    <div
+      className="app-shell"
+      style={{ "--sidebar-width": `${sidebarCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH}px` }}
+    >
+      <aside className={`sidebar${sidebarCollapsed ? " collapsed" : ""}`}>
         <div className="sidebar-top">
           <div className="sidebar-brand">
             <ProctorIQLogo className="brand-mark brand-mark-proctoriq" />
@@ -2255,30 +3890,41 @@ export default function App() {
               <h2>ProctorIQ</h2>
               <p>Assessment Integrity Console</p>
             </div>
+            <button
+              className="sidebar-collapse-btn"
+              type="button"
+              onClick={() => setSidebarCollapsed((value) => !value)}
+              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              {sidebarCollapsed ? <ArrowRight size={16} /> : <ArrowLeft size={16} />}
+            </button>
           </div>
         </div>
 
         <nav className="nav">
-          <button className={page === "dashboard" ? "active" : ""} onClick={() => setPage("dashboard")}>
+          <button className={page === "dashboard" ? "active" : ""} onClick={() => navigateToPage("dashboard")} title="Command Center">
             <Home size={18} />
             <span>Command Center</span>
           </button>
-          <button className={page === "queue" ? "active" : ""} onClick={() => setPage("queue")}>
+          <button className={page === "queue" ? "active" : ""} onClick={() => navigateToPage("queue")} title="Review Queue">
             <ListChecks size={18} />
             <span>Review Queue</span>
           </button>
-          <button className={page === "report" ? "active" : ""} onClick={() => setPage("report")}>
+          <button className={page === "report" ? "active" : ""} onClick={() => navigateToPage("report")} title="Investigation">
             <ShieldAlert size={18} />
             <span>Investigation</span>
           </button>
-          <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>
+          <button className={page === "settings" ? "active" : ""} onClick={() => navigateToPage("settings")} title="Settings">
             <Settings size={18} />
             <span>Settings</span>
           </button>
         </nav>
 
+        <div className="sidebar-spacer"></div>
+
         <div className="sidebar-footer">
-          <div className={`connection-card ${wsConnected ? "online" : "offline"}`}>
+          <div className={`connection-card ${wsConnected ? "online" : "offline"}`} title={wsStatusLabel}>
             <div className="connection-card-row">
               <span className="pulse"></span>
               <strong>{wsStatusLabel}</strong>
@@ -2288,7 +3934,7 @@ export default function App() {
 
           {currentUser ? (
             <div className="sidebar-user-panel">
-              <button className="sidebar-user-card" type="button">
+              <button className="sidebar-user-card" type="button" title={currentUser.full_name || currentUser.email}>
                 <span className="sidebar-user-avatar">{getInitials(currentUser.full_name || currentUser.email)}</span>
                 <span className="sidebar-user-copy">
                   <strong>{currentUser.full_name || currentUser.email}</strong>
@@ -2296,7 +3942,7 @@ export default function App() {
                 </span>
                 <ChevronDown size={16} />
               </button>
-              <button className="sidebar-logout-btn" onClick={logout} type="button">
+              <button className="sidebar-logout-btn" onClick={logout} type="button" title="Logout">
                 <ArrowRight size={16} /> Logout
               </button>
             </div>
@@ -2312,11 +3958,12 @@ export default function App() {
             stats={stats}
             dashboardSummary={dashboardSummary}
             currentUser={currentUser}
-            setSelected={setSelected}
-            setPage={setPage}
+            onOpenReport={openReportForAttempt}
+            setPage={navigateToPage}
             loading={loading}
             wsConnected={wsConnected}
             wsState={wsState}
+            liveUpdatesEnabled={liveUpdatesEnabled}
           />
         )}
 
@@ -2329,12 +3976,13 @@ export default function App() {
             caseAccessError={caseAccessError}
             currentUser={currentUser}
             onRefresh={() => {
-              void fetchLogs();
+              if (liveUpdatesEnabled) {
+                void fetchLogs();
+              }
               void fetchCases();
               void fetchReviewQueue();
             }}
-            setSelected={setSelected}
-            setPage={setPage}
+            onOpenReport={openReportForAttempt}
           />
         )}
 
@@ -2347,7 +3995,7 @@ export default function App() {
             currentUser={currentUser}
             onUnauthorized={logout}
             onCaseAction={performCaseAction}
-            onBack={() => setPage("queue")}
+            onBack={() => navigateToPage("queue")}
           />
         )}
 
@@ -2357,8 +4005,6 @@ export default function App() {
             apiBaseUrl={API_BASE_URL}
             wsConnected={wsConnected}
             wsState={wsState}
-            themeMode={themeMode}
-            onThemeModeChange={setThemeMode}
             autoRefreshInterval={autoRefreshInterval}
             onAutoRefreshIntervalChange={setAutoRefreshInterval}
             liveUpdatesEnabled={liveUpdatesEnabled}
@@ -2372,13 +4018,21 @@ export default function App() {
   );
 }
 
-function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setSelected, setPage, loading, wsConnected, wsState }) {
+function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, onOpenReport, setPage, loading, wsConnected, wsState, liveUpdatesEnabled }) {
   const [feedExpanded, setFeedExpanded] = useState(false);
+  const [analyticsExpanded, setAnalyticsExpanded] = useState(false);
+  const [dashboardClock, setDashboardClock] = useState(() => new Date());
+
+  useEffect(() => {
+    const timerId = window.setInterval(() => setDashboardClock(new Date()), 1000);
+    return () => window.clearInterval(timerId);
+  }, []);
+
   const recentLogs = useMemo(
     () => filterRecentItems(logs, (item) => item?.timestamp || getLastActivityAt(item)),
     [logs],
   );
-  const sortedLogs = [...recentLogs].sort((a, b) => compareIso(b?.timestamp, a?.timestamp));
+  const sortedLogs = [...recentLogs].sort((a, b) => compareIso(getDashboardFeedTimestamp(b), getDashboardFeedTimestamp(a)));
   const caseByAttemptId = Object.fromEntries(cases.map((item) => [item.attempt_id, item]));
   const reviewRows = buildReviewQueueItems(recentLogs, caseByAttemptId);
   const fallbackStats = {
@@ -2390,16 +4044,16 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
     completed: recentLogs.filter((x) => getExamStatus(x) === "COMPLETED").length,
     avgConfidence: recentLogs.reduce((sum, x) => sum + Number(x.confidence || 0), 0) / (recentLogs.length || 1),
   };
-  const fallbackFeedRows = sortedLogs.slice(0, 5);
+  const fallbackFeedRows = sortedLogs.filter(isMeaningfulDashboardFeedItem).slice(0, 8);
   const fallbackReviewCases = reviewRows.filter((row) => isQueueActionableStatus(row.queueStatus)).slice(0, 5);
   const unresolvedCases = reviewRows.filter((row) => isQueueActionableStatus(row.queueStatus)).length;
   const fallbackSignalSummary = buildAggregateSignals(recentLogs);
   const fallbackLiveEventRate = getLiveEventRate(recentLogs);
   const riskTotal = Math.max(1, fallbackStats.total);
   const fallbackLastUpdated = sortedLogs[0]?.timestamp || null;
-  const feedRows = Array.isArray(dashboardSummary?.recent_risk_feed) && dashboardSummary.recent_risk_feed.length
+  const feedRows = liveUpdatesEnabled && Array.isArray(dashboardSummary?.recent_risk_feed) && dashboardSummary.recent_risk_feed.length
     ? dashboardSummary.recent_risk_feed
-    : fallbackFeedRows;
+    : liveUpdatesEnabled ? fallbackFeedRows : [];
   const visibleFeedRows = feedExpanded ? feedRows : feedRows.slice(0, 5);
   const reviewCases = Array.isArray(dashboardSummary?.cases_needing_review) && dashboardSummary.cases_needing_review.length
     ? dashboardSummary.cases_needing_review
@@ -2426,7 +4080,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
 
   const metrics = [
     { title: "Active Sessions", value: metricActiveSessions, subtitle: "Live exams in progress", tone: "blue", icon: <Users size={20} /> },
-    { title: "Total Attempts", value: metricTotalAttempts, subtitle: "All time attempts", tone: "cyan", icon: <ClipboardList size={20} /> },
+    { title: "Total Attempts", value: metricTotalAttempts, subtitle: "Persisted attempts", tone: "cyan", icon: <ClipboardList size={20} /> },
     { title: "High Risk Now", value: metricHighRisk, subtitle: "Requires attention", tone: "high", icon: <AlertTriangle size={20} /> },
     { title: "Medium Risk", value: metricMediumRisk, subtitle: "Monitoring", tone: "medium", icon: <ShieldAlert size={20} /> },
     { title: "Needs Review", value: metricNeedsReview, subtitle: "Unresolved cases", tone: "violet", icon: <ListChecks size={20} /> },
@@ -2440,12 +4094,31 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
     { label: "Low Risk", value: Number((((dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#65d46e", count: dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk },
   ];
 
+  const analyticsSummary = [
+    { label: "Total Attempts", value: metricTotalAttempts },
+    { label: "Medium Risk", value: metricMediumRisk },
+    { label: "Live Event Rate", value: liveEventRate },
+    { label: "Stream", value: wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused" },
+  ];
+
   return (
     <div className="command-center-page">
-      <div className="page-title-block">
-        <span className="page-kicker">LIVE ASSESSMENT MONITORING</span>
-        <h1>Risk Command Center</h1>
-        <p>Track active attempts, risk movement, and candidates requiring review.</p>
+      <div className="command-header-row">
+        <div className="page-title-block command-title-block">
+          <span className="page-kicker">LIVE ASSESSMENT MONITORING</span>
+          <h1>Command Center</h1>
+          <p>Real-time assessment monitoring and risk intelligence</p>
+        </div>
+        <div className="command-header-meta">
+          <div className="command-live-chip">
+            <span className="command-live-dot"></span>
+            <span>{wsConnected ? "Live monitoring" : "Stream reconnecting"}</span>
+          </div>
+          <div className="command-clock-card">
+            <small>Local Time</small>
+            <strong>{dashboardClock.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</strong>
+          </div>
+        </div>
       </div>
 
       <section className="command-metrics-grid">
@@ -2463,49 +4136,50 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
       </section>
 
       <section className="command-primary-grid">
-        <div className="enterprise-panel">
-          <PanelHeader
-            title="Live Risk Feed"
-            subtitle="Real-time suspicious activity"
-            actionLabel={feedRows.length > 5 ? (feedExpanded ? "Show Less" : "View All") : null}
-            onActionClick={feedRows.length > 5 ? () => setFeedExpanded((value) => !value) : undefined}
-          />
-          {feedRows.length === 0 ? (
-            <EmptyState text="No recent live activity has been received yet." />
-          ) : (
-            <div className="activity-feed-list">
-              {visibleFeedRows.map((item, index) => (
-                <button
-                  className="activity-feed-row"
-                  key={`${item.attempt_id}-${item.timestamp || item.last_activity || index}`}
-                  onClick={() => {
-                    setSelected(item);
-                    setPage("report");
-                  }}
-                >
-                  <span className="activity-feed-time">{formatTime(item.timestamp)}</span>
-                  <span className="activity-feed-event">{eventIcon(item.latest_event?.event_type || item.latest_event_type || item.risk || item.risk_level)}</span>
-                  <span className="activity-feed-copy">
-                    <strong>{getCandidateName(item)} <small>({item.attempt_id})</small></strong>
-                    <p>{item.attempt_summary || getLatestActivity(item)}</p>
-                  </span>
-                  <span className={riskClass(item.risk || item.risk_level)}>{item.risk || item.risk_level || "LOW"}</span>
-                  <ArrowRight size={16} />
+        {liveUpdatesEnabled ? (
+          <div className="enterprise-panel">
+            <PanelHeader
+              title="Live Risk Feed"
+              subtitle="Real-time suspicious activity"
+              actionLabel={feedRows.length > 5 ? (feedExpanded ? "Show Less" : "View All") : null}
+              onActionClick={feedRows.length > 5 ? () => setFeedExpanded((value) => !value) : undefined}
+            />
+            {feedRows.length === 0 ? (
+              <EmptyState text="No recent live activity has been received yet." />
+            ) : (
+              <div className="activity-feed-list">
+                {visibleFeedRows.map((item, index) => (
+                  <button
+                    className="activity-feed-row"
+                    key={`${item.attempt_id}-${item.timestamp || item.last_activity || index}`}
+                    onClick={() => onOpenReport(item)}
+                  >
+                    <span className="activity-feed-time">{formatTime(item.timestamp)}</span>
+                    <span className="activity-feed-avatar">{getInitials(getCandidateName(item))}</span>
+                    <span className="activity-feed-copy">
+                      <strong>{getCandidateName(item)}</strong>
+                      <small>{getDashboardAssessmentLabel(item)}</small>
+                      <p>{getDashboardStrongestReason(item)}</p>
+                    </span>
+                    <span className={riskClass(item.risk || item.risk_level)}>{item.risk || item.risk_level || "LOW"}</span>
+                    <span className="activity-feed-relative">{formatRelativeTime(item.timestamp || item.last_activity)}</span>
+                    <ArrowRight size={16} />
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="panel-footer-link">
+              <span>{feedExpanded ? `Showing ${visibleFeedRows.length} recent events` : `Showing latest ${visibleFeedRows.length} events`}</span>
+              {feedRows.length > 5 ? (
+                <button className="panel-footer-action" onClick={() => setFeedExpanded((value) => !value)} type="button">
+                  {feedExpanded ? "Show Less" : "View All Activity"}
                 </button>
-              ))}
+              ) : null}
             </div>
-          )}
-          <div className="panel-footer-link">
-            <span>{feedExpanded ? `Showing ${visibleFeedRows.length} recent events` : `Showing latest ${visibleFeedRows.length} events`}</span>
-            {feedRows.length > 5 ? (
-              <button className="panel-footer-action" onClick={() => setFeedExpanded((value) => !value)} type="button">
-                {feedExpanded ? "Show Less" : "View All Activity"}
-              </button>
-            ) : null}
           </div>
-        </div>
+        ) : null}
 
-        <div className="enterprise-panel">
+        <div className={`enterprise-panel${!liveUpdatesEnabled ? " command-primary-full" : ""}`}>
           <PanelHeader
             title="Cases Needing Review"
             subtitle="Prioritized unresolved cases"
@@ -2518,9 +4192,8 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
             <div className="review-priority-table">
               <div className="review-priority-head">
                 <span>Priority</span>
-                <span>Candidate / Attempt</span>
+                <span>Candidate</span>
                 <span>Risk</span>
-                <span>Status</span>
                 <span>Score</span>
                 <span>Action</span>
               </div>
@@ -2528,19 +4201,20 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
                 <div className="review-priority-row" key={row.attemptId || row.attempt_id}>
                   <span className={`priority-index tone-${riskTone(row.risk || row.risk_level)}`}>{row.priority || index + 1}</span>
                   <span className="review-priority-candidate">
-                    <strong>{row.candidateName || row.candidate_name || "Unknown Candidate"}</strong>
-                    <small>{row.attemptId || row.attempt_id}</small>
-                    <small>{formatDateTime(row.lastActivity || row.last_activity)}</small>
+                    <span className="review-priority-avatar activity-feed-avatar">{getInitials(row.candidateName || row.candidate_name || "Unknown Candidate")}</span>
+                    <span className="review-priority-candidate-copy activity-feed-copy">
+                      <strong>{row.candidateName || row.candidate_name || "Unknown Candidate"}</strong>
+                      <small title={row.attemptId || row.attempt_id}>{getDashboardAssessmentLabel(row)}</small>
+                      <p>{getDashboardReviewStatus(row)}</p>
+                    </span>
                   </span>
-                  <span className={riskClass(row.risk || row.risk_level)}>{row.risk || row.risk_level}</span>
-                  <span className={caseStatusClass(row.queueStatus || row.status)}>{formatWorkflowStatus(row.queueStatus || row.status)}</span>
+                  <span className="review-priority-risk-stack">
+                    <span className={riskClass(row.risk || row.risk_level)}>{row.risk || row.risk_level || "LOW"}</span>
+                  </span>
                   <span>{formatNumber(row.score)}</span>
                   <button
                     className="action-link-button"
-                    onClick={() => {
-                      setSelected(row.item || logs.find((item) => item.attempt_id === (row.attemptId || row.attempt_id)) || null);
-                      setPage("report");
-                    }}
+                    onClick={() => onOpenReport(row)}
                     type="button"
                   >
                     View
@@ -2558,58 +4232,82 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, setS
         </div>
       </section>
 
-      <section className="command-bottom-grid">
-        <div className="enterprise-panel">
-          <PanelHeader title="Risk Distribution" subtitle="Distribution of attempts by risk level" />
-          <div className="distribution-panel">
-            <div className="distribution-donut-wrap">
-              <div className="distribution-donut" style={buildDonutStyle(distributionSegments)}></div>
+      <section className={`command-analytics-shell enterprise-panel${analyticsExpanded ? " expanded" : ""}`}>
+        <div className="command-analytics-header">
+          <div>
+            <h3>Analytics &amp; System Overview</h3>
+            <p>Risk distribution, evidence signals, system health, and detailed insights</p>
+          </div>
+          <button
+            className="panel-header-action command-analytics-toggle"
+            onClick={() => setAnalyticsExpanded((value) => !value)}
+            type="button"
+          >
+            {analyticsExpanded ? "Collapse" : "Expand"}
+          </button>
+        </div>
+        <div className="command-analytics-summary">
+          {analyticsSummary.map((item) => (
+            <div className="command-analytics-pill" key={item.label}>
+              <span>{item.label}</span>
+              <strong>{item.value}</strong>
             </div>
-            <div className="distribution-legend">
-              {distributionSegments.map((segment) => (
-                <div className="distribution-legend-row" key={segment.label}>
-                  <span><i style={{ background: segment.color }}></i>{segment.label}</span>
-                  <strong>{segment.count} ({formatPercent(segment.count, stats.total)})</strong>
+          ))}
+        </div>
+        {analyticsExpanded ? (
+          <div className="command-bottom-grid">
+            <div className="command-analytics-section">
+              <PanelHeader title="Risk Distribution" subtitle="Distribution of attempts by risk level" />
+              <div className="distribution-panel">
+                <div className="distribution-donut-wrap">
+                  <div className="distribution-donut" style={buildDonutStyle(distributionSegments)}></div>
                 </div>
-              ))}
+                <div className="distribution-legend">
+                  {distributionSegments.map((segment) => (
+                    <div className="distribution-legend-row" key={segment.label}>
+                      <span><i style={{ background: segment.color }}></i>{segment.label}</span>
+                      <strong>{segment.count} ({formatPercent(segment.count, stats.total)})</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="panel-caption">Total Attempts: {dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts}</div>
+            </div>
+            <div className="command-analytics-section">
+              <PanelHeader title="Recent Evidence Signals" subtitle="Summary of recent suspicious activity" />
+              <div className="signals-grid">
+                <SignalStatCard title="Clipboard Copy/Paste" value={signalSummary.clipboard} tone="high" icon={<Copy size={18} />} />
+                <SignalStatCard title="Tab Switch Events" value={signalSummary.tabSwitches} tone="medium" icon={<MonitorOff size={18} />} />
+                <SignalStatCard title="Idle Time Spikes" value={signalSummary.idleSpikes} tone="medium" icon={<Clock3 size={18} />} />
+                <SignalStatCard title="Rapid Answer Bursts" value={signalSummary.rapidBursts} tone="medium" icon={<Zap size={18} />} />
+                <SignalStatCard title="Focus/Blur Events" value={signalSummary.focusBlur} tone="violet" icon={<Eye size={18} />} />
+              </div>
+            </div>
+
+            <div className="command-analytics-section">
+              <PanelHeader title="System Health" subtitle="Real-time system status" />
+              <div className="system-health-list">
+                <SystemHealthRow icon={<Server size={16} />} label="Backend API" value={dashboardSummary?.system_health_basic?.backend_api || getHealthLabel(logs.length > 0, loading)} tone="success" />
+                <SystemHealthRow
+                  icon={<Wifi size={16} />}
+                  label="WebSocket Stream"
+                  value={dashboardSummary?.system_health_basic?.websocket_stream || (wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused")}
+                  tone={(dashboardSummary?.system_health_basic?.websocket_stream || (wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused")) === "Connected" ? "success" : "danger"}
+                />
+                <SystemHealthRow icon={<Radio size={16} />} label="Event Stream" value={dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")} tone={(dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")) === "Idle" ? "warning" : "success"} />
+                <SystemHealthRow icon={<ShieldCheck size={16} />} label="Authentication" value={dashboardSummary?.system_health_basic?.authentication || (currentUser ? "Active" : "Unknown")} tone="success" />
+                <SystemHealthRow icon={<Database size={16} />} label="Database" value={dashboardSummary?.system_health_basic?.database || (logs.length || cases.length ? "Healthy" : "Awaiting Data")} tone="success" />
+              </div>
+              <div className="panel-caption">Last Updated: {formatDateTime(lastUpdated)}</div>
             </div>
           </div>
-          <div className="panel-caption">Total Attempts: {dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts}</div>
-        </div>
-
-        <div className="enterprise-panel">
-          <PanelHeader title="Recent Evidence Signals" subtitle="Summary of recent suspicious activity" />
-          <div className="signals-grid">
-            <SignalStatCard title="Clipboard Copy/Paste" value={signalSummary.clipboard} tone="high" icon={<Copy size={18} />} />
-            <SignalStatCard title="Tab Switch Events" value={signalSummary.tabSwitches} tone="medium" icon={<MonitorOff size={18} />} />
-            <SignalStatCard title="Idle Time Spikes" value={signalSummary.idleSpikes} tone="medium" icon={<Clock3 size={18} />} />
-            <SignalStatCard title="Rapid Answer Bursts" value={signalSummary.rapidBursts} tone="medium" icon={<Zap size={18} />} />
-            <SignalStatCard title="Focus/Blur Events" value={signalSummary.focusBlur} tone="violet" icon={<Eye size={18} />} />
-          </div>
-        </div>
-
-        <div className="enterprise-panel">
-          <PanelHeader title="System Health" subtitle="Real-time system status" />
-          <div className="system-health-list">
-            <SystemHealthRow icon={<Server size={16} />} label="Backend API" value={dashboardSummary?.system_health_basic?.backend_api || getHealthLabel(logs.length > 0, loading)} tone="success" />
-            <SystemHealthRow
-              icon={<Wifi size={16} />}
-              label="WebSocket Stream"
-              value={dashboardSummary?.system_health_basic?.websocket_stream || (wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused")}
-              tone={(dashboardSummary?.system_health_basic?.websocket_stream || (wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused")) === "Connected" ? "success" : "danger"}
-            />
-            <SystemHealthRow icon={<Radio size={16} />} label="Event Stream" value={dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")} tone={(dashboardSummary?.system_health_basic?.event_stream || (logs.length ? "Receiving" : "Idle")) === "Idle" ? "warning" : "success"} />
-            <SystemHealthRow icon={<ShieldCheck size={16} />} label="Authentication" value={dashboardSummary?.system_health_basic?.authentication || (currentUser ? "Active" : "Unknown")} tone="success" />
-            <SystemHealthRow icon={<Database size={16} />} label="Database" value={dashboardSummary?.system_health_basic?.database || (logs.length || cases.length ? "Healthy" : "Awaiting Data")} tone="success" />
-          </div>
-          <div className="panel-caption">Last Updated: {formatDateTime(lastUpdated)}</div>
-        </div>
+        ) : null}
       </section>
     </div>
   );
 }
 
-function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError, currentUser, onRefresh, setSelected, setPage }) {
+function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError, currentUser, onRefresh, onOpenReport }) {
   const [activeTab, setActiveTab] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -2926,10 +4624,7 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
                   <span>
                     <button
                       className="action-link-button"
-                      onClick={() => {
-                        setSelected(row.item || logs.find((item) => item.attempt_id === row.attemptId) || null);
-                        setPage("report");
-                      }}
+                      onClick={() => onOpenReport(row)}
                       type="button"
                     >
                       View
@@ -2962,69 +4657,6 @@ function QueuePage({ logs, reviewQueuePayload, caseByAttemptId, caseAccessError,
         </div>
       </section>
 
-      <section className="enterprise-panel review-analytics-panel">
-        <div className="review-analytics-section">
-          <div className="review-analytics-title">Queue Health</div>
-          <div className="distribution-panel">
-            <div className="distribution-donut-wrap">
-              <div
-                className="distribution-donut"
-                style={buildDonutStyle(queueHealth.map((segment) => ({ ...segment, value: Number(((segment.count / Math.max(1, summary.total)) * 100).toFixed(1)) })))}
-              ></div>
-            </div>
-            <div className="distribution-legend">
-              {queueHealth.map((segment) => (
-                <div className="distribution-legend-row" key={segment.label}>
-                  <span><i style={{ background: segment.color }}></i>{segment.label}</span>
-                  <strong>{segment.count} ({formatPercent(segment.count, summary.total)})</strong>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="panel-caption">Total {summary.total}</div>
-        </div>
-
-        <div className="review-analytics-section">
-          <div className="review-analytics-title">SLA Compliance</div>
-          <div className="sla-card">
-            <div className="sla-ring" style={buildDonutStyle([{ value: slaPercent, color: "#65d46e" }, { value: Math.max(0, 100 - slaPercent), color: "rgba(255,255,255,0.08)" }])}>
-              <span>{slaPercent}%</span>
-            </div>
-            <div className="sla-copy">
-              <strong>On Track</strong>
-              <small>Within SLA {withinSla}</small>
-              <small>Breached SLA {Math.max(0, reviewRows.length - withinSla)}</small>
-              <small>Target: 90%</small>
-            </div>
-          </div>
-        </div>
-
-        <div className="review-analytics-section">
-          <div className="review-analytics-title">Average Review Time</div>
-          <div className="avg-time-card">
-            <div className="avg-time-circle"><Clock3 size={22} /></div>
-            <div>
-              <strong>{avgReviewSeconds ? formatDuration(avgReviewSeconds) : "—"}</strong>
-              <small>Average time to resolution</small>
-            </div>
-          </div>
-        </div>
-
-        <div className="review-analytics-section">
-          <div className="review-analytics-title">Top Reviewers</div>
-          <div className="top-reviewer-list">
-            {topReviewers.map(([name, count]) => (
-              <div className="top-reviewer-row" key={name}>
-                <span className="top-reviewer-avatar">{getInitials(name)}</span>
-                <span className="top-reviewer-copy">
-                  <strong>{name}</strong>
-                  <small>{count} cases</small>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
     </div>
   );
 }
@@ -3050,6 +4682,9 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   }, [selected?.attempt_id]);
 
   useEffect(() => {
+    let disposed = false;
+    let reportRetryCount = 0;
+
     async function fetchReportData() {
       if (!selected?.attempt_id) return;
       try {
@@ -3073,9 +4708,11 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
           historyRes.json(),
           reportRes.json(),
         ]);
+        if (disposed) return;
         setLiveRisk(liveJson.data || null);
         setEvents(eventsJson.data || []);
         setRiskHistory(historyJson.data || []);
+        let shouldRetryReport = false;
         setReportData((prev) => {
           if (reportJson?.status !== "success") {
             return prev;
@@ -3085,6 +4722,13 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
           const nextEvidence = Array.isArray(nextData?.evidence_items) ? nextData.evidence_items : [];
           const prevOverview = prev?.violation_overview_counts ? Object.keys(prev.violation_overview_counts).length : 0;
           const nextOverview = nextData?.violation_overview_counts ? Object.keys(nextData.violation_overview_counts).length : 0;
+          shouldRetryReport = Boolean(
+            nextData
+            && nextData.attempt_status !== "ONGOING"
+            && !nextData.final_risk_assessment
+            && nextEvidence.length === 0
+            && nextOverview === 0,
+          );
           if (prev && prevEvidence.length > 0 && nextData && nextEvidence.length === 0 && nextOverview === 0) {
             return {
               ...prev,
@@ -3102,13 +4746,26 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
           }
           return nextData;
         });
+        if (shouldRetryReport && reportRetryCount < 3) {
+          reportRetryCount += 1;
+          window.setTimeout(() => {
+            if (!disposed) {
+              void fetchReportData();
+            }
+          }, 1200);
+        }
       } catch (err) {
         console.error("Failed to fetch report data:", err);
       } finally {
-        setReportLoading(false);
+        if (!disposed) {
+          setReportLoading(false);
+        }
       }
     }
     void fetchReportData();
+    return () => {
+      disposed = true;
+    };
   }, [onUnauthorized, selected?.attempt_id, token]);
 
   useEffect(() => {
@@ -3237,6 +4894,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   });
   const topEvidenceRows = sortedEvidenceRows.slice(0, 5);
   const investigationInsights = buildInvestigationInsights(reportData, sortedEvidenceRows, displayRisk);
+  const provenanceAnalysis = reportData?.provenance_analysis || null;
   const canExportPdf = ["ADMIN", "REVIEWER"].includes(String(currentUser?.role || "").toUpperCase());
 
   const handleExportPdf = useCallback(async () => {
@@ -3603,6 +5261,105 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
           </div>
         </section>
 
+        <section className="investigation-card provenance-intelligence-card">
+          <div className="report-card-head accent">
+            <h3>Answer Provenance Intelligence</h3>
+          </div>
+          {provenanceAnalysis ? (
+            <div className="provenance-intelligence-body">
+              <div className="provenance-summary-grid">
+                <article className="provenance-summary-item">
+                  <span>External Similarity Likelihood</span>
+                  <strong className={riskClass(provenanceAnalysis.external_similarity_likelihood || "LOW")}>
+                    {provenanceAnalysis.external_similarity_likelihood || "LOW"}
+                  </strong>
+                </article>
+                <article className="provenance-summary-item">
+                  <span>Confidence Score</span>
+                  <strong>{formatNumber(provenanceAnalysis.confidence_score, 2)}</strong>
+                </article>
+                <article className="provenance-summary-item">
+                  <span>Possible Reference Matches</span>
+                  <strong>{(provenanceAnalysis.possible_reference_matches || []).length}</strong>
+                </article>
+              </div>
+              <div className="provenance-summary-copy">
+                <p>{provenanceAnalysis.summary || "No meaningful reference overlap was detected in submitted answers."}</p>
+                {(provenanceAnalysis.evidence_title && (provenanceAnalysis.external_similarity_likelihood === "MEDIUM" || provenanceAnalysis.external_similarity_likelihood === "HIGH")) ? (
+                  <div className={`provenance-evidence-banner tone-${String(provenanceAnalysis.external_similarity_likelihood || "LOW").toLowerCase()}`}>
+                    <strong>{provenanceAnalysis.evidence_title}</strong>
+                    <span>Potential external similarity source overlap should be reviewed alongside behavioral context.</span>
+                  </div>
+                ) : null}
+              </div>
+              {(provenanceAnalysis.behavioral_correlation || []).length ? (
+                <div className="provenance-correlation-list">
+                  <span>Behavioral Correlation</span>
+                  <ul>
+                    {provenanceAnalysis.behavioral_correlation.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              <div className="provenance-match-list">
+                {(provenanceAnalysis.possible_reference_matches || []).length ? (
+                  provenanceAnalysis.possible_reference_matches.map((match, index) => (
+                    <details className="provenance-match-card" key={`${match.source_title}-${match.question_id}-${index}`}>
+                      <summary>
+                        <div>
+                          <strong>{match.source_title || "Possible source match"}</strong>
+                          <small>{match.source_type || "Reference"}{match.question_title ? ` • ${match.question_title}` : ""}</small>
+                        </div>
+                        <div className="provenance-match-meta">
+                          <span>{match.similarity_percent}% similarity</span>
+                          <span className={riskClass(match.likelihood || "LOW")}>{match.likelihood || "LOW"}</span>
+                        </div>
+                      </summary>
+                      <div className="provenance-match-body">
+                        <div className="provenance-preview-grid">
+                          <article>
+                            <span>Candidate Excerpt</span>
+                            <p>{match.candidate_excerpt || "No candidate excerpt available."}</p>
+                          </article>
+                          <article>
+                            <span>Reference Excerpt</span>
+                            <p>{match.reference_excerpt || "No reference excerpt available."}</p>
+                          </article>
+                        </div>
+                        <div className="provenance-match-footer">
+                          <div>
+                            <span>Source</span>
+                            <strong>{match.source_type || "Reference"}</strong>
+                          </div>
+                          {match.source_url ? (
+                            <a href={match.source_url} rel="noreferrer" target="_blank">
+                              Reference Link
+                            </a>
+                          ) : null}
+                        </div>
+                        {(match.behavioral_correlation || []).length ? (
+                          <ul className="provenance-correlation-inline">
+                            {match.behavioral_correlation.map((item) => (
+                              <li key={item}>{item}</li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
+                    </details>
+                  ))
+                ) : (
+                  <div className="empty-state-inline">No strong reference overlaps were detected in submitted answers.</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="provenance-empty-state">
+              <p>Waiting for post-submission answer provenance analysis.</p>
+            </div>
+          )}
+        </section>
+
         <div className="report-main-row investigation-main-grid">
           <EvidenceTable rows={sortedEvidenceRows} loading={reportLoading} />
           <ReviewerWorkflow
@@ -3637,8 +5394,6 @@ function SettingsPage({
   apiBaseUrl,
   wsConnected,
   wsState,
-  themeMode,
-  onThemeModeChange,
   autoRefreshInterval,
   onAutoRefreshIntervalChange,
   liveUpdatesEnabled,
@@ -3734,18 +5489,8 @@ function SettingsPage({
         >
           <div className="settings-controls">
             <SettingsControl
-              label="Theme"
-              help="Persisted locally for this browser."
-              control={(
-                <select value={themeMode} onChange={(event) => onThemeModeChange(event.target.value)}>
-                  <option value="dark">Dark</option>
-                  <option value="midnight">Midnight</option>
-                </select>
-              )}
-            />
-            <SettingsControl
-              label="Live Updates"
-              help="Enable or pause websocket-driven updates."
+              label="Live Risk Feed"
+              help="Enable or pause live feed fetching, websocket updates, and candidate activity rendering."
               control={(
                 <button
                   className={`settings-toggle ${liveUpdatesEnabled ? "enabled" : ""}`}
@@ -3921,6 +5666,63 @@ function SettingsDashboardCard({ title, subtitle, className = "", children }) {
       </div>
       {children}
     </div>
+  );
+}
+
+function DemoInfoRail({ telemetryStatus, candidateId, apiBaseUrl, selectedAssessment, totalQuestions, telemetryError }) {
+  return (
+    <>
+      <section className="public-demo-card compact">
+        <div className="public-demo-card-head compact">
+          <h3>Telemetry Notice</h3>
+        </div>
+        <ul className="public-demo-bullets compact">
+          <li>Focus loss and visibility changes</li>
+          <li>Clipboard copy/paste metadata</li>
+          <li>Question timing and answer change timing</li>
+          <li>Idle recovery and typing rhythm metadata</li>
+          <li>Correlated suspicious event sequences</li>
+        </ul>
+      </section>
+
+      <section className="public-demo-card compact">
+        <div className="public-demo-card-head compact">
+          <h3>Privacy notice</h3>
+        </div>
+        <ul className="public-demo-bullets compact">
+          <li>No webcam monitoring</li>
+          <li>No microphone recording</li>
+          <li>No answer text stored as telemetry</li>
+          <li>No clipboard contents stored</li>
+          <li>No screen recording</li>
+        </ul>
+      </section>
+
+      <section className="public-demo-card compact">
+        <div className="public-demo-card-head compact">
+          <h3>Demo session</h3>
+        </div>
+        <div className="public-demo-summary-grid single">
+          <div className="public-demo-summary-item">
+            <span>Telemetry Status</span>
+            <strong>{telemetryStatus}</strong>
+          </div>
+          <div className="public-demo-summary-item">
+            <span>Candidate ID</span>
+            <strong>{candidateId || "Generated on start"}</strong>
+          </div>
+          <div className="public-demo-summary-item">
+            <span>Backend</span>
+            <strong>{apiBaseUrl}</strong>
+          </div>
+          <div className="public-demo-summary-item">
+            <span>Sections</span>
+            <strong>{selectedAssessment.sections.length} sections / {totalQuestions} questions</strong>
+          </div>
+        </div>
+        {telemetryError ? <div className="workflow-message workflow-message-warning">{telemetryError}</div> : null}
+      </section>
+    </>
   );
 }
 
@@ -4149,6 +5951,4 @@ function EmptyState({ text }) {
     </div>
   );
 }
-
-
 

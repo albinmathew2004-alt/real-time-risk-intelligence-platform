@@ -974,8 +974,11 @@ def _upsert_attempt_state(
         state.risk_history = risk_history or []
     if features or not state.features:
         state.features = features or {}
-    if signals or not state.signals:
-        state.signals = signals or {}
+    merged_signals = dict(getattr(state, "signals", None) or {})
+    if signals:
+        merged_signals.update(signals)
+    if merged_signals or not state.signals:
+        state.signals = merged_signals
     state.latest_event_type = latest_event_type or state.latest_event_type
     state.latest_event_at = latest_event_at or state.latest_event_at
     state.event_count = max(int(event_count or 0), int(state.event_count or 0))
@@ -2009,6 +2012,12 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
             for item in payload.answers
             if str(item.answer_text or "").strip()
         ]
+        logger.info(
+            "provenance_answers_received attempt_id=%s answers=%s assessment=%s",
+            attempt_id,
+            len(answers),
+            payload.assessment_name or attempt_state.assessment_name or "",
+        )
 
         events = [
             {
@@ -2030,6 +2039,13 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
             submitted_answers=answers,
             events=events,
         )
+        logger.info(
+            "provenance_computed attempt_id=%s matches=%s likelihood=%s confidence=%.2f",
+            attempt_id,
+            len(provenance_result.get("possible_reference_matches") or []),
+            provenance_result.get("external_similarity_likelihood") or "LOW",
+            safe_float(provenance_result.get("confidence_score"), 0.0),
+        )
 
         existing_signals = dict(getattr(attempt_state, "signals", None) or {})
         existing_signals["submitted_answers"] = answers
@@ -2048,6 +2064,11 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
             attempt_state.status = "SUBMITTED"
 
         db.commit()
+        logger.info(
+            "provenance_persisted attempt_id=%s signals_keys=%s",
+            attempt_id,
+            ",".join(sorted(existing_signals.keys())),
+        )
         return {
             "status": "success",
             "attempt_id": attempt_id,

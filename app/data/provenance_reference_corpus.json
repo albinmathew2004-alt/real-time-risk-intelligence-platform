@@ -1,0 +1,154 @@
+[
+  {
+    "source_title": "React refresh after WebSocket update",
+    "source_type": "Engineering Tutorial",
+    "source_url": "https://example.com/react-websocket-refresh",
+    "assessment_type": "Frontend Debugging",
+    "tags": ["react", "state", "websocket", "source-of-truth"],
+    "content": "When stale rows return after a WebSocket refresh, inspect whether the UI refetches from an outdated API source of truth. Keep the sidebar fixed, offset main content using the same width token, and preserve min-width: 0 on the main pane so layout and data refresh behavior stay stable."
+  },
+  {
+    "source_title": "React state synchronization explanation",
+    "source_type": "Developer Q&A",
+    "source_url": "https://example.com/react-state-sync",
+    "assessment_type": "Frontend Debugging",
+    "tags": ["react", "useEffect", "stale-data"],
+    "content": "A common root cause is a useEffect refetch that restores stale server data after local state updates. The fix is to align the refresh path with the canonical backend state instead of blindly replacing rows whenever the selected case changes."
+  },
+  {
+    "source_title": "GeeksForGeeks-style React Reconciliation and Keys Explanation",
+    "source_type": "Public tutorial/reference",
+    "source_url": "https://example.com/react-reconciliation-keys-reference",
+    "assessment_type": "Frontend Debugging",
+    "tags": ["react", "reconciliation", "keys", "list rendering", "stale ui"],
+    "content": "React reconciliation is the process React uses to compare the previous virtual DOM tree with the next render output and decide which parts of the real DOM need to change. When rendering lists, keys help React identify which items are stable across renders. If a developer uses array indexes or unstable values as keys, React may reuse the wrong component instance when items are inserted, removed, or reordered. This can cause stale rows, incorrect local state, or UI updates appearing on the wrong item. A practical fix is to use stable unique identifiers from the data model, inspect list rendering paths, and verify that keys do not change between renders unless the underlying item identity changes."
+  },
+  {
+    "source_title": "Actionable review queue ordering in SQL",
+    "source_type": "SQL Tutorial",
+    "source_url": "https://example.com/sql-actionable-queue",
+    "assessment_type": "SQL Analysis",
+    "tags": ["sql", "postgresql", "queue", "ordering"],
+    "content": "Select investigation cases joined to attempt states, restrict status to NEW, TRIAGED, UNDER_INVESTIGATION, and ESCALATED, and order by the most recent meaningful activity using COALESCE(latest_event_at, updated_at) descending so actionable rows stay at the top."
+  },
+  {
+    "source_title": "Why High Risk Now should ignore resolved cases",
+    "source_type": "Analytics Note",
+    "source_url": "https://example.com/high-risk-now",
+    "assessment_type": "SQL Analysis",
+    "tags": ["metrics", "dashboard", "active-risk"],
+    "content": "High Risk Now should count unresolved HIGH attempts only. Historical HIGH records that are already cleared, confirmed, or closed belong in history, not in the live operational metric."
+  },
+  {
+    "source_title": "SQL queue indexing for operational triage",
+    "source_type": "Database tuning guide",
+    "source_url": "https://example.com/sql-queue-indexing",
+    "assessment_type": "SQL Analysis",
+    "tags": ["sql", "indexing", "triage", "query-plan"],
+    "content": "When a review queue grows into the millions of rows, indexing has to follow the actual filter pattern used by triage screens. Actionable statuses should be filtered early, composite indexes should support both status and recent activity ordering, and large tables often benefit from partial indexes that exclude resolved or historical rows. The goal is to reduce scans, preserve predictable latency, and keep recent actionable work near the top."
+  },
+  {
+    "source_title": "Ordering by latest meaningful activity in review systems",
+    "source_type": "SQL operations blog",
+    "source_url": "https://example.com/sql-latest-meaningful-activity",
+    "assessment_type": "SQL Analysis",
+    "tags": ["sql", "ordering", "coalesce", "queue"],
+    "content": "A reviewer queue should not order by generic updated_at alone if operational relevance comes from actual behavioral events. A safer pattern is to join case records to attempt state or risk history data and order by the latest meaningful event timestamp, often with COALESCE over recent event time, recent risk transition, and only then the generic row update time. That keeps stale records from floating above newly escalated work."
+  },
+  {
+    "source_title": "Reviewer prioritization under ambiguity",
+    "source_type": "Reasoning Reference",
+    "source_url": "https://example.com/reviewer-priority",
+    "assessment_type": "Logical Reasoning",
+    "tags": ["triage", "review", "priority"],
+    "content": "An escalated HIGH case with correlated clipboard evidence should be reviewed first because severity and corroboration outweigh ambiguous MEDIUM activity or minor LOW blur noise. Reviewer time should be directed toward the strongest, most connected risk story."
+  },
+  {
+    "source_title": "Context-first review note for medium-risk attempts",
+    "source_type": "Operational Playbook",
+    "source_url": "https://example.com/medium-risk-context",
+    "assessment_type": "Logical Reasoning",
+    "tags": ["medium-risk", "ambiguity", "reviewer-judgment"],
+    "content": "Moderate focus loss, one clipboard sequence, and inconsistent typing may justify manual review without automatic escalation. The reviewer should ask whether the signals are corroborated, repeated, and close to meaningful answer changes before treating the attempt as confirmed risk."
+  },
+  {
+    "source_title": "FastAPI request-scoped session handling",
+    "source_type": "Backend architecture reference",
+    "source_url": "https://example.com/fastapi-session-scope",
+    "assessment_type": "FastAPI Backend Design",
+    "tags": ["fastapi", "sqlalchemy", "sessions", "pooling"],
+    "content": "A FastAPI application should open a database session per request, close it reliably, and avoid running unnecessary heavy synchronization work on every read endpoint. Connection pool exhaustion often happens when websocket reconnects and dashboard refreshes each trigger overlapping database work while sessions remain open longer than needed. Dependency-scoped sessions, narrow queries, and avoiding repeated global sync operations are standard safeguards."
+  },
+  {
+    "source_title": "Environment-driven admin seeding pattern",
+    "source_type": "Security operations note",
+    "source_url": "https://example.com/demo-admin-seeding",
+    "assessment_type": "Authentication Security",
+    "tags": ["authentication", "password-hashing", "env", "seeding"],
+    "content": "An idempotent admin seeding routine should read credentials from environment variables, create the account if it does not exist, and reset the password hash if the existing account has drifted from the configured password. The role should be enforced as ADMIN, the account should remain active, and plaintext passwords should never be logged or bypassed through insecure shortcuts."
+  },
+  {
+    "source_title": "Reviewer handoff summary guidelines",
+    "source_type": "Investigation workflow playbook",
+    "source_url": "https://example.com/reviewer-handoff-summary",
+    "assessment_type": "Investigation Workflow Reasoning",
+    "tags": ["reviewer", "handoff", "summary", "escalation"],
+    "content": "A strong investigation summary should connect the risk level to specific behavioral evidence, note where ambiguity still exists, and explain why escalation or manual review is warranted. The summary should avoid unsupported accusations, preserve reviewer confidence in the evidence, and help the next analyst understand the sequence of suspicious events and the reason for the current case status."
+  },
+  {
+    "source_title": "Explainability without certainty claims",
+    "source_type": "Product governance note",
+    "source_url": "https://example.com/explainable-risk-confidence",
+    "assessment_type": "Explainable AI Reasoning",
+    "tags": ["explainability", "confidence", "reviewer", "risk"],
+    "content": "An explainable integrity system should communicate what signals were observed, how strongly they correlate, and why the case is being surfaced for review. Confidence should be presented as a measure of how consistent the observed pattern is with known reviewer-relevant behavior, not as proof of intent. Reviewer judgement remains necessary when evidence is ambiguous or partially corroborated."
+  },
+  {
+    "source_title": "Metadata-only browser telemetry interpretation",
+    "source_type": "Privacy-preserving telemetry guide",
+    "source_url": "https://example.com/browser-telemetry-metadata",
+    "assessment_type": "Browser Telemetry Interpretation",
+    "tags": ["browser", "focus", "visibility", "clipboard", "privacy"],
+    "content": "Browser telemetry can remain privacy-preserving when it records only metadata such as focus changes, document visibility transitions, clipboard event timing, typing cadence, and navigation patterns. The platform should avoid storing clipboard contents, raw keystrokes, passwords, or media streams while still using timing and sequencing to help reviewers understand behavioral patterns around answer entry and window switching."
+  },
+  {
+    "source_title": "Actionable reviewer queue prioritization",
+    "source_type": "Operations runbook",
+    "source_url": "https://example.com/actionable-reviewer-queue",
+    "assessment_type": "Queue Prioritization",
+    "tags": ["queue", "priority", "triage", "review"],
+    "content": "Reviewer queues should prioritize actionable statuses such as NEW, TRIAGED, UNDER_INVESTIGATION, and ESCALATED, while excluding stale resolved or closed work from the main operational view. The ordering should favor recent meaningful escalations, strong corroborated evidence, and tasks that still require reviewer action instead of recently touched but already completed records."
+  },
+  {
+    "source_title": "Correlated suspicious sequence explanation",
+    "source_type": "Incident review note",
+    "source_url": "https://example.com/correlated-suspicious-sequence",
+    "assessment_type": "Event Correlation",
+    "tags": ["correlation", "focus-loss", "clipboard", "overwrite"],
+    "content": "A focus loss followed by visibility hidden, clipboard activity, and a rapid overwrite is more meaningful than isolated events because the signals appear in a short, connected sequence. Correlation matters when deciding escalation because the combined timeline suggests the answer may have been prepared externally and inserted with limited recovery typing or natural editing afterward."
+  },
+  {
+    "source_title": "Deterministic risk thresholds and corroboration",
+    "source_type": "Scoring design reference",
+    "source_url": "https://example.com/deterministic-risk-thresholds",
+    "assessment_type": "Risk Scoring Logic",
+    "tags": ["risk-scoring", "thresholds", "false-positives", "corroboration"],
+    "content": "A deterministic integrity model should avoid escalating a case to HIGH risk solely because of one suspicious signal. Thresholds should be supported by corroboration such as focus loss near clipboard activity, unusual timing, or repeated suspicious sequences. Reviewer oversight remains important because multiple moderate signals can be explainable in context, while a small number of tightly connected signals can be far more meaningful."
+  },
+  {
+    "source_title": "Behavioral sequence escalation note",
+    "source_type": "Security Investigation",
+    "source_url": "https://example.com/behavioral-escalation-note",
+    "assessment_type": "Security Investigation",
+    "tags": ["focus-loss", "clipboard", "overwrite", "escalation"],
+    "content": "Candidate returned from focus loss and performed a large paste-driven overwrite within seconds. The sequence focus loss to clipboard activity to rapid answer change forms a correlated suspicious pattern that warrants escalation before any final outcome is released."
+  },
+  {
+    "source_title": "Security analyst timeline explanation",
+    "source_type": "Incident Review Example",
+    "source_url": "https://example.com/security-timeline",
+    "assessment_type": "Security Investigation",
+    "tags": ["timeline", "correlation", "analyst-note"],
+    "content": "The strongest explanation is a focus loss followed by visibility hidden, clipboard paste, and rapid overwrite behavior. That sequence is more meaningful than isolated typing anomalies because the signals appear together in a short operational window."
+  }
+]
