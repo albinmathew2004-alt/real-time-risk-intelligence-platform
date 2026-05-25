@@ -7,6 +7,10 @@ from sqlalchemy.orm import Session
 
 from app.auth.security import hash_password, verify_password
 from app.models.user import User, UserRole
+from app.runtime_env import load_local_env
+
+
+load_local_env()
 
 
 LOCAL_DEMO_MODES = {

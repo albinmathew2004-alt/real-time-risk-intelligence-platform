@@ -2,6 +2,10 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import os
 
+from app.runtime_env import load_local_env
+
+
+load_local_env()
 
 DEFAULT_SQLITE_URL = "sqlite:///./risk_intel.db"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()

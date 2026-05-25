@@ -4,11 +4,18 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
+import time
 import traceback
+
+from app.runtime_env import load_local_env
+
+load_local_env()
 
 from engine.core.scorer import run_scoring
 from sqlalchemy import text
@@ -39,7 +46,14 @@ from app.services.evidence_service import (
     normalize_risk_level,
     safe_float,
 )
+from app.services.demo_attempt_cleanup import (
+    DEMO_ABANDONED_STATUS,
+    DEMO_EXPIRED_MESSAGE,
+    DEMO_EXPIRED_STATUS,
+    expire_stale_demo_attempts,
+)
 from app.services.final_assessment_service import build_final_risk_assessment
+from app.services.provenance_analysis_service import analyze_answer_provenance, build_provenance_evidence_item
 from app.services.report_summary_service import build_report_summary
 
 RISK_HISTORY_SCORE_EPSILON = 0.01
@@ -52,6 +66,41 @@ ACTIONABLE_CASE_STATUSES = {"NEW", "TRIAGED", "UNDER_INVESTIGATION", "ESCALATED"
 COMPLETED_CASE_STATUSES = {"CONFIRMED_RISK", "FALSE_POSITIVE", "CLEARED", "RESOLVED", "CLOSED", "COMPLETED"}
 PERSIST_DEMO_DATA = os.getenv("PERSIST_DEMO_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
 SUBMISSION_EVENT_TYPES = {"exam_submitted", "assessment_submitted", "submit", "completed"}
+ACTIVE_SESSION_WINDOW_MINUTES = int(os.getenv("ACTIVE_SESSION_WINDOW_MINUTES", "5"))
+FEED_SUSPICIOUS_EVENT_TYPES = {
+    "clipboard",
+    "visibility_change",
+    "idle_state",
+    "rapid_answer_burst",
+    "typing_burst",
+    "typing_pause",
+    "backspace_activity",
+}
+FEED_GENERIC_REASON_PHRASES = (
+    "stable engagement observed",
+    "normal behavior pattern",
+    "review signals detected",
+    "no major violation detected",
+    "minor focus interruptions observed",
+)
+FEED_REASON_KEYWORDS = (
+    "clipboard",
+    "focus loss",
+    "focus recovery",
+    "tab switch",
+    "visibility",
+    "paste",
+    "rapid answer",
+    "typing",
+    "idle",
+    "correlated",
+    "suspicious sequence",
+    "review recommended",
+    "escalat",
+    "confidence spike",
+    "overwrite",
+)
+logger = logging.getLogger("proctoriq.app")
 
 
 def _is_local_mode() -> bool:
@@ -193,6 +242,10 @@ def startup_event():
         _maybe_seed_hosted_demo_dataset()
         db = SessionLocal()
         try:
+            cleanup_result = expire_stale_demo_attempts(db)
+            if cleanup_result["updated_count"]:
+                db.commit()
+            print(f"[OK] Stale demo attempts expired: {cleanup_result['updated_count']}")
             if _attempt_data_exists(db) and not db.query(InvestigationCase.id).limit(1).first():
                 _sync_cases_from_attempts(db)
             counts = _startup_counts(db)
@@ -305,6 +358,27 @@ class ExamEventIngest(BaseModel):
         return self
 
 
+class SubmittedAnswerIn(BaseModel):
+    question_id: str = Field(..., min_length=1, max_length=255)
+    question_title: Optional[str] = Field(default=None, max_length=255)
+    section_id: Optional[str] = Field(default=None, max_length=255)
+    section_title: Optional[str] = Field(default=None, max_length=255)
+    assessment_type: Optional[str] = Field(default=None, max_length=255)
+    input_type: Optional[str] = Field(default=None, max_length=64)
+    answer_text: str = Field(..., min_length=1, max_length=12000)
+    marked_for_review: bool = False
+
+
+class SubmittedAnswersPayload(BaseModel):
+    attempt_id: str = Field(..., min_length=1, max_length=255)
+    candidate_id: Optional[str] = Field(default=None, max_length=255)
+    candidate_name: Optional[str] = Field(default=None, max_length=255)
+    candidate_email: Optional[str] = Field(default=None, max_length=320)
+    assessment_id: Optional[str] = Field(default=None, max_length=255)
+    assessment_name: Optional[str] = Field(default=None, max_length=255)
+    answers: List[SubmittedAnswerIn] = Field(default_factory=list)
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -365,6 +439,109 @@ def build_reason(result: Dict[str, Any]) -> str:
         return "Risk escalated to MEDIUM after multiple reviewer-relevant irregularities were observed."
 
     return "Risk remains LOW with stable engagement and limited suspicious behavior."
+
+
+def _behavioral_feed_timestamp(row: Dict[str, Any], latest_event: Optional[RawExamEvent]) -> Optional[datetime]:
+    candidates = [
+        getattr(latest_event, "occurred_at", None),
+        getattr(latest_event, "received_at", None),
+        ((row.get("latest_event") or {}).get("occurred_at") if isinstance(row.get("latest_event"), dict) else None),
+        ((row.get("latest_event") or {}).get("timestamp") if isinstance(row.get("latest_event"), dict) else None),
+        row.get("submitted_at"),
+    ]
+    for candidate in candidates:
+        parsed = parse_timestamp(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _meaningful_history_timestamp(row: Dict[str, Any], latest_history: Optional[RiskHistory]) -> Optional[datetime]:
+    if latest_history is None:
+        return None
+    risk_level = str(row.get("risk_level") or row.get("risk") or getattr(latest_history, "risk", None) or "LOW").upper()
+    reason = str(getattr(latest_history, "reason", None) or row.get("strongest_reason") or "").strip().lower()
+    has_reason_keyword = any(keyword in reason for keyword in FEED_REASON_KEYWORDS)
+    if risk_level in {"HIGH", "MEDIUM"} or has_reason_keyword:
+        return parse_timestamp(getattr(latest_history, "timestamp", None))
+    return None
+
+
+def _row_has_meaningful_behavioral_signal(row: Dict[str, Any], latest_event: Optional[RawExamEvent]) -> bool:
+    risk_level = str(row.get("risk_level") or row.get("risk") or "LOW").upper()
+    latest_event_type = str(
+        row.get("latest_event_type")
+        or getattr(latest_event, "event_type", None)
+        or ""
+    ).strip().lower()
+    reason = str(row.get("strongest_reason") or row.get("explanation") or "").strip().lower()
+    features = row.get("features") or {}
+
+    suspicious_sequences = int(features.get("suspicious_sequence_count") or features.get("correlated_pattern_count") or 0)
+    clipboard_events = int(features.get("clipboard_count") or 0)
+    focus_interruptions = int(features.get("focus_blur_count") or features.get("tab_hidden_count") or 0)
+    typing_anomalies = int(features.get("typing_behavior_anomaly_count") or 0)
+    rapid_answers = int(features.get("rapid_answer_count") or features.get("rapid_answer_burst_count") or 0)
+    confidence = safe_float(row.get("confidence"), 0.0)
+
+    has_reason_keyword = any(keyword in reason for keyword in FEED_REASON_KEYWORDS)
+    is_generic_reason = reason and any(phrase in reason for phrase in FEED_GENERIC_REASON_PHRASES)
+    has_suspicious_event = latest_event_type in FEED_SUSPICIOUS_EVENT_TYPES
+    has_behavioral_counts = any(
+        (
+            suspicious_sequences > 0,
+            clipboard_events > 0,
+            focus_interruptions >= 3,
+            typing_anomalies > 0,
+            rapid_answers > 0,
+        )
+    )
+
+    if risk_level == "HIGH" and (has_reason_keyword or has_suspicious_event or has_behavioral_counts):
+        return True
+    if risk_level == "MEDIUM" and (has_reason_keyword or has_suspicious_event or has_behavioral_counts or confidence >= 0.55):
+        return True
+    if suspicious_sequences > 0 or clipboard_events > 0 or (has_reason_keyword and not is_generic_reason):
+        return True
+    return False
+
+
+def _feed_priority_score(row: Dict[str, Any], latest_event: Optional[RawExamEvent]) -> tuple[int, float]:
+    risk_level = str(row.get("risk_level") or row.get("risk") or "LOW").upper()
+    features = row.get("features") or {}
+    latest_event_type = str(
+        row.get("latest_event_type")
+        or getattr(latest_event, "event_type", None)
+        or ""
+    ).strip().lower()
+
+    risk_weight = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(risk_level, 0)
+    suspicious_sequences = int(features.get("suspicious_sequence_count") or features.get("correlated_pattern_count") or 0)
+    clipboard_events = int(features.get("clipboard_count") or 0)
+    typing_anomalies = int(features.get("typing_behavior_anomaly_count") or 0)
+    rapid_answers = int(features.get("rapid_answer_count") or features.get("rapid_answer_burst_count") or 0)
+    event_bonus = 1 if latest_event_type in FEED_SUSPICIOUS_EVENT_TYPES else 0
+    confidence = safe_float(row.get("confidence"), 0.0)
+    return (
+        risk_weight * 100
+        + suspicious_sequences * 8
+        + clipboard_events * 4
+        + typing_anomalies * 3
+        + rapid_answers * 3
+        + event_bonus,
+        confidence,
+    )
+
+
+def _feed_queue_priority(status: str) -> int:
+    normalized = str(status or "").upper()
+    if normalized == "ESCALATED":
+        return 3
+    if normalized == "UNDER_INVESTIGATION":
+        return 2
+    if normalized in {"TRIAGED", "NEW"}:
+        return 1
+    return 0
 
 
 def _last_timeline_point(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -624,6 +801,27 @@ def _is_submission_event_type(event_type: Any) -> bool:
     return str(event_type or "").strip().lower() in SUBMISSION_EVENT_TYPES
 
 
+def _active_session_cutoff() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(minutes=max(1, ACTIVE_SESSION_WINDOW_MINUTES))
+
+
+def _is_live_attempt_row(row: Dict[str, Any]) -> bool:
+    attempt_status = str(row.get("attempt_status") or "").strip().upper()
+    if attempt_status not in {"ONGOING", "IN_PROGRESS"}:
+        return False
+    if _is_submission_event_type(row.get("latest_event_type")):
+        return False
+
+    last_activity = parse_timestamp(row.get("timestamp"))
+    if last_activity is None or last_activity < _active_session_cutoff():
+        return False
+
+    review_status = str(row.get("status") or "").strip().upper()
+    if review_status in COMPLETED_CASE_STATUSES:
+        return False
+    return True
+
+
 def _derive_attempt_status(
     *,
     existing_status: Optional[str] = None,
@@ -632,14 +830,21 @@ def _derive_attempt_status(
     features: Optional[Dict[str, Any]] = None,
 ) -> str:
     normalized_existing = str(existing_status or "").strip().upper()
-    if normalized_existing == "RESOLVED":
+    if normalized_existing in {"RESOLVED", "COMPLETED"}:
         return "RESOLVED"
+    if normalized_existing in {DEMO_EXPIRED_STATUS, DEMO_ABANDONED_STATUS}:
+        return normalized_existing
 
     normalized_review = str(review_status or "").strip().upper()
     if normalized_review in COMPLETED_CASE_STATUSES:
         return "RESOLVED"
     if normalized_review in {"TRIAGED", "UNDER_INVESTIGATION", "ESCALATED"}:
         return "UNDER_REVIEW"
+
+    if normalized_existing == "UNDER_REVIEW":
+        return "UNDER_REVIEW"
+    if normalized_existing == "SUBMITTED":
+        return "SUBMITTED"
 
     if _is_submission_event_type(latest_event_type) or bool((features or {}).get("has_submit_event")):
         return "SUBMITTED"
@@ -792,6 +997,20 @@ def _latest_event_metadata(db) -> Dict[str, RawExamEvent]:
     return by_attempt
 
 
+def _latest_meaningful_event_metadata(db) -> Dict[str, RawExamEvent]:
+    rows = (
+        db.query(RawExamEvent)
+        .filter(RawExamEvent.event_type.in_(sorted(FEED_SUSPICIOUS_EVENT_TYPES)))
+        .order_by(RawExamEvent.occurred_at.desc(), RawExamEvent.received_at.desc(), RawExamEvent.id.desc())
+        .all()
+    )
+    by_attempt: Dict[str, RawExamEvent] = {}
+    for row in rows:
+        if row.attempt_id and row.attempt_id not in by_attempt:
+            by_attempt[row.attempt_id] = row
+    return by_attempt
+
+
 def _latest_risk_history_by_attempt(db) -> Dict[str, RiskHistory]:
     rows = (
         db.query(RiskHistory)
@@ -828,6 +1047,9 @@ def _event_counts_by_attempt(db) -> Dict[str, int]:
 
 
 def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, sync_cases: bool = False) -> List[Dict[str, Any]]:
+    cleanup_result = expire_stale_demo_attempts(db)
+    if cleanup_result["updated_count"]:
+        db.commit()
     if sync_cases:
         _sync_cases_from_attempts(db)
     latest_event_by_attempt = _latest_event_metadata(db)
@@ -953,7 +1175,12 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, syn
 
 
 def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[str, Any]:
+    cleanup_result = expire_stale_demo_attempts(db)
+    if cleanup_result["updated_count"]:
+        db.commit()
     latest_event_by_attempt = _latest_event_metadata(db)
+    latest_meaningful_event_by_attempt = _latest_meaningful_event_metadata(db)
+    latest_history_by_attempt = _latest_risk_history_by_attempt(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     cutoff = _recent_cutoff(recent_hours)
     attempt_rows = _build_persisted_attempt_rows(db, recent_hours=recent_hours, sync_cases=False)
@@ -976,10 +1203,7 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
     active_sessions = sum(
         1
         for row in attempt_rows
-        if (
-            row.get("attempt_status") == "ONGOING"
-            and _actionable_case_status(str(row.get("status") or "NEW"))
-        )
+        if _is_live_attempt_row(row)
     )
     high_risk_count = sum(
         1
@@ -1015,25 +1239,54 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
     else:
         live_event_rate = 0
 
-    feed_candidates: List[Dict[str, Any]] = []
-    for preferred_risk in ("HIGH", "MEDIUM", "LOW"):
-        match = next((row for row in attempt_rows if row.get("risk_level") == preferred_risk), None)
-        if match and match not in feed_candidates:
-            feed_candidates.append(match)
+    meaningful_feed_candidates: List[Dict[str, Any]] = []
     for row in attempt_rows:
-        if row not in feed_candidates:
-            feed_candidates.append(row)
-        if len(feed_candidates) >= 8:
-            break
+        attempt_id = row.get("attempt_id")
+        event_meta = latest_event_by_attempt.get(attempt_id)
+        meaningful_event_meta = latest_meaningful_event_by_attempt.get(attempt_id)
+        latest_history = latest_history_by_attempt.get(attempt_id)
+        if not _row_has_meaningful_behavioral_signal(row, meaningful_event_meta or event_meta):
+            continue
+        feed_event_time = max(
+            (
+                ts for ts in [
+                    _behavioral_feed_timestamp(row, meaningful_event_meta or event_meta),
+                    _meaningful_history_timestamp(row, latest_history),
+                ]
+                if ts is not None
+            ),
+            default=None,
+        )
+        meaningful_feed_candidates.append(
+            {
+                **row,
+                "_feed_event_time": feed_event_time,
+                "_feed_priority": _feed_priority_score(row, meaningful_event_meta or event_meta),
+                "_feed_queue_priority": _feed_queue_priority(str(row.get("status") or "NEW")),
+                "_event_meta": meaningful_event_meta or event_meta,
+            }
+        )
+
+    meaningful_feed_candidates.sort(
+        key=lambda row: (
+            row.get("_feed_event_time") or datetime.min.replace(tzinfo=timezone.utc),
+            row.get("_feed_queue_priority", 0),
+            row.get("_feed_priority", (0, 0.0))[0],
+            row.get("_feed_priority", (0, 0.0))[1],
+        ),
+        reverse=True,
+    )
 
     recent_risk_feed = []
-    for row in feed_candidates[:8]:
-        event_meta = latest_event_by_attempt.get(row.get("attempt_id"))
+    for row in meaningful_feed_candidates[:8]:
+        event_meta = row.get("_event_meta")
+        feed_timestamp = row.get("_feed_event_time")
         recent_risk_feed.append({
             "attempt_id": row.get("attempt_id"),
             "candidate_name": row.get("candidate_name") or getattr(event_meta, "candidate_name", None),
             "candidate_email": row.get("candidate_email") or getattr(event_meta, "candidate_email", None),
-            "timestamp": row.get("timestamp") or getattr(event_meta, "received_at", None) or getattr(event_meta, "occurred_at", None),
+            "timestamp": feed_timestamp.isoformat() if isinstance(feed_timestamp, datetime) else getattr(event_meta, "occurred_at", None) or getattr(event_meta, "received_at", None),
+            "assessment_name": row.get("assessment_name") or getattr(event_meta, "assessment_name", None),
             "risk_level": row.get("risk_level") or "LOW",
             "risk": row.get("risk_level") or "LOW",
             "score": round(safe_float(row.get("combined_score"), 0.0), 4),
@@ -1165,6 +1418,9 @@ def get_review_queue(
 
 
 def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
+    cleanup_result = expire_stale_demo_attempts(db)
+    if cleanup_result["updated_count"]:
+        db.commit()
     persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
     events = (
         db.query(RawExamEvent)
@@ -1234,8 +1490,12 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         risk_score=risk_score,
         risk_level=risk_level,
     )
+    provenance_result = dict(((getattr(persisted_state, "signals", None) or {}).get("answer_provenance") or {}))
     persisted_evidence_items = list(getattr(persisted_state, "evidence_summary", None) or [])
     evidence_items = persisted_evidence_items if persisted_evidence_items else computed_evidence_items
+    provenance_evidence = build_provenance_evidence_item(provenance_result)
+    if provenance_evidence is not None:
+        evidence_items = [provenance_evidence, *evidence_items]
     metadata_source = fallback_result or current_risk or {}
     session_narrative = (
         metadata_source.get("session_intelligence", {}) or {}
@@ -1273,8 +1533,10 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         "raw_explanation": assessment.get("strongest_reason") or getattr(latest_history, "reason", None),
         "strongest_reason": assessment.get("strongest_reason") or summary.get("strongest_reason"),
         "attempt_status": attempt_status,
+        "attempt_status_note": DEMO_EXPIRED_MESSAGE if attempt_status in {DEMO_EXPIRED_STATUS, DEMO_ABANDONED_STATUS} else None,
         "submitted_at": getattr(persisted_state, "submitted_at", None),
         "updated_at": getattr(persisted_state, "updated_at", None) or assessment.get("generated_at"),
+        "provenance_analysis": provenance_result or None,
         "final_risk_assessment": {
             "combined_score": round(risk_score, 4),
             "risk_level": risk_level,
@@ -1450,12 +1712,15 @@ async def score(batch: EventBatch):
 @app.post("/v1/events/ingest")
 async def ingest_event(event: ExamEventIngest):
     db = SessionLocal()
+    started_at = time.perf_counter()
 
     try:
         if not event.event_type:
             raise HTTPException(status_code=400, detail="event_type is required")
 
         received_at = utc_now()
+        is_submission_event = _is_submission_event_type(event.event_type)
+        persist_raw_event_started_at = time.perf_counter()
 
         raw_event = RawExamEvent(
             attempt_id=event.attempt_id,
@@ -1472,6 +1737,7 @@ async def ingest_event(event: ExamEventIngest):
 
         db.add(raw_event)
         db.flush()
+        persist_raw_event_ms = round((time.perf_counter() - persist_raw_event_started_at) * 1000, 2)
 
         redis_event = {
             "event_type": event.event_type,
@@ -1497,7 +1763,9 @@ async def ingest_event(event: ExamEventIngest):
                 )
             ]
 
+        scoring_started_at = time.perf_counter()
         result = run_scoring(scoring_events, event.attempt_id)
+        scoring_ms = round((time.perf_counter() - scoring_started_at) * 1000, 2)
         score_value = safe_float(result.get("combined_score"), 0.0)
         confidence_value = safe_float(result.get("confidence"), 0.0)
         risk_level = normalize_risk_level(score_value)
@@ -1534,8 +1802,7 @@ async def ingest_event(event: ExamEventIngest):
             "signals": signals,
         }
 
-        set_current_risk(event.attempt_id, current_risk_state)
-
+        persistence_started_at = time.perf_counter()
         _persist_timeline_snapshots(
             db,
             attempt_id=event.attempt_id,
@@ -1562,7 +1829,7 @@ async def ingest_event(event: ExamEventIngest):
             score=score_value,
             reason=reason,
             timestamp=snapshot_timestamp,
-            force=_risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
+            force=is_submission_event or _risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
         )
         _upsert_attempt_log(
             db,
@@ -1601,6 +1868,7 @@ async def ingest_event(event: ExamEventIngest):
         current_risk_state["submitted_at"] = getattr(attempt_state, "submitted_at", None)
         set_current_risk(event.attempt_id, current_risk_state)
         db.commit()
+        persistence_ms = round((time.perf_counter() - persistence_started_at) * 1000, 2)
 
         broadcast_payload = {
             "type": "risk_update",
@@ -1636,7 +1904,49 @@ async def ingest_event(event: ExamEventIngest):
             },
         }
 
-        await manager.broadcast(broadcast_payload)
+        broadcast_started_at = time.perf_counter()
+        websocket_payloads = [broadcast_payload]
+        if is_submission_event:
+            websocket_payloads.append({
+                "type": "attempt_submitted",
+                "attempt_id": event.attempt_id,
+                "candidate_id": event.candidate_id,
+                "candidate_name": event.candidate_name,
+                "assessment_id": event.assessment_id,
+                "assessment_name": event.assessment_name,
+                "risk": risk_level,
+                "combined_score": score_value,
+                "confidence": confidence_value,
+                "attempt_status": getattr(attempt_state, "status", None),
+                "submitted_at": getattr(attempt_state, "submitted_at", None),
+                "occurred_at": event.occurred_at or received_at,
+            })
+        if case_record is not None:
+            websocket_payloads.append({
+                "type": "case_created_or_updated",
+                "attempt_id": event.attempt_id,
+                "case_id": getattr(case_record, "id", None),
+                "status": getattr(case_record, "status", None),
+                "risk": risk_level,
+                "combined_score": score_value,
+                "confidence": confidence_value,
+                "updated_at": received_at,
+            })
+
+        await asyncio.gather(*(manager.broadcast(payload) for payload in websocket_payloads))
+        broadcast_ms = round((time.perf_counter() - broadcast_started_at) * 1000, 2)
+        total_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info(
+            "ingest_event_timing attempt_id=%s event_type=%s total_ms=%.2f raw_event_ms=%.2f scoring_ms=%.2f persistence_ms=%.2f broadcast_ms=%.2f event_count=%s",
+            event.attempt_id,
+            event.event_type,
+            total_ms,
+            persist_raw_event_ms,
+            scoring_ms,
+            persistence_ms,
+            broadcast_ms,
+            len(scoring_events),
+        )
 
         return {
             "status": "success",
@@ -1646,6 +1956,13 @@ async def ingest_event(event: ExamEventIngest):
             "current_risk": risk_level,
             "current_confidence": confidence_value,
             "current_score": score_value,
+            "timings_ms": {
+                "raw_event": persist_raw_event_ms,
+                "scoring": scoring_ms,
+                "persistence": persistence_ms,
+                "broadcast": broadcast_ms,
+                "total": total_ms,
+            },
             "result": {
                 **result,
                 "risk": risk_level,
@@ -1666,8 +1983,96 @@ async def ingest_event(event: ExamEventIngest):
         db.close()
 
 
+@app.post("/v1/attempts/{attempt_id}/answers")
+def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload):
+    if attempt_id != payload.attempt_id:
+        raise HTTPException(status_code=400, detail="Attempt id mismatch")
+
+    db = SessionLocal()
+    try:
+        attempt_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+        if attempt_state is None:
+            attempt_state = AttemptState(attempt_id=attempt_id, updated_at=utc_now(), status="SUBMITTED")
+            db.add(attempt_state)
+
+        answers = [
+            {
+                "question_id": item.question_id,
+                "question_title": item.question_title,
+                "section_id": item.section_id,
+                "section_title": item.section_title,
+                "assessment_type": item.assessment_type,
+                "input_type": item.input_type,
+                "answer_text": item.answer_text,
+                "marked_for_review": bool(item.marked_for_review),
+            }
+            for item in payload.answers
+            if str(item.answer_text or "").strip()
+        ]
+
+        events = [
+            {
+                "event_type": row.event_type,
+                "payload": row.payload or {},
+                "occurred_at": row.occurred_at,
+            }
+            for row in (
+                db.query(RawExamEvent)
+                .filter(RawExamEvent.attempt_id == attempt_id)
+                .order_by(RawExamEvent.occurred_at.asc())
+                .all()
+            )
+        ]
+
+        provenance_result = analyze_answer_provenance(
+            attempt_id=attempt_id,
+            assessment_name=payload.assessment_name or attempt_state.assessment_name or "",
+            submitted_answers=answers,
+            events=events,
+        )
+
+        existing_signals = dict(getattr(attempt_state, "signals", None) or {})
+        existing_signals["submitted_answers"] = answers
+        existing_signals["answer_provenance"] = provenance_result
+
+        attempt_state.candidate_id = payload.candidate_id or attempt_state.candidate_id
+        attempt_state.candidate_name = payload.candidate_name or attempt_state.candidate_name
+        attempt_state.candidate_email = payload.candidate_email or attempt_state.candidate_email
+        attempt_state.assessment_id = payload.assessment_id or attempt_state.assessment_id
+        attempt_state.assessment_name = payload.assessment_name or attempt_state.assessment_name
+        attempt_state.signals = existing_signals
+        attempt_state.updated_at = utc_now()
+        if not attempt_state.submitted_at:
+            attempt_state.submitted_at = attempt_state.updated_at
+        if attempt_state.status in {"ONGOING", "IN_PROGRESS", ""}:
+            attempt_state.status = "SUBMITTED"
+
+        db.commit()
+        return {
+            "status": "success",
+            "attempt_id": attempt_id,
+            "data": provenance_result,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to persist submitted answers: {exc}") from exc
+    finally:
+        db.close()
+
+
 @app.get("/v1/live-risk/{attempt_id}")
 def get_live_risk(attempt_id: str, _user=Depends(require_reviewer)):
+    db = SessionLocal()
+    try:
+        cleanup_result = expire_stale_demo_attempts(db)
+        if cleanup_result["updated_count"]:
+            db.commit()
+    finally:
+        db.close()
     data = get_current_risk(attempt_id)
 
     if not data:

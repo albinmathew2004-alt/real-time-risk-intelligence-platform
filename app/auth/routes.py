@@ -7,8 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from engine.db.database import SessionLocal
 from app.auth.security import create_access_token, verify_password
 from app.models.user import User
+from app.runtime_env import load_local_env
 from app.schemas.auth import LoginRequest, TokenResponse, UserOut
 from app.auth.dependencies import get_current_user
+
+
+load_local_env()
 
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
