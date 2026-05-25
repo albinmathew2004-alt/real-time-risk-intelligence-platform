@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import json
 import logging
+import os
 import re
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -17,6 +19,8 @@ MEDIUM = "MEDIUM"
 HIGH = "HIGH"
 PROVENANCE_VALIDATION_TRACK = "Testing Post-Submission Answer Provenance Analysis"
 LIMITATIONS_NOTE = "Source matches indicate potential reference overlap, not definitive proof of copying."
+WEB_RETRIEVAL_LIMITATIONS_NOTE = "Web retrieval matches are experimental and may contain approximate or indirect overlaps."
+ENABLE_EXPERIMENTAL_WEB_RETRIEVAL = os.getenv("ENABLE_EXPERIMENTAL_WEB_RETRIEVAL", "false").strip().lower() in {"1", "true", "yes", "on"}
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +59,34 @@ class ProvenanceResult:
     limitations_note: str
 
 
+@dataclass(slots=True)
+class RetrievedWebCandidate:
+    source_candidate: SourceCandidate
+    retrieval_source: str
+    retrieval_confidence: float
+    retrieved_at: str
+    ranking_position: int | None = None
+    query: str | None = None
+    extraction_status: str = "not_fetched"
+
+
+@dataclass(slots=True)
+class RetrievalResult:
+    enabled: bool
+    provider_name: str
+    generated_queries: list[str]
+    candidates: list[RetrievedWebCandidate]
+    retrieved_at: str
+    note: str
+
+
+class RetrievalProvider(Protocol):
+    provider_name: str
+
+    def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        ...
+
+
 class WebSearchProvider(Protocol):
     def search(self, query: str, *, limit: int = 5) -> list[SourceCandidate]:
         ...
@@ -82,6 +114,208 @@ class InactiveProvenanceProviders:
     crawler_provider: CrawlerProvider | None = None
     OCR_provider: OCRProvider | None = None
     vector_search_provider: VectorSearchProvider | None = None
+
+
+class SearchQueryBuilder:
+    def __init__(self, *, max_queries: int = 3, max_terms: int = 14) -> None:
+        self.max_queries = max_queries
+        self.max_terms = max_terms
+
+    def build_queries(self, *, answer_text: str, question_title: str = "", assessment_name: str = "") -> list[str]:
+        normalized_answer = _normalize_text(answer_text)
+        if not normalized_answer:
+            return []
+        chunks = _chunk_text(normalized_answer, chunk_size=180)[: self.max_queries]
+        prefix_terms = [term for term in _tokenize(f"{question_title} {assessment_name}") if len(term) > 2][:5]
+        queries: list[str] = []
+        for chunk in chunks:
+            chunk_terms = [term for term in _tokenize(chunk) if len(term) > 2][: self.max_terms]
+            merged_terms = []
+            seen: set[str] = set()
+            for term in [*prefix_terms, *chunk_terms]:
+                if term and term not in seen:
+                    seen.add(term)
+                    merged_terms.append(term)
+            query = " ".join(merged_terms[: self.max_terms]).strip()
+            if query and query not in queries:
+                queries.append(query)
+        return queries
+
+
+class BraveSearchProvider:
+    provider_name = "brave_search"
+
+    def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        return _disabled_retrieval_result(self.provider_name, queries)
+
+
+class BingSearchProvider:
+    provider_name = "bing_search"
+
+    def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        return _disabled_retrieval_result(self.provider_name, queries)
+
+
+class InternalCorpusProvider:
+    provider_name = "internal_corpus"
+
+    def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        retrieved_at = _utcnow_iso()
+        candidates: list[RetrievedWebCandidate] = []
+        if not queries:
+            return RetrievalResult(
+                enabled=ENABLE_EXPERIMENTAL_WEB_RETRIEVAL,
+                provider_name=self.provider_name,
+                generated_queries=[],
+                candidates=[],
+                retrieved_at=retrieved_at,
+                note="No retrieval queries were generated.",
+            )
+        corpus = load_reference_corpus()
+        ranked: list[tuple[float, dict[str, Any], str]] = []
+        for query in queries:
+            for reference in corpus:
+                query_score = _similarity_score(query, str(reference.get("content") or ""))
+                if query_score <= 0:
+                    continue
+                ranked.append((query_score, reference, query))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        for index, (score, reference, query) in enumerate(ranked[:limit], start=1):
+            source_candidate = _build_source_candidate({**reference, "retrieved_from": self.provider_name})
+            candidates.append(
+                RetrievedWebCandidate(
+                    source_candidate=source_candidate,
+                    retrieval_source=self.provider_name,
+                    retrieval_confidence=round(score, 4),
+                    retrieved_at=retrieved_at,
+                    ranking_position=index,
+                    query=query,
+                    extraction_status="corpus_preview",
+                )
+            )
+        return RetrievalResult(
+            enabled=ENABLE_EXPERIMENTAL_WEB_RETRIEVAL,
+            provider_name=self.provider_name,
+            generated_queries=queries,
+            candidates=candidates,
+            retrieved_at=retrieved_at,
+            note="Internal corpus retrieval can be used as a future fallback when live web retrieval is enabled.",
+        )
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _disabled_retrieval_result(provider_name: str, queries: list[str]) -> RetrievalResult:
+    return RetrievalResult(
+        enabled=False,
+        provider_name=provider_name,
+        generated_queries=queries,
+        candidates=[],
+        retrieved_at=_utcnow_iso(),
+        note="Experimental web retrieval is disabled by feature flag.",
+    )
+
+
+def _future_page_content_extraction(url: str) -> dict[str, Any]:
+    return {
+        "url": url,
+        "status": "disabled",
+        "content": None,
+        "note": "Page-content extraction hook is reserved for a future retrieval pipeline.",
+    }
+
+
+def _future_vector_search_hook(text: str) -> dict[str, Any]:
+    return {
+        "query_text_length": len(_normalize_text(text)),
+        "status": "disabled",
+        "matches": [],
+        "note": "Vector-search integration hook is reserved for future provenance retrieval experiments.",
+    }
+
+
+def _build_retrieval_candidates_for_answer(
+    *,
+    answer: dict[str, Any],
+    assessment_name: str,
+    query_builder: SearchQueryBuilder,
+    providers: list[RetrievalProvider],
+) -> list[RetrievalResult]:
+    queries = query_builder.build_queries(
+        answer_text=str(answer.get("answer_text") or ""),
+        question_title=str(answer.get("question_title") or ""),
+        assessment_name=assessment_name,
+    )
+    if not queries:
+        return []
+    results: list[RetrievalResult] = []
+    for provider in providers:
+        results.append(provider.retrieve(queries, limit=3))
+    return results
+
+
+def _experimental_retrieval_hooks(
+    *,
+    answers: list[dict[str, Any]],
+    assessment_name: str,
+) -> dict[str, Any]:
+    query_builder = SearchQueryBuilder()
+    generated_queries = [
+        query
+        for answer in answers[:2]
+        for query in query_builder.build_queries(
+            answer_text=str(answer.get("answer_text") or ""),
+            question_title=str(answer.get("question_title") or ""),
+            assessment_name=assessment_name,
+        )
+    ]
+    if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL:
+        return {
+            "enabled": False,
+            "generated_at": _utcnow_iso(),
+            "generated_queries": generated_queries[:6],
+            "results": [],
+            "page_content_extraction": _future_page_content_extraction(""),
+            "vector_search": _future_vector_search_hook(
+                " ".join(str(answer.get("answer_text") or "") for answer in answers[:1])
+            ),
+            "limitations_note": WEB_RETRIEVAL_LIMITATIONS_NOTE,
+        }
+    providers: list[RetrievalProvider] = [
+        InternalCorpusProvider(),
+        BraveSearchProvider(),
+        BingSearchProvider(),
+    ]
+    retrieval_results = [
+        asdict(result)
+        for answer in answers[:2]
+        for result in _build_retrieval_candidates_for_answer(
+            answer=answer,
+            assessment_name=assessment_name,
+            query_builder=query_builder,
+            providers=providers,
+        )
+    ]
+    sample_url = None
+    for result in retrieval_results:
+        candidates = list(result.get("candidates") or [])
+        if candidates:
+            sample_url = ((candidates[0] or {}).get("source_candidate") or {}).get("source_url")
+            if sample_url:
+                break
+    return {
+        "enabled": ENABLE_EXPERIMENTAL_WEB_RETRIEVAL,
+        "generated_at": _utcnow_iso(),
+        "generated_queries": generated_queries[:6],
+        "results": retrieval_results,
+        "page_content_extraction": _future_page_content_extraction(sample_url or ""),
+        "vector_search": _future_vector_search_hook(
+            " ".join(str(answer.get("answer_text") or "") for answer in answers[:1])
+        ),
+        "limitations_note": WEB_RETRIEVAL_LIMITATIONS_NOTE,
+    }
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -484,6 +718,7 @@ def analyze_answer_provenance(
     answers = [item for item in submitted_answers if str(item.get("answer_text") or "").strip()]
     event_list = list(events or [])
     corpus = load_reference_corpus()
+    retrieval_hooks = _experimental_retrieval_hooks(answers=answers, assessment_name=assessment_name)
     validation_mode = _is_validation_mode(assessment_name, answers)
     minimum_match_threshold, _, _ = _match_thresholds(validation_mode)
     logger.info(
@@ -553,6 +788,9 @@ def analyze_answer_provenance(
                     "source_url": source_candidate.source_url,
                     "source_domain": source_candidate.source_domain,
                     "retrieved_from": source_candidate.retrieved_from,
+                    "retrieval_source": source_candidate.retrieved_from,
+                    "retrieval_confidence": round(similarity, 4),
+                    "retrieval_timestamp": retrieval_hooks.get("generated_at"),
                     "content_snippet": source_candidate.content_snippet,
                     "tags": source_candidate.tags,
                     "similarity_score": match_evidence.similarity_score,
@@ -628,6 +866,8 @@ def analyze_answer_provenance(
         },
         "reviewer_summary": result.reviewer_summary,
         "limitations_note": result.limitations_note,
+        "experimental_web_retrieval": retrieval_hooks,
+        "web_retrieval_disclaimer": WEB_RETRIEVAL_LIMITATIONS_NOTE if ENABLE_EXPERIMENTAL_WEB_RETRIEVAL else "",
         "top_matches": result.top_matches,
         "evidence_title": "Potential External Similarity Pattern" if result.likelihood in {MEDIUM, HIGH} else None,
     }

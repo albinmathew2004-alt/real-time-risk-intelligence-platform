@@ -1485,37 +1485,61 @@ function setStoredSetting(key, value) {
   }
 }
 
-async function authJsonFetch(url, { token, method = "GET", body } = {}) {
+async function authJsonFetch(url, options = {}) {
+  const {
+    token,
+    method = "GET",
+    body,
+    timeoutMs = 12000,
+    retries = 0,
+    retryDelayMs = 700,
+  } = options;
   const headers = { "Content-Type": "application/json" };
   if (token) headers.Authorization = `Bearer ${token}`;
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 12000);
-  try {
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    let data = null;
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { detail: text };
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = { detail: text };
+        }
       }
+      const payload = { ok: res.ok, status: res.status, data };
+      if ((payload.ok || payload.status !== 0) || attempt >= retries) {
+        return payload;
+      }
+    } catch {
+      if (attempt >= retries) {
+        return {
+          ok: false,
+          status: 0,
+          data: { detail: "Backend is unavailable or waking up. Please retry shortly." },
+        };
+      }
+    } finally {
+      window.clearTimeout(timeoutId);
     }
-    return { ok: res.ok, status: res.status, data };
-  } catch {
-    return {
-      ok: false,
-      status: 0,
-      data: { detail: "Backend is unavailable or waking up. Please retry shortly." },
-    };
-  } finally {
-    window.clearTimeout(timeoutId);
+
+    await new Promise((resolve) => window.setTimeout(resolve, retryDelayMs * (attempt + 1)));
   }
+
+  return {
+    ok: false,
+    status: 0,
+    data: { detail: "Backend is unavailable or waking up. Please retry shortly." },
+  };
 }
 
 const DEMO_MONACO_LOADER_URL = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js";
@@ -1689,6 +1713,22 @@ function DemoMonacoEditor({ language, value, onChange, readOnly = false }) {
 }
 
 const PUBLIC_DEMO_ASSESSMENTS = [
+  {
+    id: "assessment_behavioral_integrity_demo",
+    name: "Behavioral Integrity Demo",
+    durationMinutes: 9,
+    icon: Shield,
+    intro: "A polished integrity-focused walkthrough that highlights focus loss, tab switching, clipboard activity, and the reviewer evidence timeline.",
+    sectionOrder: ["frontend", "logic", "sql", "security"],
+  },
+  {
+    id: "assessment_enterprise_investigation_demo",
+    name: "Enterprise Investigation Demo",
+    durationMinutes: 10,
+    icon: ClipboardList,
+    intro: "A reviewer-storytelling track designed to showcase escalation paths, evidence grouping, and end-to-end enterprise investigation workflow.",
+    sectionOrder: ["security", "frontend", "sql", "logic"],
+  },
   {
     id: "assessment_integrity_showcase",
     name: "Assessment Integrity Showcase",
@@ -2258,31 +2298,31 @@ function getDemoSignalToast(event) {
   const idleDuration = Number(payload.duration_seconds || 0);
 
   if (eventType === "visibility_change" && state === "hidden") {
-    return { key: "visibility_hidden", label: "Focus change observed" };
+    return { key: "visibility_hidden", group: "focus_shift", label: "Focus change observed" };
   }
   if (eventType === "visibility_change" && state === "visible") {
-    return { key: "visibility_visible", label: "Focus returned to assessment" };
+    return { key: "visibility_visible", group: "focus_recovery", label: "Focus returned to assessment" };
   }
   if (eventType === "blur") {
-    return { key: "focus_loss", label: "Focus change observed" };
+    return { key: "focus_loss", group: "focus_shift", label: "Focus change observed" };
   }
   if (eventType === "focus") {
-    return { key: "focus_return", label: "Focus returned to assessment" };
+    return { key: "focus_return", group: "focus_recovery", label: "Focus returned to assessment" };
   }
   if (eventType === "clipboard" && action === "paste") {
-    return { key: "clipboard_paste", label: "Clipboard activity recorded" };
+    return { key: "clipboard_paste", group: "clipboard_activity", label: "Clipboard activity recorded" };
   }
   if (eventType === "clipboard" && action === "copy") {
-    return { key: "clipboard_copy", label: "Clipboard activity recorded" };
+    return { key: "clipboard_copy", group: "clipboard_activity", label: "Clipboard activity recorded" };
   }
   if (eventType === "answer_change" && changeType === "paste" && (answerLength >= 180 || pasteSize === "large")) {
-    return { key: "large_answer_insert", label: "Large answer insertion noted" };
+    return { key: "large_answer_insert", group: "answer_shift", label: "Large answer insertion noted" };
   }
   if (eventType === "idle_state" && state === "idle" && idleDuration >= 20) {
-    return { key: "idle_period", label: "Long inactivity period observed" };
+    return { key: "idle_period", group: "idle_transition", label: "Long inactivity period observed" };
   }
   if (eventType === "idle_state" && state === "active") {
-    return { key: "idle_recovery", label: "Assessment integrity signal logged" };
+    return { key: "idle_recovery", group: "idle_transition", label: "Assessment integrity signal logged" };
   }
   return null;
 }
@@ -2290,7 +2330,12 @@ function getDemoSignalToast(event) {
 function PublicDemoPage({ apiBaseUrl }) {
   const initialCompletion = useMemo(() => getDemoCompletionFromLocation(), []);
   const tracker = useMemo(() => ({ visited: new Set(), lastSectionId: "" }), []);
-  const toastTracker = useRef({ lastShownAt: {}, dismissTimers: {}, lastAnswerChangeByQuestion: {} });
+  const toastTracker = useRef({
+    lastShownAt: {},
+    dismissTimers: {},
+    lastAnswerChangeByQuestion: {},
+    recentTelemetrySignatures: {},
+  });
   const [consented, setConsented] = useState(false);
   const [candidateName, setCandidateName] = useState(() => initialCompletion?.candidateName || "");
   const [candidateEmail, setCandidateEmail] = useState("");
@@ -2362,9 +2407,10 @@ function PublicDemoPage({ apiBaseUrl }) {
   const addDemoSignalToast = useCallback((toast) => {
     if (!DEMO_SIGNAL_TOASTS_ENABLED || stage !== "assessment" || !toast?.key || !toast?.label) return;
     const now = Date.now();
-    const lastShownAt = toastTracker.current.lastShownAt[toast.key] || 0;
+    const cooldownKey = toast.group || toast.key;
+    const lastShownAt = toastTracker.current.lastShownAt[cooldownKey] || 0;
     if (now - lastShownAt < DEMO_SIGNAL_TOAST_COOLDOWN_MS) return;
-    toastTracker.current.lastShownAt[toast.key] = now;
+    toastTracker.current.lastShownAt[cooldownKey] = now;
 
     const toastId = `${toast.key}-${now}`;
     setSignalToasts((prev) => {
@@ -2444,6 +2490,19 @@ function PublicDemoPage({ apiBaseUrl }) {
 
     function handleTelemetryToast(event) {
       const toast = getDemoSignalToast(event.detail);
+      const payload = event?.detail?.payload || {};
+      const signature = [
+        toast?.group || toast?.key || "",
+        event?.detail?.event_type || "",
+        payload?.state || payload?.visibility_state || payload?.action || payload?.operation || "",
+        payload?.question_id || "",
+      ].join("|");
+      const now = Date.now();
+      const lastSeenAt = toastTracker.current.recentTelemetrySignatures[signature] || 0;
+      if (toast && now - lastSeenAt < 1400) return;
+      if (toast) {
+        toastTracker.current.recentTelemetrySignatures[signature] = now;
+      }
       if (toast) addDemoSignalToast(toast);
     }
 
@@ -2529,24 +2588,34 @@ function PublicDemoPage({ apiBaseUrl }) {
     setQuestionIndex(Math.max(0, Math.min(totalQuestions - 1, nextIndex)));
   }, [totalQuestions]);
 
-  const waitForReportReadiness = useCallback(async (targetAttemptId, { timeoutMs = 15000, intervalMs = 1000 } = {}) => {
+  const waitForReportReadiness = useCallback(async (targetAttemptId, { timeoutMs = 22000, intervalMs = 900 } = {}) => {
     const startedAt = Date.now();
+    const reportUrlFallback = targetAttemptId?.startsWith("demo_public_")
+      ? `/demo/report/${encodeURIComponent(targetAttemptId)}`
+      : `/?attemptId=${encodeURIComponent(targetAttemptId)}`;
     let lastKnown = {
       reportReady: false,
       provenanceReady: false,
       timedOut: false,
-      reportUrl: `/?attemptId=${encodeURIComponent(targetAttemptId)}`,
+      reportUrl: reportUrlFallback,
     };
+    let attemptCount = 0;
 
     while (Date.now() - startedAt < timeoutMs) {
-      const result = await authJsonFetch(`${apiBaseUrl.replace(/\/$/, "")}/v1/reports/${targetAttemptId}/status`);
+      attemptCount += 1;
+      const elapsedMs = Date.now() - startedAt;
+      const result = await authJsonFetch(`${apiBaseUrl.replace(/\/$/, "")}/v1/reports/${targetAttemptId}/status`, {
+        timeoutMs: 7000,
+        retries: 1,
+        retryDelayMs: 500,
+      });
       if (result.ok && result.data?.data) {
         const statusData = result.data.data;
         lastKnown = {
           reportReady: Boolean(statusData.report_exists),
           provenanceReady: Boolean(statusData.provenance_ready),
           timedOut: false,
-          reportUrl: statusData.report_url || `/?attemptId=${encodeURIComponent(targetAttemptId)}`,
+          reportUrl: statusData.report_url || reportUrlFallback,
         };
         if (lastKnown.provenanceReady) {
           console.info("[Demo Submit Lifecycle]", { event: "provenance_ready", attemptId: targetAttemptId });
@@ -2557,8 +2626,12 @@ function PublicDemoPage({ apiBaseUrl }) {
         if (lastKnown.reportReady && lastKnown.provenanceReady) {
           return lastKnown;
         }
+        if (lastKnown.reportReady && elapsedMs >= Math.min(timeoutMs - 2000, 9000)) {
+          return lastKnown;
+        }
       }
-      await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+      const nextIntervalMs = Math.min(intervalMs + (attemptCount > 5 ? 250 : 0), 1600);
+      await new Promise((resolve) => window.setTimeout(resolve, nextIntervalMs));
     }
 
     return {
@@ -2612,6 +2685,7 @@ function PublicDemoPage({ apiBaseUrl }) {
     setSignalToasts([]);
     toastTracker.current.lastShownAt = {};
     toastTracker.current.lastAnswerChangeByQuestion = {};
+    toastTracker.current.recentTelemetrySignatures = {};
     setTelemetryError("");
     tracker.visited.clear();
     tracker.lastSectionId = "";
@@ -2788,7 +2862,11 @@ function PublicDemoPage({ apiBaseUrl }) {
       });
 
       if (finalFlush && finalFlush.ok === false) {
-        throw new Error("Final telemetry sync timed out before the reviewer report was ready.");
+        console.warn("[Demo Submit Lifecycle]", {
+          event: "telemetry_flush_timeout",
+          attemptId,
+          queueLength: finalFlush.queueLength ?? 0,
+        });
       }
 
       const submittedAnswersPayload = {
@@ -2817,6 +2895,9 @@ function PublicDemoPage({ apiBaseUrl }) {
         {
           method: "POST",
           body: submittedAnswersPayload,
+          timeoutMs: 12000,
+          retries: 1,
+          retryDelayMs: 800,
         },
       );
       const provenancePersistDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - provenancePersistStartedAt;
@@ -2915,6 +2996,7 @@ function PublicDemoPage({ apiBaseUrl }) {
     setSignalToasts([]);
     toastTracker.current.lastShownAt = {};
     toastTracker.current.lastAnswerChangeByQuestion = {};
+    toastTracker.current.recentTelemetrySignatures = {};
     setStage("welcome");
     setTimeRemaining(selectedAssessment.durationMinutes * 60);
     tracker.visited.clear();
@@ -6056,6 +6138,9 @@ function ProvenanceIntelligenceCard({
             {provenanceAnalysis.limitations_note ? (
               <p className="provenance-limitations-note">{provenanceAnalysis.limitations_note}</p>
             ) : null}
+            {provenanceAnalysis.web_retrieval_disclaimer ? (
+              <p className="provenance-limitations-note">{provenanceAnalysis.web_retrieval_disclaimer}</p>
+            ) : null}
           </div>
           {(provenanceAnalysis.behavioral_correlation || []).length ? (
             <div className="provenance-correlation-list">
@@ -6101,10 +6186,28 @@ function ProvenanceIntelligenceCard({
                         <span>Source</span>
                         <strong>{match.source_type || "Reference"}</strong>
                       </div>
+                      {match.retrieval_source ? (
+                        <div>
+                          <span>Retrieval Source</span>
+                          <strong>{match.retrieval_source}</strong>
+                        </div>
+                      ) : null}
                       <div>
                         <span>Domain</span>
                         <strong>{match.source_domain || "Controlled corpus"}</strong>
                       </div>
+                      {match.retrieval_confidence != null ? (
+                        <div>
+                          <span>Retrieval Confidence</span>
+                          <strong>{formatNumber(match.retrieval_confidence, 2)}</strong>
+                        </div>
+                      ) : null}
+                      {match.retrieval_timestamp ? (
+                        <div>
+                          <span>Retrieved</span>
+                          <strong>{formatDateTime(match.retrieval_timestamp)}</strong>
+                        </div>
+                      ) : null}
                       <div>
                         <span>Match Reason</span>
                         <strong>{match.match_reason || match.confidence_label || "Observed similarity pattern"}</strong>
@@ -6156,7 +6259,8 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
 
     async function loadReport() {
       const startedAt = Date.now();
-      while (!cancelled && Date.now() - startedAt < 15000) {
+      let transientFailureCount = 0;
+      while (!cancelled && Date.now() - startedAt < 18000) {
         const requestUrl = `${apiBaseUrl.replace(/\/$/, "")}/v1/demo/attempts/${encodeURIComponent(attemptId)}/report`;
         console.info("[Candidate Report]", {
           event: "candidate_report_fetch_started",
@@ -6182,15 +6286,21 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
             message: error instanceof Error ? error.message : "Unknown fetch error",
           });
           window.clearTimeout(timeoutId);
-          if (!cancelled) {
+          transientFailureCount += 1;
+          if (cancelled) return;
+          if (transientFailureCount >= 3) {
             setReportState({
               loading: false,
               ready: false,
               data: null,
               error: "Backend is unavailable or waking up. Please retry shortly.",
             });
+            return;
           }
-          return;
+          await new Promise((resolve) => {
+            timerId = window.setTimeout(resolve, 1100 * transientFailureCount);
+          });
+          continue;
         } finally {
           window.clearTimeout(timeoutId);
         }
@@ -6214,6 +6324,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           setReportState({ loading: false, ready: true, data: payload.data, error: "" });
           return;
         }
+        transientFailureCount = 0;
 
         if (response?.status === 404) {
           console.error("[Candidate Report]", {
@@ -6421,6 +6532,15 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
               <h3>{reportState.error ? "Report unavailable" : "Generating your report..."}</h3>
             </div>
             <p>{reportState.error || "Behavioral analysis, evidence sections, and answer provenance details are still being prepared for this attempt."}</p>
+            {reportState.error ? (
+              <div className="public-demo-actions">
+                <button className="workflow-action-btn primary" onClick={() => window.location.reload()} type="button">
+                  <RefreshCw size={16} />
+                  Retry Report Load
+                </button>
+                <a className="workflow-action-btn" href="/demo">Start New Demo</a>
+              </div>
+            ) : null}
           </section>
         ) : (
           <>

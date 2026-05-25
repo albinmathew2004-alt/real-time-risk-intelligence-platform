@@ -1564,6 +1564,9 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "source_url": match.get("source_url"),
             "source_domain": match.get("source_domain"),
             "retrieved_from": match.get("retrieved_from"),
+            "retrieval_source": match.get("retrieval_source"),
+            "retrieval_confidence": round(safe_float(match.get("retrieval_confidence"), 0.0), 4) if match.get("retrieval_confidence") is not None else None,
+            "retrieval_timestamp": match.get("retrieval_timestamp"),
             "content_snippet": match.get("content_snippet"),
             "question_id": match.get("question_id"),
             "question_title": match.get("question_title"),
@@ -1593,6 +1596,7 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "evidence_title": provenance.get("evidence_title"),
             "reviewer_summary": provenance.get("reviewer_summary") or provenance.get("summary") or "",
             "limitations_note": provenance.get("limitations_note") or "",
+            "web_retrieval_disclaimer": provenance.get("web_retrieval_disclaimer") or "",
         }
 
     return {
@@ -2344,6 +2348,10 @@ def get_attempt_report(attempt_id: str, _user=Depends(require_reviewer)):
 def get_attempt_report_status(attempt_id: str):
     db = SessionLocal()
     try:
+        cleanup_result = expire_stale_demo_attempts(db)
+        if cleanup_result["updated_count"]:
+            db.commit()
+        report_url = f"/demo/report/{attempt_id}" if _is_public_demo_attempt_id(attempt_id) else f"/?attemptId={attempt_id}"
         persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
         if persisted_state is None:
             return {
@@ -2354,7 +2362,7 @@ def get_attempt_report_status(attempt_id: str):
                     "provenance_ready": False,
                     "attempt_status": None,
                     "submitted_at": None,
-                    "report_url": f"/?attemptId={attempt_id}",
+                    "report_url": report_url,
                 },
             }
 
@@ -2383,7 +2391,7 @@ def get_attempt_report_status(attempt_id: str):
                 "provenance_ready": provenance_ready,
                 "attempt_status": getattr(persisted_state, "status", None),
                 "submitted_at": getattr(persisted_state, "submitted_at", None),
-                "report_url": f"/?attemptId={attempt_id}",
+                "report_url": report_url,
             },
         }
     except Exception as exc:
@@ -2393,13 +2401,13 @@ def get_attempt_report_status(attempt_id: str):
             "attempt_id": attempt_id,
             "message": str(exc),
             "data": {
-                "report_exists": False,
-                "provenance_ready": False,
-                "attempt_status": None,
-                "submitted_at": None,
-                "report_url": f"/?attemptId={attempt_id}",
-            },
-        }
+                    "report_exists": False,
+                    "provenance_ready": False,
+                    "attempt_status": None,
+                    "submitted_at": None,
+                    "report_url": report_url,
+                },
+            }
     finally:
         db.close()
 
@@ -2411,6 +2419,9 @@ def get_public_demo_attempt_report(attempt_id: str):
 
     db = SessionLocal()
     try:
+        cleanup_result = expire_stale_demo_attempts(db)
+        if cleanup_result["updated_count"]:
+            db.commit()
         persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
         if persisted_state is None:
             return {
