@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from html import unescape
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Protocol
 from urllib.parse import urlparse
+import requests
 
 
 CORPUS_PATH = Path(__file__).resolve().parents[1] / "data" / "provenance_reference_corpus.json"
@@ -21,6 +23,10 @@ PROVENANCE_VALIDATION_TRACK = "Testing Post-Submission Answer Provenance Analysi
 LIMITATIONS_NOTE = "Source matches indicate potential reference overlap, not definitive proof of copying."
 WEB_RETRIEVAL_LIMITATIONS_NOTE = "Web retrieval matches are experimental and may contain approximate or indirect overlaps."
 ENABLE_EXPERIMENTAL_WEB_RETRIEVAL = os.getenv("ENABLE_EXPERIMENTAL_WEB_RETRIEVAL", "false").strip().lower() in {"1", "true", "yes", "on"}
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+WEB_RETRIEVAL_MAX_RESULTS = max(1, int(os.getenv("WEB_RETRIEVAL_MAX_RESULTS", "3") or "3"))
+WEB_RETRIEVAL_TIMEOUT_SECONDS = max(1, int(os.getenv("WEB_RETRIEVAL_TIMEOUT_SECONDS", "6") or "6"))
+BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 logger = logging.getLogger(__name__)
 
 
@@ -146,7 +152,90 @@ class BraveSearchProvider:
     provider_name = "brave_search"
 
     def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
-        return _disabled_retrieval_result(self.provider_name, queries)
+        if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL:
+            return _disabled_retrieval_result(self.provider_name, queries)
+        if not BRAVE_SEARCH_API_KEY:
+            return RetrievalResult(
+                enabled=True,
+                provider_name=self.provider_name,
+                generated_queries=queries,
+                candidates=[],
+                retrieved_at=_utcnow_iso(),
+                note="Brave Search API key is not configured. Falling back to controlled corpus matching only.",
+            )
+
+        retrieved_at = _utcnow_iso()
+        candidates: list[RetrievedWebCandidate] = []
+        seen_urls: set[str] = set()
+        try:
+            for query in queries[:3]:
+                response = requests.get(
+                    BRAVE_SEARCH_ENDPOINT,
+                    headers={
+                        "Accept": "application/json",
+                        "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+                        "User-Agent": "ProctorIQ/1.0 experimental provenance retrieval",
+                    },
+                    params={
+                        "q": query,
+                        "count": min(max(1, limit), 5),
+                        "text_decorations": False,
+                        "search_lang": "en",
+                        "country": "US",
+                    },
+                    timeout=WEB_RETRIEVAL_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                results = list((((payload or {}).get("web") or {}).get("results") or []))
+                for result in results:
+                    source_url = str(result.get("url") or "").strip()
+                    if not _is_retrievable_url(source_url) or source_url in seen_urls:
+                        continue
+                    seen_urls.add(source_url)
+                    extracted = _fetch_webpage_candidate(
+                        url=source_url,
+                        source_title=str(result.get("title") or result.get("meta_title") or "Possible web reference"),
+                        source_type="Web reference",
+                        retrieved_from=self.provider_name,
+                        query=query,
+                    )
+                    if extracted is None:
+                        continue
+                    candidates.append(
+                        RetrievedWebCandidate(
+                            source_candidate=extracted,
+                            retrieval_source=self.provider_name,
+                            retrieval_confidence=round(_safe_float(result.get("page_age"), 0.0) * 0.0 + 0.62, 4),
+                            retrieved_at=retrieved_at,
+                            ranking_position=len(candidates) + 1,
+                            query=query,
+                            extraction_status="content_extracted",
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(candidates) >= limit:
+                    break
+        except Exception as exc:
+            logger.warning("brave_retrieval_failed provider=%s error=%s", self.provider_name, exc)
+            return RetrievalResult(
+                enabled=True,
+                provider_name=self.provider_name,
+                generated_queries=queries,
+                candidates=[],
+                retrieved_at=retrieved_at,
+                note="Brave retrieval failed. Falling back to controlled corpus matching only.",
+            )
+
+        return RetrievalResult(
+            enabled=True,
+            provider_name=self.provider_name,
+            generated_queries=queries,
+            candidates=candidates[:limit],
+            retrieved_at=retrieved_at,
+            note="Experimental Brave retrieval completed.",
+        )
 
 
 class BingSearchProvider:
@@ -218,6 +307,70 @@ def _disabled_retrieval_result(provider_name: str, queries: list[str]) -> Retrie
     )
 
 
+def _is_retrievable_url(url: str) -> bool:
+    normalized = str(url or "").strip().lower()
+    return normalized.startswith("http://") or normalized.startswith("https://")
+
+
+def _extract_text_from_html(html: str) -> str:
+    if not html:
+        return ""
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", text)
+    text = re.sub(r"(?is)<svg[^>]*>.*?</svg>", " ", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _fetch_webpage_candidate(
+    *,
+    url: str,
+    source_title: str,
+    source_type: str,
+    retrieved_from: str,
+    query: str,
+) -> SourceCandidate | None:
+    if not _is_retrievable_url(url):
+        return None
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": "Mozilla/5.0 (compatible; ProctorIQ/1.0; +https://proctoriq.local/experimental)",
+            },
+            timeout=WEB_RETRIEVAL_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        logger.info("web_retrieval_page_fetch_failed url=%s error=%s", url, exc)
+        return None
+
+    content_type = str(response.headers.get("Content-Type") or "").lower()
+    if "html" not in content_type and "text/" not in content_type:
+        return None
+
+    extracted_text = _extract_text_from_html(response.text or "")
+    normalized_text = _normalize_text(extracted_text)
+    if len(normalized_text) < 60:
+        return None
+
+    return SourceCandidate(
+        source_title=source_title or "Possible web reference",
+        source_url=url,
+        source_domain=_source_domain(url),
+        source_type=source_type,
+        retrieved_from=retrieved_from,
+        content_snippet=_clip_text(extracted_text, max_length=260),
+        normalized_text=normalized_text,
+        tags=[tag for tag in _tokenize(query)[:6] if tag],
+        created_at=_utcnow_iso(),
+    )
+
+
 def _future_page_content_extraction(url: str) -> dict[str, Any]:
     return {
         "url": url,
@@ -236,12 +389,92 @@ def _future_vector_search_hook(text: str) -> dict[str, Any]:
     }
 
 
+def _build_match_payload(
+    *,
+    attempt_id: str,
+    answer: dict[str, Any],
+    assessment_name: str,
+    source_candidate: SourceCandidate,
+    similarity: float,
+    answer_text: str,
+    reference_text: str,
+    event_list: list[dict[str, Any]],
+    validation_mode: bool,
+    retrieval_confidence: float | None = None,
+    retrieval_timestamp: str | None = None,
+    retrieval_source: str | None = None,
+) -> dict[str, Any]:
+    token_overlap = round(_token_overlap_score(answer_text, reference_text), 4)
+    phrase_overlap = round(_phrase_overlap_score(answer_text, reference_text), 4)
+    chunk_similarity, chunk_candidate_excerpt, chunk_reference_excerpt = _best_chunk_similarity_details(answer_text, reference_text)
+    candidate_excerpt, reference_excerpt = _best_preview_pair(answer_text, reference_text)
+    matched_candidate_excerpt = chunk_candidate_excerpt or candidate_excerpt
+    matched_reference_excerpt = chunk_reference_excerpt or reference_excerpt
+    correlation = _behavioral_correlation(str(answer.get("question_id") or ""), len(answer_text), event_list)
+    likelihood = _likelihood_from_score(similarity, correlation["signal_count"], validation_mode)
+    confidence = _confidence_from_score(similarity, correlation["signal_count"], validation_mode)
+    match_evidence = MatchEvidence(
+        similarity_score=round(similarity, 4),
+        token_overlap=token_overlap,
+        phrase_overlap=phrase_overlap,
+        chunk_similarity=round(chunk_similarity, 4),
+        matched_candidate_excerpt=matched_candidate_excerpt,
+        matched_reference_excerpt=matched_reference_excerpt,
+        confidence_label=_confidence_label(confidence),
+        match_reason=_build_match_reason(
+            similarity_score=similarity,
+            token_overlap=token_overlap,
+            phrase_overlap=phrase_overlap,
+            chunk_similarity=chunk_similarity,
+            source_candidate=source_candidate,
+        ),
+    )
+    return {
+        "attempt_id": attempt_id,
+        "question_id": answer.get("question_id"),
+        "question_title": answer.get("question_title"),
+        "assessment_type": str(answer.get("assessment_type") or assessment_name or "").strip(),
+        "source_candidate": asdict(source_candidate),
+        "source_title": source_candidate.source_title,
+        "source_type": source_candidate.source_type,
+        "source_url": source_candidate.source_url,
+        "source_domain": source_candidate.source_domain,
+        "retrieved_from": source_candidate.retrieved_from,
+        "retrieval_source": retrieval_source or source_candidate.retrieved_from,
+        "retrieval_confidence": round(_safe_float(retrieval_confidence, similarity), 4),
+        "retrieval_timestamp": retrieval_timestamp,
+        "content_snippet": source_candidate.content_snippet,
+        "tags": source_candidate.tags,
+        "similarity_score": match_evidence.similarity_score,
+        "similarity_percent": int(round(similarity * 100)),
+        "likelihood": likelihood,
+        "confidence": confidence,
+        "match_evidence": asdict(match_evidence),
+        "token_overlap": match_evidence.token_overlap,
+        "phrase_overlap": match_evidence.phrase_overlap,
+        "chunk_similarity": match_evidence.chunk_similarity,
+        "confidence_label": match_evidence.confidence_label,
+        "match_reason": match_evidence.match_reason,
+        "candidate_excerpt": match_evidence.matched_candidate_excerpt,
+        "reference_excerpt": match_evidence.matched_reference_excerpt,
+        "behavioral_correlation": correlation["signals"],
+        "behavioral_signal_count": correlation["signal_count"],
+        "telemetry_flags": {
+            "paste_event_detected": correlation["paste_event_detected"],
+            "focus_loss_before_insertion": correlation["focus_loss_before_insertion"],
+            "large_answer_insertion": correlation["large_answer_insertion"],
+            "minimal_edits_after_paste": correlation["minimal_edits_after_paste"],
+        },
+    }
+
+
 def _build_retrieval_candidates_for_answer(
     *,
     answer: dict[str, Any],
     assessment_name: str,
     query_builder: SearchQueryBuilder,
     providers: list[RetrievalProvider],
+    limit: int = WEB_RETRIEVAL_MAX_RESULTS,
 ) -> list[RetrievalResult]:
     queries = query_builder.build_queries(
         answer_text=str(answer.get("answer_text") or ""),
@@ -252,7 +485,7 @@ def _build_retrieval_candidates_for_answer(
         return []
     results: list[RetrievalResult] = []
     for provider in providers:
-        results.append(provider.retrieve(queries, limit=3))
+        results.append(provider.retrieve(queries, limit=min(limit, WEB_RETRIEVAL_MAX_RESULTS)))
     return results
 
 
@@ -316,6 +549,55 @@ def _experimental_retrieval_hooks(
         ),
         "limitations_note": WEB_RETRIEVAL_LIMITATIONS_NOTE,
     }
+
+
+def _retrieved_web_matches_for_answers(
+    *,
+    attempt_id: str,
+    answers: list[dict[str, Any]],
+    assessment_name: str,
+    event_list: list[dict[str, Any]],
+    validation_mode: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    retrieval_hooks = _experimental_retrieval_hooks(answers=answers, assessment_name=assessment_name)
+    if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL or not BRAVE_SEARCH_API_KEY:
+        return [], retrieval_hooks
+
+    minimum_match_threshold, _, _ = _match_thresholds(validation_mode)
+    matches: list[dict[str, Any]] = []
+    for answer in answers:
+        answer_text = str(answer.get("answer_text") or "").strip()
+        if len(answer_text) < 20:
+            continue
+        retrieval_results = _build_retrieval_candidates_for_answer(
+            answer=answer,
+            assessment_name=assessment_name,
+            query_builder=SearchQueryBuilder(),
+            providers=[BraveSearchProvider()],
+        )
+        for retrieval in retrieval_results:
+            for candidate in retrieval.candidates:
+                reference_text = candidate.source_candidate.normalized_text or ""
+                similarity = _similarity_score(answer_text, reference_text)
+                if similarity < minimum_match_threshold:
+                    continue
+                matches.append(
+                    _build_match_payload(
+                        attempt_id=attempt_id,
+                        answer=answer,
+                        assessment_name=assessment_name,
+                        source_candidate=candidate.source_candidate,
+                        similarity=similarity,
+                        answer_text=answer_text,
+                        reference_text=reference_text,
+                        event_list=event_list,
+                        validation_mode=validation_mode,
+                        retrieval_confidence=candidate.retrieval_confidence,
+                        retrieval_timestamp=candidate.retrieved_at,
+                        retrieval_source=candidate.retrieval_source,
+                    )
+                )
+    return matches, retrieval_hooks
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -718,7 +1000,6 @@ def analyze_answer_provenance(
     answers = [item for item in submitted_answers if str(item.get("answer_text") or "").strip()]
     event_list = list(events or [])
     corpus = load_reference_corpus()
-    retrieval_hooks = _experimental_retrieval_hooks(answers=answers, assessment_name=assessment_name)
     validation_mode = _is_validation_mode(assessment_name, answers)
     minimum_match_threshold, _, _ = _match_thresholds(validation_mode)
     logger.info(
@@ -751,70 +1032,31 @@ def analyze_answer_provenance(
             if similarity < minimum_match_threshold:
                 continue
             source_candidate = _build_source_candidate(reference)
-            token_overlap = round(_token_overlap_score(answer_text, reference_text), 4)
-            phrase_overlap = round(_phrase_overlap_score(answer_text, reference_text), 4)
-            chunk_similarity, chunk_candidate_excerpt, chunk_reference_excerpt = _best_chunk_similarity_details(answer_text, reference_text)
-            candidate_excerpt, reference_excerpt = _best_preview_pair(answer_text, reference_text)
-            matched_candidate_excerpt = chunk_candidate_excerpt or candidate_excerpt
-            matched_reference_excerpt = chunk_reference_excerpt or reference_excerpt
-            correlation = _behavioral_correlation(str(answer.get("question_id") or ""), len(answer_text), event_list)
-            likelihood = _likelihood_from_score(similarity, correlation["signal_count"], validation_mode)
-            confidence = _confidence_from_score(similarity, correlation["signal_count"], validation_mode)
-            match_evidence = MatchEvidence(
-                similarity_score=round(similarity, 4),
-                token_overlap=token_overlap,
-                phrase_overlap=phrase_overlap,
-                chunk_similarity=round(chunk_similarity, 4),
-                matched_candidate_excerpt=matched_candidate_excerpt,
-                matched_reference_excerpt=matched_reference_excerpt,
-                confidence_label=_confidence_label(confidence),
-                match_reason=_build_match_reason(
-                    similarity_score=similarity,
-                    token_overlap=token_overlap,
-                    phrase_overlap=phrase_overlap,
-                    chunk_similarity=chunk_similarity,
-                    source_candidate=source_candidate,
-                ),
-            )
             matches.append(
-                {
-                    "attempt_id": attempt_id,
-                    "question_id": answer.get("question_id"),
-                    "question_title": answer.get("question_title"),
-                    "assessment_type": answer_assessment_type,
-                    "source_candidate": asdict(source_candidate),
-                    "source_title": source_candidate.source_title,
-                    "source_type": source_candidate.source_type,
-                    "source_url": source_candidate.source_url,
-                    "source_domain": source_candidate.source_domain,
-                    "retrieved_from": source_candidate.retrieved_from,
-                    "retrieval_source": source_candidate.retrieved_from,
-                    "retrieval_confidence": round(similarity, 4),
-                    "retrieval_timestamp": retrieval_hooks.get("generated_at"),
-                    "content_snippet": source_candidate.content_snippet,
-                    "tags": source_candidate.tags,
-                    "similarity_score": match_evidence.similarity_score,
-                    "similarity_percent": int(round(similarity * 100)),
-                    "likelihood": likelihood,
-                    "confidence": confidence,
-                    "match_evidence": asdict(match_evidence),
-                    "token_overlap": match_evidence.token_overlap,
-                    "phrase_overlap": match_evidence.phrase_overlap,
-                    "chunk_similarity": match_evidence.chunk_similarity,
-                    "confidence_label": match_evidence.confidence_label,
-                    "match_reason": match_evidence.match_reason,
-                    "candidate_excerpt": match_evidence.matched_candidate_excerpt,
-                    "reference_excerpt": match_evidence.matched_reference_excerpt,
-                    "behavioral_correlation": correlation["signals"],
-                    "behavioral_signal_count": correlation["signal_count"],
-                    "telemetry_flags": {
-                        "paste_event_detected": correlation["paste_event_detected"],
-                        "focus_loss_before_insertion": correlation["focus_loss_before_insertion"],
-                        "large_answer_insertion": correlation["large_answer_insertion"],
-                        "minimal_edits_after_paste": correlation["minimal_edits_after_paste"],
-                    },
-                }
+                _build_match_payload(
+                    attempt_id=attempt_id,
+                    answer=answer,
+                    assessment_name=answer_assessment_type or assessment_name,
+                    source_candidate=source_candidate,
+                    similarity=similarity,
+                    answer_text=answer_text,
+                    reference_text=reference_text,
+                    event_list=event_list,
+                    validation_mode=validation_mode,
+                    retrieval_confidence=similarity,
+                    retrieval_timestamp=None,
+                    retrieval_source=source_candidate.retrieved_from,
+                )
             )
+
+    retrieved_matches, retrieval_hooks = _retrieved_web_matches_for_answers(
+        attempt_id=attempt_id,
+        answers=answers,
+        assessment_name=assessment_name,
+        event_list=event_list,
+        validation_mode=validation_mode,
+    )
+    matches.extend(retrieved_matches)
 
     matches.sort(
         key=lambda item: (
