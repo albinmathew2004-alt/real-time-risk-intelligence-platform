@@ -13,6 +13,10 @@
   color-scheme: dark;
 }
 
+html.dark {
+  color-scheme: dark;
+}
+
 html,
 body,
 #root {

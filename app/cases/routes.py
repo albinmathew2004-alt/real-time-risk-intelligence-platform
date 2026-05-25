@@ -8,6 +8,7 @@ from sqlalchemy import distinct
 
 from app.auth.dependencies import require_reviewer
 from app.models.user import User
+from app.services.demo_attempt_cleanup import expire_stale_demo_attempts
 from app.services.evidence_service import normalize_evidence, normalize_risk_level, safe_float
 from app.services.final_assessment_service import build_final_risk_assessment
 from app.schemas.cases import (
@@ -467,6 +468,9 @@ def _build_review_queue_payload(
     search: Optional[str],
     recent_hours: Optional[int] = None,
 ) -> Dict[str, object]:
+    cleanup_result = expire_stale_demo_attempts(db)
+    if cleanup_result["updated_count"]:
+        db.commit()
     _ensure_case_index_ready(db)
     cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     users = {user.id: user for user in db.query(User).all()}

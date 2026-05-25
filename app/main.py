@@ -1550,6 +1550,77 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
     }
 
 
+def _is_public_demo_attempt_id(attempt_id: str) -> bool:
+    normalized = str(attempt_id or "").strip().lower()
+    return normalized.startswith("demo_public_")
+
+
+def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    provenance = dict(report.get("provenance_analysis") or {})
+    possible_matches = [
+        {
+            "source_title": match.get("source_title"),
+            "source_type": match.get("source_type"),
+            "source_url": match.get("source_url"),
+            "source_domain": match.get("source_domain"),
+            "retrieved_from": match.get("retrieved_from"),
+            "content_snippet": match.get("content_snippet"),
+            "question_id": match.get("question_id"),
+            "question_title": match.get("question_title"),
+            "similarity_percent": int(match.get("similarity_percent") or 0),
+            "similarity_score": round(safe_float(match.get("similarity_score"), 0.0), 4),
+            "likelihood": match.get("likelihood") or "LOW",
+            "token_overlap": round(safe_float(match.get("token_overlap"), 0.0), 4),
+            "phrase_overlap": round(safe_float(match.get("phrase_overlap"), 0.0), 4),
+            "chunk_similarity": round(safe_float(match.get("chunk_similarity"), 0.0), 4),
+            "confidence_label": match.get("confidence_label") or "Low confidence",
+            "match_reason": match.get("match_reason") or "",
+            "candidate_excerpt": match.get("candidate_excerpt") or "",
+            "reference_excerpt": match.get("reference_excerpt") or "",
+            "behavioral_correlation": list(match.get("behavioral_correlation") or []),
+        }
+        for match in list(provenance.get("possible_reference_matches") or [])[:3]
+    ]
+    provenance_summary = None
+    if provenance:
+        provenance_summary = {
+            "external_similarity_likelihood": provenance.get("external_similarity_likelihood") or "LOW",
+            "confidence_score": round(safe_float(provenance.get("confidence_score"), 0.0), 4),
+            "summary": provenance.get("summary") or "No meaningful reference overlap was detected in submitted answers.",
+            "behavioral_correlation": list(provenance.get("behavioral_correlation") or []),
+            "possible_reference_matches": possible_matches,
+            "matching_segment_preview": dict(provenance.get("matching_segment_preview") or {}),
+            "evidence_title": provenance.get("evidence_title"),
+            "reviewer_summary": provenance.get("reviewer_summary") or provenance.get("summary") or "",
+            "limitations_note": provenance.get("limitations_note") or "",
+        }
+
+    return {
+        "attempt_id": report.get("attempt_id") or "",
+        "candidate_name": report.get("candidate_name") or "Unknown Candidate",
+        "candidate_email": report.get("candidate_email") or "No email available",
+        "assessment_name": report.get("assessment_name") or "Assessment",
+        "attempt_status": report.get("attempt_status") or "SUBMITTED",
+        "final_decision": report.get("final_decision") or "Reviewer attention recommended",
+        "submitted_at": report.get("submitted_at"),
+        "started_at": report.get("started_at"),
+        "latest_event_at": report.get("latest_event_at"),
+        "event_count": int(report.get("event_count") or 0),
+        "risk_level": ((report.get("final_risk_assessment") or {}).get("risk_level")) or "LOW",
+        "risk_score": round(safe_float((report.get("final_risk_assessment") or {}).get("combined_score"), 0.0), 4),
+        "confidence": round(safe_float((report.get("final_risk_assessment") or {}).get("confidence"), 0.0), 4),
+        "strongest_reason": report.get("strongest_reason") or "Behavioral signals were reviewed in context after submission.",
+        "summary_text": report.get("summary_text") or report.get("why_score_text") or "Behavioral signals were analyzed after assessment submission.",
+        "why_score_text": report.get("why_score_text") or report.get("summary_text") or "Behavioral signals were analyzed after assessment submission.",
+        "behavioral_summary": report.get("summary_text") or report.get("why_score_text") or "Behavioral signals were analyzed after assessment submission.",
+        "most_suspicious_behaviors": list(report.get("investigation_insights") or [])[:6],
+        "violation_summary": dict(report.get("violation_overview_counts") or {}),
+        "evidence_items": list(report.get("evidence_items") or []),
+        "answer_provenance": provenance_summary,
+        "privacy_note": "This summary reflects metadata-based integrity analysis only. It does not use webcam, microphone, screen recording, or clipboard contents.",
+    }
+
+
 @app.get("/")
 def home():
     return {
@@ -2012,11 +2083,13 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
             for item in payload.answers
             if str(item.answer_text or "").strip()
         ]
+        answer_lengths = [len(str(item.get("answer_text") or "").strip()) for item in answers]
         logger.info(
-            "provenance_answers_received attempt_id=%s answers=%s assessment=%s",
+            "provenance_answers_received attempt_id=%s answers=%s assessment=%s lengths=%s",
             attempt_id,
             len(answers),
             payload.assessment_name or attempt_state.assessment_name or "",
+            ",".join(str(length) for length in answer_lengths[:12]),
         )
 
         events = [
@@ -2262,6 +2335,125 @@ def get_attempt_report(attempt_id: str, _user=Depends(require_reviewer)):
             "attempt_id": attempt_id,
             "message": str(e),
             "data": None,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/v1/reports/{attempt_id}/status")
+def get_attempt_report_status(attempt_id: str):
+    db = SessionLocal()
+    try:
+        persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+        if persisted_state is None:
+            return {
+                "status": "pending",
+                "attempt_id": attempt_id,
+                "data": {
+                    "report_exists": False,
+                    "provenance_ready": False,
+                    "attempt_status": None,
+                    "submitted_at": None,
+                    "report_url": f"/?attemptId={attempt_id}",
+                },
+            }
+
+        signals = dict(getattr(persisted_state, "signals", None) or {})
+        provenance_result = dict(signals.get("answer_provenance") or {})
+        provenance_ready = bool(
+            provenance_result
+            and (
+                "summary" in provenance_result
+                or "possible_reference_matches" in provenance_result
+                or "external_similarity_likelihood" in provenance_result
+            )
+        )
+        report_exists = bool(
+            getattr(persisted_state, "final_risk_level", None)
+            or getattr(persisted_state, "final_risk_score", None) is not None
+            or getattr(persisted_state, "evidence_summary", None)
+            or getattr(persisted_state, "violation_overview", None)
+            or getattr(persisted_state, "submitted_at", None)
+        )
+        return {
+            "status": "success",
+            "attempt_id": attempt_id,
+            "data": {
+                "report_exists": report_exists,
+                "provenance_ready": provenance_ready,
+                "attempt_status": getattr(persisted_state, "status", None),
+                "submitted_at": getattr(persisted_state, "submitted_at", None),
+                "report_url": f"/?attemptId={attempt_id}",
+            },
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "attempt_id": attempt_id,
+            "message": str(exc),
+            "data": {
+                "report_exists": False,
+                "provenance_ready": False,
+                "attempt_status": None,
+                "submitted_at": None,
+                "report_url": f"/?attemptId={attempt_id}",
+            },
+        }
+    finally:
+        db.close()
+
+
+@app.get("/v1/demo/attempts/{attempt_id}/report")
+def get_public_demo_attempt_report(attempt_id: str):
+    if not _is_public_demo_attempt_id(attempt_id):
+        raise HTTPException(status_code=404, detail="Demo report not found")
+
+    db = SessionLocal()
+    try:
+        persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+        if persisted_state is None:
+            return {
+                "ready": False,
+                "status": "processing",
+                "attempt_id": attempt_id,
+            }
+
+        report = _build_attempt_report(db, attempt_id)
+        if not report:
+            return {
+                "ready": False,
+                "status": "processing",
+                "attempt_id": attempt_id,
+            }
+
+        provenance = dict(report.get("provenance_analysis") or {})
+        provenance_ready = bool(
+            provenance
+            and (
+                "summary" in provenance
+                or "possible_reference_matches" in provenance
+                or "external_similarity_likelihood" in provenance
+            )
+        )
+        report_ready = bool(
+            report.get("submitted_at")
+            or report.get("event_count")
+            or report.get("final_risk_assessment")
+        )
+        if not report_ready:
+            return {
+                "ready": False,
+                "status": "processing",
+                "attempt_id": attempt_id,
+            }
+
+        return {
+            "ready": True,
+            "status": "success",
+            "attempt_id": attempt_id,
+            "provenance_ready": provenance_ready,
+            "data": _build_candidate_safe_demo_report(report),
         }
     finally:
         db.close()

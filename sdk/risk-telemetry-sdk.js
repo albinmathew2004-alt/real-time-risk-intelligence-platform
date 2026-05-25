@@ -119,6 +119,7 @@ Usage:
 
     var _destroyed = false;
     var _flushTimer = null;
+    var _flushInFlightPromise = null;
 
     // Idle detection
     var _idleTimeout = null;
@@ -135,6 +136,12 @@ Usage:
     var _activeQuestionId = null;
     var _lastPasteAtMsByQ = new Map();
     var _lastPasteSizeByQ = new Map();
+    var _focusNoiseMuteUntilMs = 0;
+    var _lastVisibilityEventAtMs = 0;
+    var _lastBlurEventAtMs = 0;
+    var _lastFocusEventAtMs = 0;
+    var _visibilityHiddenAtMs = 0;
+    var _visibilityCycleOpen = false;
 
     function _log() {
       if (!_opts || !_opts.devMode) return;
@@ -154,6 +161,15 @@ Usage:
       } catch (e) {
         // ignore
       }
+    }
+
+    function _muteFocusNoise(ms) {
+      var duration = Number.isFinite(ms) ? ms : 1500;
+      _focusNoiseMuteUntilMs = Math.max(_focusNoiseMuteUntilMs, Date.now() + duration);
+    }
+
+    function _shouldIgnoreFocusNoise(nowMs) {
+      return nowMs < _focusNoiseMuteUntilMs;
     }
 
     function _buildBaseEvent(eventType, payload, occurredAtIso) {
@@ -208,7 +224,7 @@ Usage:
       });
     }
 
-    async function _trySendQueueOnce() {
+    async function _trySendQueueInternal() {
       if (_destroyed || !_opts) return;
 
       if (!_isOnline()) {
@@ -266,6 +282,60 @@ Usage:
       }
     }
 
+    function _trySendQueueOnce() {
+      if (_flushInFlightPromise) return _flushInFlightPromise;
+
+      _flushInFlightPromise = _trySendQueueInternal().finally(function () {
+        _flushInFlightPromise = null;
+      });
+
+      return _flushInFlightPromise;
+    }
+
+    function _wait(ms) {
+      return new Promise(function (resolve) {
+        setTimeout(resolve, ms);
+      });
+    }
+
+    async function flush(options) {
+      if (_destroyed || !_opts) {
+        return { ok: false, queueLength: _queue.length, reason: 'not_initialized' };
+      }
+
+      var timeoutMs = Number.isFinite(options && options.timeoutMs) ? options.timeoutMs : 10000;
+      timeoutMs = clamp(timeoutMs, 500, 30000);
+      var settleMs = Number.isFinite(options && options.settleMs) ? options.settleMs : 125;
+      settleMs = clamp(settleMs, 50, 1000);
+      var startedAt = Date.now();
+
+      while (_queue.length > 0) {
+        await _trySendQueueOnce();
+        if (_queue.length === 0) {
+          return {
+            ok: true,
+            queueLength: 0,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if ((Date.now() - startedAt) >= timeoutMs) {
+          return {
+            ok: false,
+            queueLength: _queue.length,
+            durationMs: Date.now() - startedAt,
+            reason: 'timeout',
+          };
+        }
+        await _wait(settleMs);
+      }
+
+      return {
+        ok: true,
+        queueLength: 0,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+
     function _startFlushLoop() {
       if (_destroyed || !_opts) return;
 
@@ -286,6 +356,11 @@ Usage:
       if (_destroyed || !_opts) return;
       var ev = _buildBaseEvent(eventType, payload, occurredAtIso);
       _enqueue(ev);
+      try {
+        window.dispatchEvent(new CustomEvent('proctoriq:telemetry-event', { detail: ev }));
+      } catch (e) {
+        // Browser-only storytelling hooks should never block telemetry delivery.
+      }
       // Try to flush quickly (but still goes through queue+retry).
       _trySendQueueOnce();
     }
@@ -296,19 +371,45 @@ Usage:
 
     function _handleVisibilityChange() {
       if (_destroyed) return;
-      _send('visibility_change', {
-        state: document.visibilityState,
-        reason: 'document.visibilitychange',
-      });
+      var nowMs = Date.now();
+      if (_shouldIgnoreFocusNoise(nowMs) || (nowMs - _lastVisibilityEventAtMs) < 1200) return;
+
+      var state = String(document.visibilityState || '');
+      if (state === 'hidden') {
+        _visibilityCycleOpen = true;
+        _visibilityHiddenAtMs = nowMs;
+        _lastVisibilityEventAtMs = nowMs;
+        _send('visibility_change', {
+          state: 'hidden',
+          reason: 'document.visibilitychange',
+        });
+        return;
+      }
+
+      if (state === 'visible' && _visibilityCycleOpen) {
+        _visibilityCycleOpen = false;
+        _lastVisibilityEventAtMs = nowMs;
+        _send('visibility_change', {
+          state: 'visible',
+          reason: 'document.visibilitychange',
+          hidden_duration_ms: Math.max(0, nowMs - _visibilityHiddenAtMs),
+        });
+      }
     }
 
     function _handleWindowFocus() {
       if (_destroyed) return;
+      var nowMs = Date.now();
+      if (_shouldIgnoreFocusNoise(nowMs) || document.visibilityState === 'hidden' || (nowMs - _lastFocusEventAtMs) < 1200) return;
+      _lastFocusEventAtMs = nowMs;
       _send('focus', { state: 'focused' });
     }
 
     function _handleWindowBlur() {
       if (_destroyed) return;
+      var nowMs = Date.now();
+      if (_shouldIgnoreFocusNoise(nowMs) || document.visibilityState === 'hidden' || (nowMs - _lastBlurEventAtMs) < 1200) return;
+      _lastBlurEventAtMs = nowMs;
       _send('blur', { state: 'blurred' });
     }
 
@@ -458,6 +559,12 @@ Usage:
       _lastActivityAtMs = Date.now();
       _idle = false;
       _idleStartedAtMs = 0;
+      _focusNoiseMuteUntilMs = Date.now() + 1500;
+      _lastVisibilityEventAtMs = 0;
+      _lastBlurEventAtMs = 0;
+      _lastFocusEventAtMs = 0;
+      _visibilityHiddenAtMs = 0;
+      _visibilityCycleOpen = false;
 
       // Listeners
       document.addEventListener('visibilitychange', _handleVisibilityChange);
@@ -484,11 +591,13 @@ Usage:
     }
 
     function startExam() {
+      _muteFocusNoise(1800);
       _send('exam_started', {});
       return RiskTelemetry;
     }
 
     function endExam() {
+      _muteFocusNoise(2500);
       _send('exam_submitted', {});
       // Best-effort flush before leaving.
       _trySendQueueOnce();
@@ -498,6 +607,7 @@ Usage:
     function enterQuestion(questionId) {
       var qid = String(questionId || '');
       if (!qid) return RiskTelemetry;
+      _muteFocusNoise(1200);
 
       _activeQuestionId = qid;
 
@@ -512,6 +622,7 @@ Usage:
     function leaveQuestion(questionId) {
       var qid = String(questionId || '');
       if (!qid) return RiskTelemetry;
+      _muteFocusNoise(1200);
 
       if (_activeQuestionId === qid) {
         _activeQuestionId = null;
@@ -669,6 +780,7 @@ Usage:
       endExam: endExam,
       enterQuestion: enterQuestion,
       leaveQuestion: leaveQuestion,
+      flush: flush,
       trackAnswerChange: trackAnswerChange,
       destroy: destroy,
     };

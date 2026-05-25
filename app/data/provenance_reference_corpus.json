@@ -136,6 +136,38 @@
     "content": "A deterministic integrity model should avoid escalating a case to HIGH risk solely because of one suspicious signal. Thresholds should be supported by corroboration such as focus loss near clipboard activity, unusual timing, or repeated suspicious sequences. Reviewer oversight remains important because multiple moderate signals can be explainable in context, while a small number of tightly connected signals can be far more meaningful."
   },
   {
+    "source_title": "StackOverflow-style concurrent queue contention answer",
+    "source_type": "Developer Q&A",
+    "source_url": "https://example.com/concurrent-queue-cache-answer",
+    "assessment_type": "Concurrency Systems Design",
+    "tags": ["concurrency", "arraylist", "blockingqueue", "concurrentlinkedqueue", "cache"],
+    "content": "A synchronized ArrayList becomes a bottleneck when multiple threads repeatedly read and remove elements because every operation contends on the same monitor and compound actions are still hard to make correct. In queue-like workloads, a proper concurrent collection such as BlockingQueue or ConcurrentLinkedQueue is more appropriate. Those structures are designed for concurrent producers and consumers, reduce lock contention, and avoid fragile manual synchronization around remove and iteration paths."
+  },
+  {
+    "source_title": "Research-paper style triage automation evaluation note",
+    "source_type": "Industrial software engineering reference",
+    "source_url": "https://example.com/triage-automation-evaluation",
+    "assessment_type": "Triage Automation Research",
+    "tags": ["triage automation", "empirical studies", "datasets", "evaluation metrics"],
+    "content": "Triage automation should be evaluated with empirical studies rather than intuition alone. A rigorous design uses open-source or industrial datasets, compares the proposed approach to clear baselines, and reports metrics such as precision, recall, ranking quality, assignment accuracy, and reviewer effort reduction. External validity matters as much as model quality because industrial software engineering workflows often differ sharply from small benchmark examples."
+  },
+  {
+    "source_title": "Splunk-style telemetry definition and tradeoffs",
+    "source_type": "Observability documentation",
+    "source_url": "https://example.com/telemetry-definition-guide",
+    "assessment_type": "Browser Telemetry Interpretation",
+    "tags": ["telemetry", "monitoring", "latency", "privacy", "data integrity"],
+    "content": "Telemetry refers to remotely collected operational data that helps teams understand the behavior and health of a system over time. Monitoring is often one consumer of telemetry, but telemetry itself can include metrics, events, traces, logs, and structured metadata. Practical telemetry design has to balance privacy, latency, data volume, and data integrity so that the collected signals remain useful without creating unnecessary risk or storage overhead."
+  },
+  {
+    "source_title": "Agentic AI healthcare payer workflow article",
+    "source_type": "Industry article",
+    "source_url": "https://example.com/agentic-ai-payer-workflows",
+    "assessment_type": "Operational AI Workflow",
+    "tags": ["agentic ai", "healthcare payer", "decision support", "automation", "operational intelligence"],
+    "content": "Agentic AI can support healthcare payer workflows by coordinating decision support, summarization, routing, and operational follow-up across authorization and claims processes. The strongest production pattern is not full autonomy but supervised workflow automation, where AI agents surface relevant context, recommend next actions, and reduce repetitive manual work while humans retain approval authority. Operational intelligence comes from connecting workflow state, policy context, and escalation paths rather than treating the agent as an unsupervised decision maker."
+  },
+  {
     "source_title": "Behavioral sequence escalation note",
     "source_type": "Security Investigation",
     "source_url": "https://example.com/behavioral-escalation-note",

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import html2canvas from "html2canvas";
+import jsPDF from "jspdf";
 import {
   Activity,
   AlertTriangle,
@@ -61,6 +63,14 @@ import TechnicalDetails from "./components/TechnicalDetails";
 import ViolationOverview from "./components/ViolationOverview";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+const DEMO_SIGNAL_TOASTS_ENABLED = String(
+  import.meta.env.VITE_DEMO_SIGNAL_TOASTS_ENABLED
+  ?? import.meta.env.DEMO_SIGNAL_TOASTS_ENABLED
+  ?? "true",
+).toLowerCase() !== "false";
+const DEMO_SIGNAL_TOAST_DISMISS_MS = 4200;
+const DEMO_SIGNAL_TOAST_COOLDOWN_MS = 4500;
+const DEMO_SIGNAL_TOAST_LIMIT = 2;
 
 function toWsUrl(baseUrl, path) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
@@ -120,6 +130,54 @@ function replaceReportAttemptIdInLocation(attemptId) {
     url.searchParams.delete("attemptId");
   }
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function getDemoCompletionFromLocation() {
+  if (typeof window === "undefined") return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const attemptId = params.get("demoAttemptId") || "";
+    if (!attemptId) return null;
+    return {
+      attemptId,
+      submittedAt: params.get("demoSubmittedAt") || "",
+      candidateName: params.get("demoCandidateName") || "",
+      assessmentId: params.get("demoAssessmentId") || "",
+      reportReady: params.get("demoReportReady") === "true",
+      provenanceReady: params.get("demoProvenanceReady") === "true",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function replaceDemoCompletionInLocation(completion) {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const keys = [
+    "demoAttemptId",
+    "demoSubmittedAt",
+    "demoCandidateName",
+    "demoAssessmentId",
+    "demoReportReady",
+    "demoProvenanceReady",
+  ];
+  keys.forEach((key) => url.searchParams.delete(key));
+  if (completion?.attemptId) {
+    url.searchParams.set("demoAttemptId", completion.attemptId);
+    if (completion.submittedAt) url.searchParams.set("demoSubmittedAt", completion.submittedAt);
+    if (completion.candidateName) url.searchParams.set("demoCandidateName", completion.candidateName);
+    if (completion.assessmentId) url.searchParams.set("demoAssessmentId", completion.assessmentId);
+    url.searchParams.set("demoReportReady", completion.reportReady ? "true" : "false");
+    url.searchParams.set("demoProvenanceReady", completion.provenanceReady ? "true" : "false");
+  }
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function getPublicDemoReportAttemptIdFromPath() {
+  if (typeof window === "undefined") return "";
+  const match = window.location.pathname.match(/^\/demo\/report\/([^/?#]+)/i);
+  return match ? decodeURIComponent(match[1]) : "";
 }
 
 function buildReportSelectionFallback(source, attemptIdOverride = "") {
@@ -1881,6 +1939,74 @@ const PROVENANCE_VALIDATION_QUESTION_BANK = [
     ],
     expectedBehavior: "Encourages polished long-form technical responses similar to product explainability docs and engineering essays.",
   },
+  {
+    id: "prov_concurrent_queue_cache",
+    title: "Concurrent Queue and Cache Contention",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "FastAPI backend design",
+    assessmentType: "Concurrency Systems Design",
+    provenance_test_intent: "Encourage answers that resemble StackOverflow and concurrency-guide explanations about synchronized collections and proper concurrent queues.",
+    expected_reference_style: ["stackoverflow", "java_docs", "engineering_blog"],
+    tags: ["Concurrency", "Queue", "Cache", "BlockingQueue"],
+    placeholder: "Explain why synchronized ArrayList contention hurts throughput and what concurrent collection patterns are safer for read/remove queue workloads.",
+    promptVariants: [
+      "A cache-backed work queue uses a synchronized ArrayList and starts showing contention when multiple threads read and remove items concurrently. Explain the likely performance and correctness problems, and describe which concurrent queue or collection design would be safer.",
+      "An internal queue shares a synchronized ArrayList between readers and removers, and cache throughput collapses under concurrency. Explain why that happens and which concurrent data structures should replace it in a production design.",
+    ],
+    expectedBehavior: "Often produces reference-like concurrency explanations, paste temptation, and long paragraph answers with minimal follow-up edits.",
+  },
+  {
+    id: "prov_triage_automation_research",
+    title: "Triage Automation Evaluation Design",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "Investigation workflow reasoning",
+    assessmentType: "Triage Automation Research",
+    provenance_test_intent: "Generate research-style answers about empirical studies, open-source datasets, and evaluation metrics for triage automation.",
+    expected_reference_style: ["research_paper", "industrial_study", "engineering_blog"],
+    tags: ["Triage Automation", "Empirical Study", "Datasets", "Evaluation"],
+    placeholder: "Describe how a triage automation study should use datasets, evaluation metrics, and industrial validation instead of relying only on intuition.",
+    promptVariants: [
+      "A team wants to automate issue triage and claims the approach works well, but has not evaluated it rigorously. Explain how empirical studies, industrial software engineering datasets, and evaluation metrics should be used to validate triage automation.",
+      "Explain how triage automation should be evaluated using open-source or industrial datasets, measurable quality metrics, and empirical study design instead of anecdotal evidence.",
+    ],
+    expectedBehavior: "Encourages longer research-paper style prose and answers that resemble academic or industrial engineering references.",
+  },
+  {
+    id: "prov_splunk_telemetry",
+    title: "Telemetry vs Monitoring in Operational Systems",
+    difficulty: "Medium",
+    inputType: "textarea",
+    category: "Browser telemetry interpretation",
+    assessmentType: "Browser Telemetry Interpretation",
+    provenance_test_intent: "Encourage doc-style explanations about telemetry, remote data collection, monitoring differences, and privacy tradeoffs.",
+    expected_reference_style: ["splunk_docs", "mdn_docs", "product_docs"],
+    tags: ["Telemetry", "Monitoring", "Privacy", "Data Integrity"],
+    placeholder: "Explain what telemetry means in operational systems, how it differs from monitoring, and what tradeoffs matter for privacy and data integrity.",
+    promptVariants: [
+      "Explain what telemetry means in an operational software platform, how it differs from simple monitoring, and why privacy, latency, data volume, and data integrity matter when telemetry is collected remotely.",
+      "A team uses the words monitoring and telemetry interchangeably. Explain the difference, the major telemetry types, and the operational tradeoffs around privacy, data volume, latency, and data integrity.",
+    ],
+    expectedBehavior: "Produces tutorial-style responses that often resemble product documentation or observability guides.",
+  },
+  {
+    id: "prov_agentic_ai_payer",
+    title: "Agentic AI in Healthcare Payer Workflows",
+    difficulty: "Hard",
+    inputType: "textarea",
+    category: "Explainable AI reasoning",
+    assessmentType: "Operational AI Workflow",
+    provenance_test_intent: "Generate article-style answers about agentic AI, decision support, workflow automation, and operational intelligence.",
+    expected_reference_style: ["industry_article", "product_docs", "enterprise_blog"],
+    tags: ["Agentic AI", "Healthcare", "Decision Support", "Workflow"],
+    placeholder: "Explain how agentic AI can support healthcare payer workflows without replacing human oversight or making unsupported autonomous decisions.",
+    promptVariants: [
+      "Explain how agentic AI can be used as decision support in healthcare payer workflows, including automation opportunities, operational intelligence benefits, and the need for human oversight.",
+      "A healthcare payer wants to introduce agentic AI into authorization and operations workflows. Explain how decision support, automation, and operational intelligence can help without removing human review or governance.",
+    ],
+    expectedBehavior: "Encourages polished article-style prose that resembles enterprise AI workflow writeups.",
+  },
 ];
 
 const PUBLIC_DEMO_SECTION_LIBRARY = {
@@ -2121,15 +2247,57 @@ function isDemoAnswerFilled(question, value) {
   return Boolean(String(value || "").trim());
 }
 
+function getDemoSignalToast(event) {
+  const eventType = String(event?.event_type || "").toLowerCase();
+  const payload = event?.payload || {};
+  const state = String(payload.state || "").toLowerCase();
+  const action = String(payload.action || payload.operation || "").toLowerCase();
+  const changeType = String(payload.change_type || "").toLowerCase();
+  const answerLength = Number(payload.answer_length || 0);
+  const pasteSize = String(payload.paste_size || payload.size || "").toLowerCase();
+  const idleDuration = Number(payload.duration_seconds || 0);
+
+  if (eventType === "visibility_change" && state === "hidden") {
+    return { key: "visibility_hidden", label: "Focus change observed" };
+  }
+  if (eventType === "visibility_change" && state === "visible") {
+    return { key: "visibility_visible", label: "Focus returned to assessment" };
+  }
+  if (eventType === "blur") {
+    return { key: "focus_loss", label: "Focus change observed" };
+  }
+  if (eventType === "focus") {
+    return { key: "focus_return", label: "Focus returned to assessment" };
+  }
+  if (eventType === "clipboard" && action === "paste") {
+    return { key: "clipboard_paste", label: "Clipboard activity recorded" };
+  }
+  if (eventType === "clipboard" && action === "copy") {
+    return { key: "clipboard_copy", label: "Clipboard activity recorded" };
+  }
+  if (eventType === "answer_change" && changeType === "paste" && (answerLength >= 180 || pasteSize === "large")) {
+    return { key: "large_answer_insert", label: "Large answer insertion noted" };
+  }
+  if (eventType === "idle_state" && state === "idle" && idleDuration >= 20) {
+    return { key: "idle_period", label: "Long inactivity period observed" };
+  }
+  if (eventType === "idle_state" && state === "active") {
+    return { key: "idle_recovery", label: "Assessment integrity signal logged" };
+  }
+  return null;
+}
+
 function PublicDemoPage({ apiBaseUrl }) {
+  const initialCompletion = useMemo(() => getDemoCompletionFromLocation(), []);
   const tracker = useMemo(() => ({ visited: new Set(), lastSectionId: "" }), []);
+  const toastTracker = useRef({ lastShownAt: {}, dismissTimers: {}, lastAnswerChangeByQuestion: {} });
   const [consented, setConsented] = useState(false);
-  const [candidateName, setCandidateName] = useState("");
+  const [candidateName, setCandidateName] = useState(() => initialCompletion?.candidateName || "");
   const [candidateEmail, setCandidateEmail] = useState("");
-  const [assessmentId, setAssessmentId] = useState(PUBLIC_DEMO_ASSESSMENTS[0].id);
+  const [assessmentId, setAssessmentId] = useState(() => initialCompletion?.assessmentId || PUBLIC_DEMO_ASSESSMENTS[0].id);
   const [assessmentSessionSeed, setAssessmentSessionSeed] = useState(() => `${Date.now()}`);
-  const [stage, setStage] = useState("welcome");
-  const [attemptId, setAttemptId] = useState("");
+  const [stage, setStage] = useState(() => (initialCompletion?.attemptId ? "submitted" : "welcome"));
+  const [attemptId, setAttemptId] = useState(() => initialCompletion?.attemptId || "");
   const [candidateId, setCandidateId] = useState("");
   const [answers, setAnswers] = useState({});
   const [markedForReview, setMarkedForReview] = useState({});
@@ -2137,15 +2305,21 @@ function PublicDemoPage({ apiBaseUrl }) {
   const [timeRemaining, setTimeRemaining] = useState(PUBLIC_DEMO_ASSESSMENTS[0].durationMinutes * 60);
   const [telemetryStatus, setTelemetryStatus] = useState("Session not started");
   const [telemetryError, setTelemetryError] = useState("");
-  const [submittedAt, setSubmittedAt] = useState("");
+  const [submittedAt, setSubmittedAt] = useState(() => initialCompletion?.submittedAt || "");
   const [submissionMessage, setSubmissionMessage] = useState("");
   const [submissionBusy, setSubmissionBusy] = useState(false);
+  const [reportReadyState, setReportReadyState] = useState(() => ({
+    reportReady: Boolean(initialCompletion?.reportReady),
+    provenanceReady: Boolean(initialCompletion?.provenanceReady),
+    timedOut: false,
+  }));
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [connectionStable, setConnectionStable] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine !== false));
   const [editorLanguageByQuestion, setEditorLanguageByQuestion] = useState({});
   const [sectionCompletion, setSectionCompletion] = useState(null);
   const [editorConsoleByQuestion, setEditorConsoleByQuestion] = useState({});
   const [customInputByQuestion, setCustomInputByQuestion] = useState({});
+  const [signalToasts, setSignalToasts] = useState([]);
 
   const selectedAssessment = useMemo(
     () => buildDemoAssessment(assessmentId, assessmentSessionSeed),
@@ -2176,6 +2350,39 @@ function PublicDemoPage({ apiBaseUrl }) {
   const currentSectionProgress = currentSectionSummary?.total ? ((currentSectionSummary.answered || 0) / currentSectionSummary.total) * 100 : 0;
   const demoDataReady = Boolean(selectedAssessment?.sections?.length && flatQuestions.length && currentQuestion);
 
+  const dismissSignalToast = useCallback((toastId) => {
+    const timer = toastTracker.current.dismissTimers[toastId];
+    if (timer) {
+      window.clearTimeout(timer);
+      delete toastTracker.current.dismissTimers[toastId];
+    }
+    setSignalToasts((prev) => prev.filter((toast) => toast.id !== toastId));
+  }, []);
+
+  const addDemoSignalToast = useCallback((toast) => {
+    if (!DEMO_SIGNAL_TOASTS_ENABLED || stage !== "assessment" || !toast?.key || !toast?.label) return;
+    const now = Date.now();
+    const lastShownAt = toastTracker.current.lastShownAt[toast.key] || 0;
+    if (now - lastShownAt < DEMO_SIGNAL_TOAST_COOLDOWN_MS) return;
+    toastTracker.current.lastShownAt[toast.key] = now;
+
+    const toastId = `${toast.key}-${now}`;
+    setSignalToasts((prev) => {
+      const next = [...prev, { ...toast, id: toastId, createdAt: now }];
+      return next.slice(-DEMO_SIGNAL_TOAST_LIMIT);
+    });
+    toastTracker.current.dismissTimers[toastId] = window.setTimeout(() => {
+      dismissSignalToast(toastId);
+    }, DEMO_SIGNAL_TOAST_DISMISS_MS);
+  }, [dismissSignalToast, stage]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(toastTracker.current.dismissTimers).forEach((timerId) => window.clearTimeout(timerId));
+      toastTracker.current.dismissTimers = {};
+    };
+  }, []);
+
   useEffect(() => {
     if (stage !== "assessment" && stage !== "review") {
       setTimeRemaining(selectedAssessment.durationMinutes * 60);
@@ -2186,6 +2393,17 @@ function PublicDemoPage({ apiBaseUrl }) {
     if (typeof window === "undefined") return;
     window.__PROVENANCE_TEST_MODE__ = Boolean(selectedAssessment?.isProvenanceValidation);
   }, [selectedAssessment?.isProvenanceValidation]);
+
+  useEffect(() => {
+    if (stage !== "submitted") return;
+    console.info("[Demo Submit Lifecycle]", {
+      event: "completion_screen_rendered",
+      attemptId,
+      reportReady: reportReadyState.reportReady,
+      provenanceReady: reportReadyState.provenanceReady,
+      timedOut: reportReadyState.timedOut,
+    });
+  }, [attemptId, reportReadyState.provenanceReady, reportReadyState.reportReady, reportReadyState.timedOut, stage]);
 
   useEffect(() => {
     function syncFullscreenState() {
@@ -2220,6 +2438,18 @@ function PublicDemoPage({ apiBaseUrl }) {
     }, 1000);
     return () => window.clearInterval(intervalId);
   }, [stage]);
+
+  useEffect(() => {
+    if (!DEMO_SIGNAL_TOASTS_ENABLED || stage !== "assessment" || typeof window === "undefined") return undefined;
+
+    function handleTelemetryToast(event) {
+      const toast = getDemoSignalToast(event.detail);
+      if (toast) addDemoSignalToast(toast);
+    }
+
+    window.addEventListener("proctoriq:telemetry-event", handleTelemetryToast);
+    return () => window.removeEventListener("proctoriq:telemetry-event", handleTelemetryToast);
+  }, [addDemoSignalToast, stage]);
 
   const emitDemoEvent = useCallback((eventType, payload = {}) => {
     if (!attemptId) return;
@@ -2299,6 +2529,44 @@ function PublicDemoPage({ apiBaseUrl }) {
     setQuestionIndex(Math.max(0, Math.min(totalQuestions - 1, nextIndex)));
   }, [totalQuestions]);
 
+  const waitForReportReadiness = useCallback(async (targetAttemptId, { timeoutMs = 15000, intervalMs = 1000 } = {}) => {
+    const startedAt = Date.now();
+    let lastKnown = {
+      reportReady: false,
+      provenanceReady: false,
+      timedOut: false,
+      reportUrl: `/?attemptId=${encodeURIComponent(targetAttemptId)}`,
+    };
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const result = await authJsonFetch(`${apiBaseUrl.replace(/\/$/, "")}/v1/reports/${targetAttemptId}/status`);
+      if (result.ok && result.data?.data) {
+        const statusData = result.data.data;
+        lastKnown = {
+          reportReady: Boolean(statusData.report_exists),
+          provenanceReady: Boolean(statusData.provenance_ready),
+          timedOut: false,
+          reportUrl: statusData.report_url || `/?attemptId=${encodeURIComponent(targetAttemptId)}`,
+        };
+        if (lastKnown.provenanceReady) {
+          console.info("[Demo Submit Lifecycle]", { event: "provenance_ready", attemptId: targetAttemptId });
+        }
+        if (lastKnown.reportReady) {
+          console.info("[Demo Submit Lifecycle]", { event: "report_ready", attemptId: targetAttemptId });
+        }
+        if (lastKnown.reportReady && lastKnown.provenanceReady) {
+          return lastKnown;
+        }
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+    }
+
+    return {
+      ...lastKnown,
+      timedOut: true,
+    };
+  }, [apiBaseUrl]);
+
   const handleToggleFullscreen = useCallback(async () => {
     if (typeof document === "undefined") return;
     try {
@@ -2328,6 +2596,7 @@ function PublicDemoPage({ apiBaseUrl }) {
   const handleStart = useCallback(() => {
     const nextAttemptId = createDemoAttemptId(candidateName, selectedAssessment.id);
     const nextCandidateId = createDemoCandidateId(candidateName, candidateEmail);
+    replaceDemoCompletionInLocation(null);
     setAttemptId(nextAttemptId);
     setCandidateId(nextCandidateId);
     setAnswers({});
@@ -2340,6 +2609,9 @@ function PublicDemoPage({ apiBaseUrl }) {
     setEditorLanguageByQuestion({});
     setEditorConsoleByQuestion({});
     setCustomInputByQuestion({});
+    setSignalToasts([]);
+    toastTracker.current.lastShownAt = {};
+    toastTracker.current.lastAnswerChangeByQuestion = {};
     setTelemetryError("");
     tracker.visited.clear();
     tracker.lastSectionId = "";
@@ -2375,13 +2647,34 @@ function PublicDemoPage({ apiBaseUrl }) {
   }, [apiBaseUrl, candidateEmail, candidateName, selectedAssessment.id, selectedAssessment.name, tracker]);
 
   const handleAnswerChange = useCallback((questionId, value) => {
+    const now = Date.now();
+    const nextValue = String(value || "");
+    const previousValue = String(answers[questionId] || "");
+    const previousChange = toastTracker.current.lastAnswerChangeByQuestion[questionId] || { at: 0, length: previousValue.length, bursts: 0 };
+    const lengthDelta = Math.abs(nextValue.length - previousValue.length);
+    const rapidWindowMs = now - previousChange.at;
+    const rapidBursts = rapidWindowMs > 0 && rapidWindowMs < 850
+      ? (previousChange.bursts || 0) + 1
+      : 1;
+    toastTracker.current.lastAnswerChangeByQuestion[questionId] = {
+      at: now,
+      length: nextValue.length,
+      bursts: rapidBursts,
+    };
+
+    if (lengthDelta >= 140) {
+      addDemoSignalToast({ key: "large_answer_insert", label: "Large answer insertion noted" });
+    } else if (rapidBursts >= 4) {
+      addDemoSignalToast({ key: "rapid_answer_change", label: "Rapid answer change detected" });
+    }
+
     setAnswers((prev) => ({ ...prev, [questionId]: value }));
     try {
       window.RiskTelemetry?.trackAnswerChange(questionId, value);
     } catch (error) {
       setTelemetryError(error instanceof Error ? error.message : "Unable to record typing telemetry.");
     }
-  }, []);
+  }, [addDemoSignalToast, answers]);
 
   const handleMcqKeyDown = useCallback((event, question, optionIndex) => {
     if (!question?.options?.length) return;
@@ -2468,10 +2761,12 @@ function PublicDemoPage({ apiBaseUrl }) {
     };
 
     setSubmissionBusy(true);
+    setReportReadyState({ reportReady: false, provenanceReady: false, timedOut: false });
     setTelemetryError("");
     setSubmissionMessage("Submitting assessment...");
     setTelemetryStatus("Submitting assessment...");
     setStage("submitting");
+    console.info("[Demo Submit Lifecycle]", { event: "submission_started", attemptId });
     queueSubmissionMessage("Analyzing behavioral signals...", 450);
     queueSubmissionMessage("Generating reviewer report...", 1400);
 
@@ -2485,6 +2780,12 @@ function PublicDemoPage({ apiBaseUrl }) {
       const flushAfterSubmitStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       const finalFlush = await window.RiskTelemetry?.flush?.({ timeoutMs: 12000, settleMs: 125 });
       const flushAfterSubmitDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - flushAfterSubmitStartedAt;
+      console.info("[Demo Submit Lifecycle]", {
+        event: "telemetry_flushed",
+        attemptId,
+        flushBeforeSubmitMs: Math.round(flushBeforeSubmitDurationMs),
+        flushAfterSubmitMs: Math.round(flushAfterSubmitDurationMs),
+      });
 
       if (finalFlush && finalFlush.ok === false) {
         throw new Error("Final telemetry sync timed out before the reviewer report was ready.");
@@ -2523,6 +2824,9 @@ function PublicDemoPage({ apiBaseUrl }) {
         console.warn("[Demo Provenance Persist]", provenancePersistResult.data?.detail || "Unable to persist submitted answers for provenance analysis.");
       }
 
+      const reportState = await waitForReportReadiness(attemptId);
+      setReportReadyState(reportState);
+
       clearProgressTimers();
       setSubmissionMessage("Assessment submitted successfully");
       setTelemetryStatus("Assessment submitted successfully");
@@ -2535,6 +2839,16 @@ function PublicDemoPage({ apiBaseUrl }) {
         pendingEventsAfterSubmit: finalFlush?.queueLength ?? 0,
         totalSubmitMs: Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - submitStartedAt),
       });
+      const completedAt = new Date().toISOString();
+      setSubmittedAt(completedAt);
+      replaceDemoCompletionInLocation({
+        attemptId,
+        submittedAt: completedAt,
+        candidateName: candidateName.trim(),
+        assessmentId: selectedAssessment.id,
+        reportReady: reportState.reportReady,
+        provenanceReady: reportState.provenanceReady,
+      });
     } catch (error) {
       clearProgressTimers();
       setSubmissionBusy(false);
@@ -2545,10 +2859,9 @@ function PublicDemoPage({ apiBaseUrl }) {
       return;
     }
 
-    setSubmittedAt(new Date().toISOString());
     setSubmissionBusy(false);
     setStage("submitted");
-  }, [answers, apiBaseUrl, attemptId, candidateEmail, candidateId, candidateName, flatQuestions, markedForReview, selectedAssessment.id, selectedAssessment.name, submissionBusy]);
+  }, [answers, apiBaseUrl, attemptId, candidateEmail, candidateId, candidateName, flatQuestions, markedForReview, selectedAssessment.id, selectedAssessment.name, submissionBusy, waitForReportReadiness]);
 
   const handleDemoRun = useCallback(() => {
     if (!currentQuestion?.id) return;
@@ -2565,12 +2878,22 @@ function PublicDemoPage({ apiBaseUrl }) {
     }));
   }, [currentEditorLanguage, currentQuestion?.id, currentQuestionAnswer, customInputByQuestion]);
 
+  const handleOpenCandidateReport = useCallback(() => {
+    if (!attemptId) return;
+    window.location.assign(`/demo/report/${encodeURIComponent(attemptId)}`);
+  }, [attemptId]);
+
+  const handleOpenReviewerConsole = useCallback(() => {
+    window.location.assign("/");
+  }, []);
+
   const handleRestart = useCallback(() => {
     try {
       window.RiskTelemetry?.destroy();
     } catch {
       // ignore
     }
+    replaceDemoCompletionInLocation(null);
     if (selectedAssessment?.isProvenanceValidation) {
       setAssessmentSessionSeed(`${Date.now()}`);
     }
@@ -2588,6 +2911,10 @@ function PublicDemoPage({ apiBaseUrl }) {
     setEditorLanguageByQuestion({});
     setEditorConsoleByQuestion({});
     setCustomInputByQuestion({});
+    setReportReadyState({ reportReady: false, provenanceReady: false, timedOut: false });
+    setSignalToasts([]);
+    toastTracker.current.lastShownAt = {};
+    toastTracker.current.lastAnswerChangeByQuestion = {};
     setStage("welcome");
     setTimeRemaining(selectedAssessment.durationMinutes * 60);
     tracker.visited.clear();
@@ -3262,13 +3589,19 @@ function PublicDemoPage({ apiBaseUrl }) {
             {demoDataReady && stage === "submitted" && (
               <section className="public-demo-card public-demo-stage-card">
                 <div className="public-demo-card-head">
-                  <h2>Assessment submitted</h2>
-                  <span className="demo-status-chip success">Telemetry delivered</span>
+                  <div>
+                    <h2>Assessment Complete</h2>
+                    <p>Your telemetry, behavioral analysis, and reviewer-facing investigation report were successfully generated.</p>
+                  </div>
+                  <span className="demo-status-chip success">
+                    {reportReadyState.provenanceReady ? "Report ready" : reportReadyState.timedOut ? "Ready to review" : "Telemetry delivered"}
+                  </span>
                 </div>
                 <div className="public-demo-copy-block">
                   <p>
-                    The assessment session is now available to the reviewer console. Risk history, evidence, and any
-                    correlated suspicious sequences will appear in the Command Center, Review Queue, and Investigation Report if generated by the session.
+                    {reportReadyState.timedOut
+                      ? "The assessment has been submitted successfully. Report generation took longer than expected, but you can still open the generated investigation view and reviewer console safely."
+                      : "The assessment session is now available in the reviewer workflow. Risk history, evidence, answer provenance findings, and correlated suspicious sequences can now be reviewed."}
                   </p>
                 </div>
                 <div className="public-demo-summary-grid">
@@ -3292,15 +3625,24 @@ function PublicDemoPage({ apiBaseUrl }) {
                     <span>Submission Status</span>
                     <strong>{submissionMessage || "Assessment submitted successfully"}</strong>
                   </div>
+                  <div className="public-demo-summary-item">
+                    <span>Report Readiness</span>
+                    <strong>{reportReadyState.provenanceReady ? "Provenance ready" : reportReadyState.reportReady ? "Report available" : "Processing fallback complete"}</strong>
+                  </div>
                 </div>
                 <div className="public-demo-actions">
+                  <button className="workflow-action-btn primary" onClick={handleOpenCandidateReport} type="button">
+                    <Eye size={16} />
+                    View My Candidate Report
+                  </button>
+                  <button className="workflow-action-btn" onClick={handleOpenReviewerConsole} type="button">
+                    <ArrowUpRight size={16} />
+                    Open Reviewer Console
+                  </button>
                   <button className="workflow-action-btn primary" onClick={handleRestart} type="button">
                     <CheckSquare size={16} />
-                    Start Another Demo Attempt
+                    Start New Demo
                   </button>
-                  <a className="demo-link-btn secondary" href="/">
-                    Open Reviewer Console
-                  </a>
                 </div>
               </section>
             )}
@@ -3319,14 +3661,30 @@ function PublicDemoPage({ apiBaseUrl }) {
             </aside>
           ) : null}
         </section>
+        {DEMO_SIGNAL_TOASTS_ENABLED && signalToasts.length ? (
+          <div className="public-demo-signal-toasts" aria-live="polite" aria-label="Assessment integrity signal notifications">
+            {signalToasts.map((toast) => (
+              <div className="public-demo-signal-toast" key={toast.id}>
+                <span className="public-demo-signal-dot"></span>
+                <div>
+                  <strong>{toast.label}</strong>
+                  <small>Assessment integrity signal logged</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   );
 }
 
 export default function App() {
-  const isPublicDemoRoute = typeof window !== "undefined" && window.location.pathname.replace(/\/+$/, "") === "/demo";
-  const initialReportAttemptId = !isPublicDemoRoute ? getReportAttemptIdFromLocation() : "";
+  const normalizedPath = typeof window !== "undefined" ? window.location.pathname.replace(/\/+$/, "") : "";
+  const isPublicDemoRoute = normalizedPath === "/demo";
+  const publicDemoReportAttemptId = normalizedPath.startsWith("/demo/report/") ? getPublicDemoReportAttemptIdFromPath() : "";
+  const isPublicDemoReportRoute = Boolean(publicDemoReportAttemptId);
+  const initialReportAttemptId = (!isPublicDemoRoute && !isPublicDemoReportRoute) ? getReportAttemptIdFromLocation() : "";
   const [page, setPage] = useState(() => (initialReportAttemptId ? "report" : "dashboard"));
   const [logs, setLogs] = useState([]);
   const [cases, setCases] = useState([]);
@@ -3852,6 +4210,10 @@ export default function App() {
     : wsState === "reconnecting"
       ? "REST polling continues while the stream reconnects"
       : "Live updates are paused";
+
+  if (isPublicDemoReportRoute) {
+    return <PublicDemoReportPage apiBaseUrl={API_BASE_URL} attemptId={publicDemoReportAttemptId} />;
+  }
 
   if (isPublicDemoRoute) {
     return <PublicDemoPage apiBaseUrl={API_BASE_URL} />;
@@ -5247,118 +5609,9 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
 
         <ViolationOverview items={overviewItems} />
 
-        <section className="investigation-card investigation-insights-card">
-          <div className="report-card-head accent">
-            <h3>Most Suspicious Behaviors Observed</h3>
-          </div>
-          <div className="investigation-insights-list">
-            {investigationInsights.map((item) => (
-              <article className="investigation-insight-item" key={item}>
-                <span className={`insight-dot ${String(displayRisk || "LOW").toLowerCase()}`}></span>
-                <p>{item}</p>
-              </article>
-            ))}
-          </div>
-        </section>
+        <InvestigationInsightsCard insights={investigationInsights} riskLevel={displayRisk} />
 
-        <section className="investigation-card provenance-intelligence-card">
-          <div className="report-card-head accent">
-            <h3>Answer Provenance Intelligence</h3>
-          </div>
-          {provenanceAnalysis ? (
-            <div className="provenance-intelligence-body">
-              <div className="provenance-summary-grid">
-                <article className="provenance-summary-item">
-                  <span>External Similarity Likelihood</span>
-                  <strong className={riskClass(provenanceAnalysis.external_similarity_likelihood || "LOW")}>
-                    {provenanceAnalysis.external_similarity_likelihood || "LOW"}
-                  </strong>
-                </article>
-                <article className="provenance-summary-item">
-                  <span>Confidence Score</span>
-                  <strong>{formatNumber(provenanceAnalysis.confidence_score, 2)}</strong>
-                </article>
-                <article className="provenance-summary-item">
-                  <span>Possible Reference Matches</span>
-                  <strong>{(provenanceAnalysis.possible_reference_matches || []).length}</strong>
-                </article>
-              </div>
-              <div className="provenance-summary-copy">
-                <p>{provenanceAnalysis.summary || "No meaningful reference overlap was detected in submitted answers."}</p>
-                {(provenanceAnalysis.evidence_title && (provenanceAnalysis.external_similarity_likelihood === "MEDIUM" || provenanceAnalysis.external_similarity_likelihood === "HIGH")) ? (
-                  <div className={`provenance-evidence-banner tone-${String(provenanceAnalysis.external_similarity_likelihood || "LOW").toLowerCase()}`}>
-                    <strong>{provenanceAnalysis.evidence_title}</strong>
-                    <span>Potential external similarity source overlap should be reviewed alongside behavioral context.</span>
-                  </div>
-                ) : null}
-              </div>
-              {(provenanceAnalysis.behavioral_correlation || []).length ? (
-                <div className="provenance-correlation-list">
-                  <span>Behavioral Correlation</span>
-                  <ul>
-                    {provenanceAnalysis.behavioral_correlation.map((item) => (
-                      <li key={item}>{item}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-              <div className="provenance-match-list">
-                {(provenanceAnalysis.possible_reference_matches || []).length ? (
-                  provenanceAnalysis.possible_reference_matches.map((match, index) => (
-                    <details className="provenance-match-card" key={`${match.source_title}-${match.question_id}-${index}`}>
-                      <summary>
-                        <div>
-                          <strong>{match.source_title || "Possible source match"}</strong>
-                          <small>{match.source_type || "Reference"}{match.question_title ? ` • ${match.question_title}` : ""}</small>
-                        </div>
-                        <div className="provenance-match-meta">
-                          <span>{match.similarity_percent}% similarity</span>
-                          <span className={riskClass(match.likelihood || "LOW")}>{match.likelihood || "LOW"}</span>
-                        </div>
-                      </summary>
-                      <div className="provenance-match-body">
-                        <div className="provenance-preview-grid">
-                          <article>
-                            <span>Candidate Excerpt</span>
-                            <p>{match.candidate_excerpt || "No candidate excerpt available."}</p>
-                          </article>
-                          <article>
-                            <span>Reference Excerpt</span>
-                            <p>{match.reference_excerpt || "No reference excerpt available."}</p>
-                          </article>
-                        </div>
-                        <div className="provenance-match-footer">
-                          <div>
-                            <span>Source</span>
-                            <strong>{match.source_type || "Reference"}</strong>
-                          </div>
-                          {match.source_url ? (
-                            <a href={match.source_url} rel="noreferrer" target="_blank">
-                              Reference Link
-                            </a>
-                          ) : null}
-                        </div>
-                        {(match.behavioral_correlation || []).length ? (
-                          <ul className="provenance-correlation-inline">
-                            {match.behavioral_correlation.map((item) => (
-                              <li key={item}>{item}</li>
-                            ))}
-                          </ul>
-                        ) : null}
-                      </div>
-                    </details>
-                  ))
-                ) : (
-                  <div className="empty-state-inline">No strong reference overlaps were detected in submitted answers.</div>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="provenance-empty-state">
-              <p>Waiting for post-submission answer provenance analysis.</p>
-            </div>
-          )}
-        </section>
+        <ProvenanceIntelligenceCard provenanceAnalysis={provenanceAnalysis} />
 
         <div className="report-main-row investigation-main-grid">
           <EvidenceTable rows={sortedEvidenceRows} loading={reportLoading} />
@@ -5723,6 +5976,494 @@ function DemoInfoRail({ telemetryStatus, candidateId, apiBaseUrl, selectedAssess
         {telemetryError ? <div className="workflow-message workflow-message-warning">{telemetryError}</div> : null}
       </section>
     </>
+  );
+}
+
+function CandidateViolationSummary({ summary }) {
+  const items = [
+    ["Tab Switches", summary?.tab_switches],
+    ["Blur Events", summary?.blur_events],
+    ["Clipboard Events", summary?.clipboard_events],
+    ["Idle Spikes", summary?.idle_spikes],
+    ["Rapid Answers", summary?.rapid_answer_bursts],
+  ].filter(([, value]) => value !== undefined && value !== null);
+
+  return (
+    <div className="public-demo-summary-grid">
+      {items.map(([label, value]) => (
+        <div className="public-demo-summary-item" key={label}>
+          <span>{label}</span>
+          <strong>{String(value)}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function InvestigationInsightsCard({ insights, riskLevel, title = "Most Suspicious Behaviors Observed" }) {
+  return (
+    <section className="investigation-card investigation-insights-card">
+      <div className="report-card-head accent">
+        <h3>{title}</h3>
+      </div>
+      <div className="investigation-insights-list">
+        {(insights || []).map((item) => (
+          <article className="investigation-insight-item" key={item}>
+            <span className={`insight-dot ${String(riskLevel || "LOW").toLowerCase()}`}></span>
+            <p>{item}</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ProvenanceIntelligenceCard({
+  provenanceAnalysis,
+  waitingMessage = "Waiting for post-submission answer provenance analysis.",
+}) {
+  return (
+    <section className="investigation-card provenance-intelligence-card">
+      <div className="report-card-head accent">
+        <h3>Answer Provenance Intelligence</h3>
+      </div>
+      {provenanceAnalysis ? (
+        <div className="provenance-intelligence-body">
+          <div className="provenance-summary-grid">
+            <article className="provenance-summary-item">
+              <span>External Similarity Likelihood</span>
+              <strong className={riskClass(provenanceAnalysis.external_similarity_likelihood || "LOW")}>
+                {provenanceAnalysis.external_similarity_likelihood || "LOW"}
+              </strong>
+            </article>
+            <article className="provenance-summary-item">
+              <span>Confidence Score</span>
+              <strong>{formatNumber(provenanceAnalysis.confidence_score, 2)}</strong>
+            </article>
+            <article className="provenance-summary-item">
+              <span>Possible Reference Matches</span>
+              <strong>{(provenanceAnalysis.possible_reference_matches || []).length}</strong>
+            </article>
+          </div>
+          <div className="provenance-summary-copy">
+            <p>{provenanceAnalysis.summary || "No meaningful reference overlap was detected in submitted answers."}</p>
+            {(provenanceAnalysis.evidence_title && (provenanceAnalysis.external_similarity_likelihood === "MEDIUM" || provenanceAnalysis.external_similarity_likelihood === "HIGH")) ? (
+              <div className={`provenance-evidence-banner tone-${String(provenanceAnalysis.external_similarity_likelihood || "LOW").toLowerCase()}`}>
+                <strong>{provenanceAnalysis.evidence_title}</strong>
+                <span>Potential external similarity source overlap should be reviewed alongside behavioral context.</span>
+              </div>
+            ) : null}
+            {provenanceAnalysis.limitations_note ? (
+              <p className="provenance-limitations-note">{provenanceAnalysis.limitations_note}</p>
+            ) : null}
+          </div>
+          {(provenanceAnalysis.behavioral_correlation || []).length ? (
+            <div className="provenance-correlation-list">
+              <span>Behavioral Correlation</span>
+              <ul>
+                {provenanceAnalysis.behavioral_correlation.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          <div className="provenance-match-list">
+            {(provenanceAnalysis.possible_reference_matches || []).length ? (
+              provenanceAnalysis.possible_reference_matches.map((match, index) => (
+                <details className="provenance-match-card" key={`${match.source_title}-${match.question_id || "candidate"}-${index}`}>
+                  <summary>
+                    <div>
+                      <strong>{match.source_title || "Possible source match"}</strong>
+                      <small>
+                        {match.source_type || "Reference"}
+                        {match.source_domain ? ` • ${match.source_domain}` : ""}
+                        {match.question_title ? ` • ${match.question_title}` : ""}
+                      </small>
+                    </div>
+                    <div className="provenance-match-meta">
+                      <span>{match.similarity_percent}% similarity</span>
+                      <span className={riskClass(match.likelihood || "LOW")}>{match.likelihood || "LOW"}</span>
+                    </div>
+                  </summary>
+                  <div className="provenance-match-body">
+                    <div className="provenance-preview-grid">
+                      <article>
+                        <span>Candidate Excerpt</span>
+                        <p>{match.candidate_excerpt || "No candidate excerpt available."}</p>
+                      </article>
+                      <article>
+                        <span>Reference Excerpt</span>
+                        <p>{match.reference_excerpt || "No reference excerpt available."}</p>
+                      </article>
+                    </div>
+                    <div className="provenance-match-footer">
+                      <div>
+                        <span>Source</span>
+                        <strong>{match.source_type || "Reference"}</strong>
+                      </div>
+                      <div>
+                        <span>Domain</span>
+                        <strong>{match.source_domain || "Controlled corpus"}</strong>
+                      </div>
+                      <div>
+                        <span>Match Reason</span>
+                        <strong>{match.match_reason || match.confidence_label || "Observed similarity pattern"}</strong>
+                      </div>
+                      {match.source_url ? (
+                        <a href={match.source_url} rel="noreferrer" target="_blank">
+                          Reference Link
+                        </a>
+                      ) : null}
+                    </div>
+                    <div className="provenance-match-metrics">
+                      <span>Token overlap {formatNumber(match.token_overlap, 2)}</span>
+                      <span>Phrase overlap {formatNumber(match.phrase_overlap, 2)}</span>
+                      <span>Chunk similarity {formatNumber(match.chunk_similarity, 2)}</span>
+                      <span>{match.confidence_label || "Low confidence"}</span>
+                    </div>
+                    {(match.behavioral_correlation || []).length ? (
+                      <ul className="provenance-correlation-inline">
+                        {match.behavioral_correlation.map((item) => (
+                          <li key={item}>{item}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                </details>
+              ))
+            ) : (
+              <div className="empty-state-inline">No strong reference overlaps were detected in submitted answers.</div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="provenance-empty-state">
+          <p>{waitingMessage}</p>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
+  const [reportState, setReportState] = useState({ loading: true, ready: false, data: null, error: "" });
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const exportTargetRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timerId = null;
+
+    async function loadReport() {
+      const startedAt = Date.now();
+      while (!cancelled && Date.now() - startedAt < 15000) {
+        const requestUrl = `${apiBaseUrl.replace(/\/$/, "")}/v1/demo/attempts/${encodeURIComponent(attemptId)}/report`;
+        console.info("[Candidate Report]", {
+          event: "candidate_report_fetch_started",
+          attemptId,
+          url: requestUrl,
+        });
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 20000);
+        let response;
+        let payload = null;
+        try {
+          response = await fetch(requestUrl, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            signal: controller.signal,
+          });
+          const text = await response.text();
+          payload = text ? JSON.parse(text) : null;
+        } catch (error) {
+          console.error("[Candidate Report]", {
+            event: "candidate_report_fetch_failed",
+            attemptId,
+            message: error instanceof Error ? error.message : "Unknown fetch error",
+          });
+          window.clearTimeout(timeoutId);
+          if (!cancelled) {
+            setReportState({
+              loading: false,
+              ready: false,
+              data: null,
+              error: "Backend is unavailable or waking up. Please retry shortly.",
+            });
+          }
+          return;
+        } finally {
+          window.clearTimeout(timeoutId);
+        }
+
+        if (cancelled) return;
+
+        const hasReadyReport = Boolean(
+          response?.ok
+          && (
+            (payload?.ready === true && payload?.data)
+            || (payload?.status === "success" && payload?.data)
+          )
+        );
+        if (hasReadyReport) {
+          console.info("[Candidate Report]", {
+            event: "candidate_report_fetch_success",
+            attemptId,
+            ready: payload?.ready,
+            status: payload?.status,
+          });
+          setReportState({ loading: false, ready: true, data: payload.data, error: "" });
+          return;
+        }
+
+        if (response?.status === 404) {
+          console.error("[Candidate Report]", {
+            event: "candidate_report_fetch_failed",
+            attemptId,
+            message: "Report not found",
+          });
+          setReportState({ loading: false, ready: false, data: null, error: "This demo report is not available." });
+          return;
+        }
+
+        if (response?.ok && payload?.ready === false && payload?.status === "processing") {
+          setReportState((prev) => ({ ...prev, loading: true, ready: false, error: "" }));
+        } else if (!response?.ok) {
+          console.error("[Candidate Report]", {
+            event: "candidate_report_fetch_failed",
+            attemptId,
+            status: response?.status || 0,
+            message: payload?.detail || payload?.message || "Request failed",
+          });
+          setReportState({
+            loading: false,
+            ready: false,
+            data: null,
+            error: payload?.detail || payload?.message || "Backend is unavailable or waking up. Please retry shortly.",
+          });
+          return;
+        }
+
+        await new Promise((resolve) => {
+          timerId = window.setTimeout(resolve, 1200);
+        });
+      }
+
+      if (!cancelled) {
+        setReportState({
+          loading: false,
+          ready: false,
+          data: null,
+          error: "Generating your report is taking longer than expected. Please refresh and try again shortly.",
+        });
+      }
+    }
+
+    void loadReport();
+    return () => {
+      cancelled = true;
+      if (timerId) window.clearTimeout(timerId);
+    };
+  }, [apiBaseUrl, attemptId]);
+
+  useEffect(() => {
+    if (!reportState.ready || !reportState.data) return;
+    console.info("[Candidate Report]", {
+      event: "candidate_report_rendered",
+      attemptId,
+      riskLevel: reportState.data.risk_level || "LOW",
+    });
+  }, [attemptId, reportState.data, reportState.ready]);
+
+  const report = reportState.data;
+  const provenance = report?.answer_provenance || null;
+  const riskLevel = report?.risk_level || "LOW";
+  const status = report?.attempt_status || "SUBMITTED";
+  const overviewItems = buildViolationOverviewFromCounts(report?.violation_summary || {});
+  const candidateInsights = (report?.most_suspicious_behaviors || []).length
+    ? report.most_suspicious_behaviors
+    : [report?.behavioral_summary || report?.strongest_reason || "Behavioral signals were analyzed after submission."];
+  const candidateEvidenceRows = Array.isArray(report?.evidence_items) ? report.evidence_items : [];
+  const candidateTechnicalDetails = [
+    { label: "Assessment", value: report?.assessment_name || "Assessment" },
+    { label: "Attempt ID", value: report?.attempt_id || attemptId || "N/A" },
+    { label: "Started", value: formatDateTime(report?.started_at) },
+    { label: "Submitted", value: formatDateTime(report?.submitted_at) },
+    { label: "Latest Activity", value: formatDateTime(report?.latest_event_at) },
+    { label: "Event Count", value: String(report?.event_count ?? 0) },
+  ];
+  const candidateMetadata = [
+    { label: "Assessment", value: report?.assessment_name || "Assessment" },
+    { label: "Attempt ID", value: report?.attempt_id || attemptId || "N/A" },
+    { label: "Submitted", value: formatDateTime(report?.submitted_at) },
+    { label: "Status", value: status },
+  ];
+  const handleDownloadPdf = useCallback(async () => {
+    if (!reportState.ready || !exportTargetRef.current || isGeneratingPdf) return;
+
+    setIsGeneratingPdf(true);
+    console.info("[Candidate Report]", {
+      event: "candidate_report_pdf_started",
+      attemptId,
+    });
+
+    try {
+      const exportNode = exportTargetRef.current;
+      const canvas = await html2canvas(exportNode, {
+        backgroundColor: "#07111f",
+        scale: Math.min(window.devicePixelRatio || 1, 2),
+        useCORS: true,
+        logging: false,
+        scrollX: 0,
+        scrollY: -window.scrollY,
+        windowWidth: exportNode.scrollWidth,
+        windowHeight: exportNode.scrollHeight,
+        ignoreElements: (element) => element?.dataset?.pdfExclude === "true",
+      });
+
+      const pdf = new jsPDF({
+        orientation: "p",
+        unit: "pt",
+        format: "a4",
+        compress: true,
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 28;
+      const usableWidth = pageWidth - margin * 2;
+      const usableHeight = pageHeight - margin * 2;
+      const scaleRatio = usableWidth / canvas.width;
+      const pagePixelHeight = Math.max(1, Math.floor(usableHeight / scaleRatio));
+
+      let pageIndex = 0;
+      for (let offsetY = 0; offsetY < canvas.height; offsetY += pagePixelHeight) {
+        const sliceHeight = Math.min(pagePixelHeight, canvas.height - offsetY);
+        const pageCanvas = document.createElement("canvas");
+        pageCanvas.width = canvas.width;
+        pageCanvas.height = sliceHeight;
+        const pageContext = pageCanvas.getContext("2d");
+        if (!pageContext) continue;
+        pageContext.drawImage(
+          canvas,
+          0,
+          offsetY,
+          canvas.width,
+          sliceHeight,
+          0,
+          0,
+          canvas.width,
+          sliceHeight,
+        );
+
+        if (pageIndex > 0) pdf.addPage();
+
+        pdf.addImage(
+          pageCanvas.toDataURL("image/png"),
+          "PNG",
+          margin,
+          margin,
+          usableWidth,
+          sliceHeight * scaleRatio,
+          undefined,
+          "FAST",
+        );
+        pageIndex += 1;
+      }
+
+      pdf.save(`ProctorIQ_Candidate_Report_${attemptId}.pdf`);
+      console.info("[Candidate Report]", {
+        event: "candidate_report_pdf_success",
+        attemptId,
+        pages: pageIndex,
+      });
+    } catch (error) {
+      console.error("[Candidate Report]", {
+        event: "candidate_report_pdf_failed",
+        attemptId,
+        message: error instanceof Error ? error.message : "Unknown PDF error",
+      });
+    } finally {
+      setIsGeneratingPdf(false);
+    }
+  }, [attemptId, isGeneratingPdf, reportState.ready]);
+
+  return (
+    <div className="report-scroll-container public-candidate-report-shell">
+      <div className="report-toolbar public-candidate-report-toolbar" data-pdf-exclude="true">
+        <div className="public-candidate-report-brand">
+          <ProctorIQLogo className="brand-mark brand-mark-proctoriq" />
+          <div>
+            <span className="report-section-kicker">ProctorIQ</span>
+            <strong>Candidate-safe investigation report</strong>
+          </div>
+        </div>
+        {reportState.ready ? (
+          <div className="report-toolbar-actions">
+            <button
+              className="panel-header-action"
+              disabled={isGeneratingPdf}
+              onClick={() => void handleDownloadPdf()}
+              type="button"
+            >
+              <FileDown size={16} />
+              {isGeneratingPdf ? "Generating PDF..." : "Download PDF Report"}
+            </button>
+            <a className="workflow-action-btn primary" href="/demo">Start New Demo</a>
+            <a className="workflow-action-btn" href="/">Open Reviewer Console</a>
+          </div>
+        ) : null}
+      </div>
+
+      <section className="investigation-page investigation-report-shell public-candidate-report-page" ref={exportTargetRef}>
+        {!reportState.ready ? (
+          <section className="investigation-card provenance-empty-state">
+            <div className="report-card-head accent">
+              <h3>{reportState.error ? "Report unavailable" : "Generating your report..."}</h3>
+            </div>
+            <p>{reportState.error || "Behavioral analysis, evidence sections, and answer provenance details are still being prepared for this attempt."}</p>
+          </section>
+        ) : (
+          <>
+            <InvestigationHeader
+              candidateName={report?.candidate_name || "Unknown Candidate"}
+              candidateEmail={report?.candidate_email || "No email available"}
+              initials={getInitials(report?.candidate_name || "Unknown Candidate")}
+              risk={riskLevel}
+              status={status}
+              finalDecision={report?.final_decision || "Integrity analysis summary"}
+              summaryText={report?.summary_text || report?.behavioral_summary || "Behavioral signals were analyzed after submission."}
+              strongestReason={report?.strongest_reason || "Behavioral signals were reviewed in context after submission."}
+              explanation={report?.why_score_text || report?.behavioral_summary || "Potential external similarity and behavioral signals should be reviewed in context."}
+              score={formatNumber(report?.risk_score, 2)}
+              confidence={formatNumber(report?.confidence, 2)}
+              confidenceLabel={getConfidenceLabel(report?.confidence)}
+              metadataItems={candidateMetadata}
+            />
+
+            <ViolationOverview items={overviewItems} />
+
+            <InvestigationInsightsCard insights={candidateInsights} riskLevel={riskLevel} />
+
+            <ProvenanceIntelligenceCard provenanceAnalysis={provenance} waitingMessage="Answer provenance analysis was not available for this attempt." />
+
+            <div className="report-main-row candidate-report-main-grid">
+              <EvidenceTable rows={candidateEvidenceRows} loading={reportState.loading} />
+              <div className="candidate-report-side-stack">
+                <TechnicalDetails items={candidateTechnicalDetails} />
+                <section className="investigation-card">
+                  <div className="report-card-head">
+                    <h3>Privacy-safe explanation</h3>
+                  </div>
+                  <div className="public-demo-copy-block">
+                    <p>{report?.privacy_note || "This summary uses metadata-based integrity analysis only."}</p>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </>
+        )}
+      </section>
+    </div>
   );
 }
 

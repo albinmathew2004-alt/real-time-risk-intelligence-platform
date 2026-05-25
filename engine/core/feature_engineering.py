@@ -44,6 +44,7 @@ def _clamp01(value: float) -> float:
 def build_features(events: List[Event], cfg: FeatureConfig) -> Features:
     paste_count = 0
     tab_hidden_count = 0
+    focus_blur_count = 0
     idle_spike_count = 0
     typing_burst_count = 0
     rapid_typing_sequences = 0
@@ -59,6 +60,10 @@ def build_features(events: List[Event], cfg: FeatureConfig) -> Features:
     pause_durations: List[float] = []
     burst_lengths: List[float] = []
     session_durations: List[float] = []
+    submit_seen = False
+    pending_hidden_time = None
+    last_hidden_time = None
+    last_blur_time = None
 
     for ev in events:
         etype = ev.get("event_type")
@@ -71,8 +76,29 @@ def build_features(events: List[Event], cfg: FeatureConfig) -> Features:
             if event_time is not None:
                 pending_pastes.append({"time": event_time, "recovered": False})
 
-        if etype == "visibility_change" and payload.get("state") == "hidden":
-            tab_hidden_count += 1
+        if etype in {"exam_submitted", "assessment_submitted", "submit", "completed"}:
+            submit_seen = True
+
+        if etype == "visibility_change":
+            state = str(payload.get("state") or "").lower()
+            if state == "hidden":
+                if event_time is not None and last_hidden_time is not None:
+                    if (event_time - last_hidden_time).total_seconds() < 1.2:
+                        continue
+                pending_hidden_time = event_time
+                last_hidden_time = event_time
+            elif state == "visible" and pending_hidden_time is not None and event_time is not None:
+                delta = (event_time - pending_hidden_time).total_seconds()
+                if 0 <= delta <= 300:
+                    tab_hidden_count += 1
+                pending_hidden_time = None
+
+        if etype == "blur":
+            if event_time is not None and last_blur_time is not None:
+                if (event_time - last_blur_time).total_seconds() < 1.2:
+                    continue
+            focus_blur_count += 1
+            last_blur_time = event_time
 
         if etype == "idle_state":
             if payload.get("state") == "idle":
@@ -200,6 +226,7 @@ def build_features(events: List[Event], cfg: FeatureConfig) -> Features:
     return {
         "paste_count": paste_count,
         "tab_hidden_count": tab_hidden_count,
+        "focus_blur_count": focus_blur_count,
         "idle_spike_count": idle_spike_count,
         "time_per_question_mean_s": avg_time,
         "questions_seen": len(question_times),
@@ -215,5 +242,5 @@ def build_features(events: List[Event], cfg: FeatureConfig) -> Features:
         "backspace_activity_count": backspace_activity_count,
         "avg_typing_burst_length": round(avg_burst_length, 2),
         "client_seq_gaps": 0,
-        "has_submit_event": True,
+        "has_submit_event": submit_seen,
     }

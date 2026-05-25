@@ -117,7 +117,7 @@ def _visibility_hidden(event: Dict[str, Any]) -> bool:
 
 def _focus_blur(event: Dict[str, Any]) -> bool:
     event_type = str(event.get("event_type") or "").lower()
-    return event_type in {"window_blur", "blur"} or _visibility_hidden(event)
+    return event_type in {"window_blur", "blur"}
 
 
 def _idle_event_seconds(event: Dict[str, Any]) -> float:
@@ -380,20 +380,22 @@ def normalize_evidence(
         )
 
     blur_times = _matching_event_times(events, _focus_blur)
-    focus_blur_count = len(blur_times)
+    focus_blur_count = int(safe_float(features.get("focus_blur_count"), len(blur_times)))
     if focus_blur_count > 0:
         first_seen, last_seen = _first_last(blur_times)
-        severity = _severity_from_count(focus_blur_count, medium_threshold=3, high_threshold=6)
+        severity = _severity_from_count(focus_blur_count, medium_threshold=4, high_threshold=7)
+        focus_explanation = (
+            f"Minor focus interruptions were observed {focus_blur_count} {_pluralize(focus_blur_count, 'time')} during the attempt."
+            if severity == LOW
+            else f"Window focus was interrupted {focus_blur_count} {_pluralize(focus_blur_count, 'time')} during the attempt, creating repeated engagement gaps."
+        )
         items.append(
             _build_item(
                 signal_type=FOCUS_BLUR,
-                title="Focus / Blur Events",
+                title="Focus Loss Events",
                 severity=severity,
                 count=focus_blur_count,
-                explanation=(
-                    f"Window focus changed or blurred {focus_blur_count} {_pluralize(focus_blur_count, 'time')} during the attempt, "
-                    "creating repeated gaps in on-screen engagement."
-                ),
+                explanation=focus_explanation,
                 first_seen=first_seen,
                 last_seen=last_seen,
                 related_event_count=focus_blur_count,
@@ -540,7 +542,7 @@ def build_violation_overview_counts(
     features = features or {}
     clipboard_count = int(safe_float(features.get("paste_count"), _count_event_type(events, "clipboard")))
     tab_switch_count = int(safe_float(features.get("tab_hidden_count"), sum(1 for event in events if _visibility_hidden(event))))
-    focus_blur_count = sum(1 for event in events if _focus_blur(event))
+    focus_blur_count = int(safe_float(features.get("focus_blur_count"), sum(1 for event in events if _focus_blur(event))))
     idle_spike_count = int(safe_float(features.get("idle_spike_count"), _count_event_type(events, "idle_state")))
     idle_max_seconds = max(
         [safe_float(features.get("idle_max_duration_s"), 0.0), *[_idle_event_seconds(event) for event in events if event.get("event_type") == "idle_state"]],

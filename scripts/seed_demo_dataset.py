@@ -22,10 +22,13 @@ from app.main import (  # noqa: E402
     ATTEMPT_LOG_FILE,
     _persist_timeline_snapshots,
     _record_risk_snapshot_if_needed,
+    _serialize_risk_history_points,
     _build_dashboard_summary,
+    _upsert_attempt_state,
     build_reason,
 )
 from app.models.user import User, UserRole  # noqa: E402
+from app.services.evidence_service import build_violation_overview_counts, normalize_evidence  # noqa: E402
 from app.services.final_assessment_service import build_final_risk_assessment  # noqa: E402
 from engine.core import risk_engine  # noqa: E402
 from engine.core.event_processor import normalize_events  # noqa: E402
@@ -48,10 +51,12 @@ DEFAULT_TARGET_MEDIUM = 0.22
 DEFAULT_TARGET_HIGH = 0.12
 ASSESSMENTS = [
     ("assessment_python_01", "Python Coding Assessment"),
-    ("assessment_sql_01", "SQL Analytics Assessment"),
-    ("assessment_java_01", "Java Backend Assessment"),
-    ("assessment_js_01", "JavaScript Frontend Assessment"),
-    ("assessment_data_01", "Data Reasoning Assessment"),
+    ("assessment_sql_01", "SQL Analysis"),
+    ("assessment_java_01", "Java Backend"),
+    ("assessment_frontend_01", "Frontend Debugging"),
+    ("assessment_data_01", "Data Reasoning"),
+    ("assessment_reasoning_01", "Logical Reasoning"),
+    ("assessment_security_01", "Security Investigation"),
 ]
 LOW_RANGE = (0.05, 0.30)
 MEDIUM_RANGE = (0.40, 0.68)
@@ -332,14 +337,6 @@ def _select_case_status(bucket: str, rng: random.Random) -> str:
     )[0]
 
 
-def _should_leave_session_open(bucket: str, bucket_position: int) -> bool:
-    if bucket == "HIGH":
-        return bucket_position <= 1
-    if bucket == "MEDIUM":
-        return bucket_position <= 2
-    return bucket_position <= 3
-
-
 def _latest_event_by_attempt(db) -> dict[str, RawExamEvent]:
     rows = (
         db.query(RawExamEvent)
@@ -565,6 +562,14 @@ def _seed_candidate_record(
     )
 
     timeline_points = list((getattr(result, "session_intelligence", {}) or {}).get("timeline_points", []))
+    serialized_history = _serialize_risk_history_points(timeline_points)
+    strongest_reason = build_reason(
+        {
+            "risk": result.risk,
+            "explanation": result.explanation_text,
+            "session_intelligence": getattr(result, "session_intelligence", {}),
+        }
+    )
     _persist_timeline_snapshots(
         db,
         attempt_id=record.attempt_id,
@@ -587,13 +592,7 @@ def _seed_candidate_record(
         risk_level=str(result.risk),
         confidence=float(result.confidence_score),
         score=float(result.combined_score),
-        reason=build_reason(
-            {
-                "risk": result.risk,
-                "explanation": result.explanation_text,
-                "session_intelligence": getattr(result, "session_intelligence", {}),
-            }
-        ),
+        reason=strongest_reason,
         timestamp=record.session_end.isoformat(),
         force=True,
     )
@@ -633,6 +632,34 @@ def _seed_candidate_record(
     )
     db.add(case)
     db.flush()
+
+    _upsert_attempt_state(
+        db,
+        attempt_id=record.attempt_id,
+        candidate_id=record.attempt_id,
+        candidate_name=record.candidate_name,
+        candidate_email=record.candidate_email,
+        assessment_id=record.assessment_id,
+        assessment_name=record.assessment_name,
+        review_status=record.case_status,
+        latest_event_type="exam_submitted",
+        latest_event_at=record.session_end.isoformat(),
+        event_count=len(record.events),
+        risk_level=str(result.risk),
+        score=float(result.combined_score),
+        confidence=float(result.confidence_score),
+        strongest_reason=strongest_reason,
+        violation_overview=build_violation_overview_counts(events=record.events, features=features),
+        evidence_summary=normalize_evidence(
+            events=record.events,
+            features=features,
+            risk_score=float(result.combined_score),
+            risk_level=str(result.risk),
+        ),
+        risk_history=serialized_history,
+        features=features,
+        signals=result.signals,
+    )
 
     action_timestamp = record.session_start + timedelta(minutes=2)
     if record.assigned_reviewer_id is not None:
@@ -684,16 +711,13 @@ def _generate_candidate_record(
     attempt_id = _dataset_attempt_id(bucket, ordinal)
     assessment_id, assessment_name = _assessment_for_index(ordinal - 1)
     profiles, score_range = _target_profiles(bucket)
-    include_submit = not _should_leave_session_open(bucket, bucket_position)
+    include_submit = True
     best_match: tuple[float, str, int, list[dict[str, Any]], Any, datetime, datetime] | None = None
 
     for trial in range(18):
         profile_name = profiles[trial % len(profiles)]
         question_count = _question_count_for_bucket(bucket, rng)
-        if include_submit:
-            session_end = _session_end_for_index(ordinal - 1 + trial, total, rng, historical=historical)
-        else:
-            session_end = _ongoing_session_end(rng)
+        session_end = _session_end_for_index(ordinal - 1 + trial, total, rng, historical=historical)
         events, session_start = _build_events_for_profile(
             attempt_id=attempt_id,
             candidate_name=name,
@@ -731,9 +755,7 @@ def _generate_candidate_record(
     _, profile_name, question_count, events, features, result, session_start, session_end = best_match
     assigned_reviewer_id = None
     assigned_reviewer_name = None
-    case_status = _select_case_status(bucket, rng) if include_submit else rng.choice(
-        [CaseStatus.NEW.value, CaseStatus.TRIAGED.value, CaseStatus.UNDER_INVESTIGATION.value]
-    )
+    case_status = _select_case_status(bucket, rng)
     if reviewer_pool and case_status in {
         CaseStatus.TRIAGED.value,
         CaseStatus.UNDER_INVESTIGATION.value,
@@ -773,6 +795,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Seed a persistent enterprise-style demo dataset into the local backend database.")
     parser.add_argument("--count", type=int, default=DEFAULT_COUNT, help="Approximate number of demo candidates to generate")
     parser.add_argument("--reset", action="store_true", help="Explicitly delete and rebuild only the persistent demo dataset attempts")
+    parser.add_argument("--reset-demo-data", action="store_true", help="Explicitly delete and rebuild only the persistent demo dataset attempts")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Deterministic random seed")
     parser.add_argument("--historical", action="store_true", help="Spread seeded attempts across today, yesterday, and the last 7 days")
     parser.add_argument("--target-low", type=float, default=DEFAULT_TARGET_LOW, help="Target LOW distribution weight or ratio")
@@ -791,7 +814,7 @@ def main() -> int:
 
     db = SessionLocal()
     try:
-        if args.reset:
+        if args.reset or args.reset_demo_data:
             _delete_existing_dataset(db)
         existing_attempt_ids = _existing_attempt_ids(db)
         reviewer_pool = (
@@ -875,6 +898,7 @@ def main() -> int:
                         "resolved_total": actual_distribution["resolved_count"],
                     },
                     "dashboard_visibility": {
+                        "active_sessions": dashboard_summary.get("active_sessions"),
                         "high_risk_now": dashboard_summary.get("high_risk_count"),
                         "medium_risk": dashboard_summary.get("medium_risk_count"),
                         "needs_review": dashboard_summary.get("needs_review_count"),
