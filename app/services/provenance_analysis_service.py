@@ -30,6 +30,15 @@ WEB_RETRIEVAL_TIMEOUT_SECONDS = max(1, int(os.getenv("WEB_RETRIEVAL_TIMEOUT_SECO
 BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 SERPER_SEARCH_ENDPOINT = "https://google.serper.dev/search"
 logger = logging.getLogger(__name__)
+GENERIC_QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "because", "by", "can", "could", "describe",
+    "do", "does", "during", "each", "explain", "for", "from", "how", "if", "in", "into", "is",
+    "it", "its", "may", "might", "of", "on", "or", "should", "show", "that", "the", "their",
+    "this", "to", "use", "what", "when", "why", "with", "your",
+}
+RARE_TERM_STOPWORDS = GENERIC_QUERY_STOPWORDS | {
+    "answer", "assessment", "candidate", "demo", "question", "review", "submission",
+}
 
 
 @dataclass(slots=True)
@@ -50,6 +59,8 @@ class MatchEvidence:
     similarity_score: float
     token_overlap: float
     phrase_overlap: float
+    rare_term_overlap: float
+    title_snippet_relevance: float
     chunk_similarity: float
     matched_candidate_excerpt: str
     matched_reference_excerpt: str
@@ -133,21 +144,23 @@ class SearchQueryBuilder:
         normalized_answer = _normalize_text(answer_text)
         if not normalized_answer:
             return []
-        chunks = _chunk_text(normalized_answer, chunk_size=180)[: self.max_queries]
-        prefix_terms = [term for term in _tokenize(f"{question_title} {assessment_name}") if len(term) > 2][:5]
+        chunks = _prioritized_chunks(normalized_answer, limit=self.max_queries, chunk_size=210)
+        prefix_terms = _high_signal_terms(f"{question_title} {assessment_name}", limit=5)
+        anchor_phrases = _high_signal_phrases(question_title, limit=2)
         queries: list[str] = []
         for chunk in chunks:
-            chunk_terms = [term for term in _tokenize(chunk) if len(term) > 2][: self.max_terms]
+            chunk_terms = _high_signal_terms(chunk, limit=self.max_terms)
+            chunk_phrases = _high_signal_phrases(chunk, limit=2)
             merged_terms = []
             seen: set[str] = set()
-            for term in [*prefix_terms, *chunk_terms]:
+            for term in [*prefix_terms, *anchor_phrases, *chunk_phrases, *chunk_terms]:
                 if term and term not in seen:
                     seen.add(term)
                     merged_terms.append(term)
             query = " ".join(merged_terms[: self.max_terms]).strip()
             if query and query not in queries:
                 queries.append(query)
-        return queries
+        return queries[: self.max_queries]
 
 
 class BraveSearchProvider:
@@ -169,6 +182,7 @@ class BraveSearchProvider:
         retrieved_at = _utcnow_iso()
         candidates: list[RetrievedWebCandidate] = []
         seen_urls: set[str] = set()
+        fetch_stats = {"fetch_success_count": 0, "fetch_failure_count": 0}
         logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
         try:
             for query in queries[:3]:
@@ -202,6 +216,7 @@ class BraveSearchProvider:
                         source_type="Web reference",
                         retrieved_from=self.provider_name,
                         query=query,
+                        stats=fetch_stats,
                     )
                     if extracted is None:
                         continue
@@ -231,7 +246,13 @@ class BraveSearchProvider:
                 note="Brave retrieval failed. Falling back to controlled corpus matching only.",
             )
 
-        logger.info("web_retrieval_urls_retrieved provider=%s url_count=%s", self.provider_name, len(candidates))
+        logger.info(
+            "web_retrieval_urls_retrieved provider=%s url_count=%s fetch_success_count=%s fetch_failure_count=%s",
+            self.provider_name,
+            len(candidates),
+            fetch_stats["fetch_success_count"],
+            fetch_stats["fetch_failure_count"],
+        )
         return RetrievalResult(
             enabled=True,
             provider_name=self.provider_name,
@@ -261,6 +282,7 @@ class SerperSearchProvider:
         retrieved_at = _utcnow_iso()
         candidates: list[RetrievedWebCandidate] = []
         seen_urls: set[str] = set()
+        fetch_stats = {"fetch_success_count": 0, "fetch_failure_count": 0}
         logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
         try:
             for query in queries[:3]:
@@ -293,6 +315,7 @@ class SerperSearchProvider:
                         source_type="Web reference",
                         retrieved_from=self.provider_name,
                         query=query,
+                        stats=fetch_stats,
                     )
                     if extracted is None:
                         continue
@@ -322,7 +345,13 @@ class SerperSearchProvider:
                 note="Serper retrieval failed. Falling back to controlled corpus matching only.",
             )
 
-        logger.info("web_retrieval_urls_retrieved provider=%s url_count=%s", self.provider_name, len(candidates))
+        logger.info(
+            "web_retrieval_urls_retrieved provider=%s url_count=%s fetch_success_count=%s fetch_failure_count=%s",
+            self.provider_name,
+            len(candidates),
+            fetch_stats["fetch_success_count"],
+            fetch_stats["fetch_failure_count"],
+        )
         return RetrievalResult(
             enabled=True,
             provider_name=self.provider_name,
@@ -359,7 +388,11 @@ class InternalCorpusProvider:
         ranked: list[tuple[float, dict[str, Any], str]] = []
         for query in queries:
             for reference in corpus:
-                query_score = _similarity_score(query, str(reference.get("content") or ""))
+                query_score = _similarity_score(
+                    query,
+                    str(reference.get("content") or ""),
+                    source_candidate=_build_source_candidate(reference),
+                )
                 if query_score <= 0:
                     continue
                 ranked.append((query_score, reference, query))
@@ -411,6 +444,13 @@ def _active_web_retrieval_providers() -> list[RetrievalProvider]:
     if not providers:
         providers.append(SerperSearchProvider())
         providers.append(BraveSearchProvider())
+    logger.info(
+        "web_retrieval_provider_selection enabled=%s provider_candidates=%s has_serper_key=%s has_brave_key=%s",
+        ENABLE_EXPERIMENTAL_WEB_RETRIEVAL,
+        ",".join(provider.provider_name for provider in providers),
+        bool(SERPER_API_KEY),
+        bool(BRAVE_SEARCH_API_KEY),
+    )
     return providers
 
 
@@ -479,8 +519,11 @@ def _fetch_webpage_candidate(
     source_type: str,
     retrieved_from: str,
     query: str,
+    stats: dict[str, int] | None = None,
 ) -> SourceCandidate | None:
     if not _is_retrievable_url(url):
+        if stats is not None:
+            stats["fetch_failure_count"] = stats.get("fetch_failure_count", 0) + 1
         return None
     try:
         response = requests.get(
@@ -493,17 +536,26 @@ def _fetch_webpage_candidate(
         )
         response.raise_for_status()
     except Exception as exc:
+        if stats is not None:
+            stats["fetch_failure_count"] = stats.get("fetch_failure_count", 0) + 1
         logger.info("web_retrieval_page_fetch_failed url=%s error=%s", url, exc)
         return None
 
     content_type = str(response.headers.get("Content-Type") or "").lower()
     if "html" not in content_type and "text/" not in content_type:
+        if stats is not None:
+            stats["fetch_failure_count"] = stats.get("fetch_failure_count", 0) + 1
         return None
 
     extracted_text = _extract_text_from_html(response.text or "")
     normalized_text = _normalize_text(extracted_text)
     if len(normalized_text) < 60:
+        if stats is not None:
+            stats["fetch_failure_count"] = stats.get("fetch_failure_count", 0) + 1
         return None
+
+    if stats is not None:
+        stats["fetch_success_count"] = stats.get("fetch_success_count", 0) + 1
 
     return SourceCandidate(
         source_title=source_title or "Possible web reference",
@@ -553,6 +605,15 @@ def _build_match_payload(
 ) -> dict[str, Any]:
     token_overlap = round(_token_overlap_score(answer_text, reference_text), 4)
     phrase_overlap = round(_phrase_overlap_score(answer_text, reference_text), 4)
+    rare_term_overlap = round(_rare_term_overlap_score(answer_text, reference_text), 4)
+    title_snippet_relevance = round(
+        _title_snippet_relevance_score(
+            answer_text,
+            source_candidate,
+            question_title=str(answer.get("question_title") or ""),
+        ),
+        4,
+    )
     chunk_similarity, chunk_candidate_excerpt, chunk_reference_excerpt = _best_chunk_similarity_details(answer_text, reference_text)
     candidate_excerpt, reference_excerpt = _best_preview_pair(answer_text, reference_text)
     matched_candidate_excerpt = chunk_candidate_excerpt or candidate_excerpt
@@ -564,6 +625,8 @@ def _build_match_payload(
         similarity_score=round(similarity, 4),
         token_overlap=token_overlap,
         phrase_overlap=phrase_overlap,
+        rare_term_overlap=rare_term_overlap,
+        title_snippet_relevance=title_snippet_relevance,
         chunk_similarity=round(chunk_similarity, 4),
         matched_candidate_excerpt=matched_candidate_excerpt,
         matched_reference_excerpt=matched_reference_excerpt,
@@ -572,8 +635,11 @@ def _build_match_payload(
             similarity_score=similarity,
             token_overlap=token_overlap,
             phrase_overlap=phrase_overlap,
+            rare_term_overlap=rare_term_overlap,
+            title_snippet_relevance=title_snippet_relevance,
             chunk_similarity=chunk_similarity,
             source_candidate=source_candidate,
+            behavioral_correlation=correlation["signals"],
         ),
     )
     return {
@@ -600,6 +666,8 @@ def _build_match_payload(
         "match_evidence": asdict(match_evidence),
         "token_overlap": match_evidence.token_overlap,
         "phrase_overlap": match_evidence.phrase_overlap,
+        "rare_term_overlap": match_evidence.rare_term_overlap,
+        "title_snippet_relevance": match_evidence.title_snippet_relevance,
         "chunk_similarity": match_evidence.chunk_similarity,
         "confidence_label": match_evidence.confidence_label,
         "match_reason": match_evidence.match_reason,
@@ -733,7 +801,12 @@ def _retrieved_web_matches_for_answers(
             )
             for candidate in retrieval.candidates:
                 reference_text = candidate.source_candidate.normalized_text or ""
-                similarity = _similarity_score(answer_text, reference_text)
+                similarity = _similarity_score(
+                    answer_text,
+                    reference_text,
+                    source_candidate=candidate.source_candidate,
+                    question_title=str(answer.get("question_title") or ""),
+                )
                 if similarity < minimum_match_threshold:
                     continue
                 matches.append(
@@ -812,6 +885,76 @@ def _tokenize(value: Any) -> list[str]:
     return [token for token in normalized.split(" ") if token]
 
 
+def _high_signal_terms(value: Any, *, limit: int = 12) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in _tokenize(value):
+        if len(token) < 3 or token in GENERIC_QUERY_STOPWORDS:
+            continue
+        technical = any(ch.isdigit() for ch in token) or any(symbol in token for symbol in ("_", ".", "/", "#", ":", "-", "sql", "api", "dom", "jwt"))
+        if not technical and len(token) < 5:
+            continue
+        if token not in seen:
+            seen.add(token)
+            terms.append(token)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _high_signal_phrases(value: Any, *, limit: int = 4) -> list[str]:
+    tokens = [token for token in _tokenize(value) if len(token) >= 3 and token not in GENERIC_QUERY_STOPWORDS]
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for size in (3, 2):
+        for index in range(max(0, len(tokens) - size + 1)):
+            phrase_tokens = tokens[index:index + size]
+            if sum(1 for token in phrase_tokens if token in RARE_TERM_STOPWORDS) >= size:
+                continue
+            phrase = " ".join(phrase_tokens)
+            if phrase not in seen:
+                seen.add(phrase)
+                phrases.append(phrase)
+            if len(phrases) >= limit:
+                return phrases
+    return phrases
+
+
+def _rare_term_overlap_score(candidate_text: str, reference_text: str) -> float:
+    candidate_terms = {token for token in _tokenize(candidate_text) if len(token) >= 5 and token not in RARE_TERM_STOPWORDS}
+    reference_terms = {token for token in _tokenize(reference_text) if len(token) >= 5 and token not in RARE_TERM_STOPWORDS}
+    if not candidate_terms or not reference_terms:
+        return 0.0
+    overlap = candidate_terms & reference_terms
+    if not overlap:
+        return 0.0
+    return len(overlap) / max(1, min(len(candidate_terms), len(reference_terms)))
+
+
+def _title_snippet_relevance_score(
+    candidate_text: str,
+    source_candidate: SourceCandidate | None,
+    *,
+    question_title: str = "",
+) -> float:
+    if not source_candidate:
+        return 0.0
+    source_context = " ".join(
+        part for part in [
+            source_candidate.source_title,
+            source_candidate.content_snippet,
+            question_title,
+            " ".join(source_candidate.tags or []),
+        ] if part
+    )
+    if not source_context.strip():
+        return 0.0
+    token_score = _token_overlap_score(candidate_text, source_context)
+    phrase_score = _phrase_overlap_score(candidate_text, source_context)
+    rare_score = _rare_term_overlap_score(candidate_text, source_context)
+    return round((token_score * 0.45) + (phrase_score * 0.25) + (rare_score * 0.30), 4)
+
+
 def _token_overlap_score(candidate_text: str, reference_text: str) -> float:
     candidate_tokens = set(_tokenize(candidate_text))
     reference_tokens = set(_tokenize(reference_text))
@@ -845,23 +988,24 @@ def _phrase_overlap_score(candidate_text: str, reference_text: str) -> float:
 
 
 def _best_chunk_similarity(candidate_text: str, reference_text: str) -> float:
-    candidate_chunks = _chunk_text(candidate_text, chunk_size=220)[:10]
-    reference_chunks = _chunk_text(reference_text, chunk_size=220)[:10]
+    candidate_chunks = _prioritized_chunks(candidate_text, limit=10, chunk_size=220)
+    reference_chunks = _prioritized_chunks(reference_text, limit=10, chunk_size=220)
     best_score = 0.0
     for candidate_chunk in candidate_chunks or [candidate_text]:
         for reference_chunk in reference_chunks or [reference_text]:
             sequence_ratio = SequenceMatcher(None, _normalize_text(candidate_chunk), _normalize_text(reference_chunk)).ratio()
             token_ratio = _token_overlap_score(candidate_chunk, reference_chunk)
             phrase_ratio = _phrase_overlap_score(candidate_chunk, reference_chunk)
-            score = round((sequence_ratio * 0.4) + (token_ratio * 0.35) + (phrase_ratio * 0.25), 4)
+            rare_term_ratio = _rare_term_overlap_score(candidate_chunk, reference_chunk)
+            score = round((sequence_ratio * 0.32) + (token_ratio * 0.28) + (phrase_ratio * 0.22) + (rare_term_ratio * 0.18), 4)
             if score > best_score:
                 best_score = score
     return best_score
 
 
 def _best_chunk_similarity_details(candidate_text: str, reference_text: str) -> tuple[float, str, str]:
-    candidate_chunks = _chunk_text(candidate_text, chunk_size=220)[:10] or [_clip_text(candidate_text, max_length=220)]
-    reference_chunks = _chunk_text(reference_text, chunk_size=220)[:10] or [_clip_text(reference_text, max_length=220)]
+    candidate_chunks = _prioritized_chunks(candidate_text, limit=10, chunk_size=220) or [_clip_text(candidate_text, max_length=220)]
+    reference_chunks = _prioritized_chunks(reference_text, limit=10, chunk_size=220) or [_clip_text(reference_text, max_length=220)]
     best_score = 0.0
     best_candidate = candidate_chunks[0]
     best_reference = reference_chunks[0]
@@ -870,7 +1014,8 @@ def _best_chunk_similarity_details(candidate_text: str, reference_text: str) -> 
             sequence_ratio = SequenceMatcher(None, _normalize_text(candidate_chunk), _normalize_text(reference_chunk)).ratio()
             token_ratio = _token_overlap_score(candidate_chunk, reference_chunk)
             phrase_ratio = _phrase_overlap_score(candidate_chunk, reference_chunk)
-            score = round((sequence_ratio * 0.4) + (token_ratio * 0.35) + (phrase_ratio * 0.25), 4)
+            rare_term_ratio = _rare_term_overlap_score(candidate_chunk, reference_chunk)
+            score = round((sequence_ratio * 0.32) + (token_ratio * 0.28) + (phrase_ratio * 0.22) + (rare_term_ratio * 0.18), 4)
             if score > best_score:
                 best_score = score
                 best_candidate = candidate_chunk
@@ -878,7 +1023,13 @@ def _best_chunk_similarity_details(candidate_text: str, reference_text: str) -> 
     return best_score, best_candidate[:180], best_reference[:180]
 
 
-def _similarity_score(candidate_text: str, reference_text: str) -> float:
+def _similarity_score(
+    candidate_text: str,
+    reference_text: str,
+    *,
+    source_candidate: SourceCandidate | None = None,
+    question_title: str = "",
+) -> float:
     normalized_candidate = _normalize_text(candidate_text)
     normalized_reference = _normalize_text(reference_text)
     if len(normalized_candidate) < 18 or len(normalized_reference) < 18:
@@ -886,7 +1037,16 @@ def _similarity_score(candidate_text: str, reference_text: str) -> float:
     sequence_ratio = SequenceMatcher(None, normalized_candidate, normalized_reference).ratio()
     token_ratio = _token_overlap_score(normalized_candidate, normalized_reference)
     phrase_ratio = _phrase_overlap_score(normalized_candidate, normalized_reference)
-    direct_score = round((sequence_ratio * 0.42) + (token_ratio * 0.33) + (phrase_ratio * 0.25), 4)
+    rare_term_ratio = _rare_term_overlap_score(normalized_candidate, normalized_reference)
+    title_relevance = _title_snippet_relevance_score(candidate_text, source_candidate, question_title=question_title)
+    direct_score = round(
+        (sequence_ratio * 0.27)
+        + (token_ratio * 0.24)
+        + (phrase_ratio * 0.21)
+        + (rare_term_ratio * 0.18)
+        + (title_relevance * 0.10),
+        4,
+    )
     chunk_score = _best_chunk_similarity(candidate_text, reference_text)
     return round(max(direct_score, chunk_score), 4)
 
@@ -895,7 +1055,15 @@ def _chunk_text(value: str, *, chunk_size: int = 180) -> list[str]:
     text = str(value or "").strip()
     if not text:
         return []
-    parts = [part.strip() for part in re.split(r"[\n\r]+|(?<=[.!?])\s+", text) if part.strip()]
+    raw_parts = [part.strip() for part in re.split(r"[\n\r]+|(?<=[.!?])\s+", text) if part.strip()]
+    parts: list[str] = []
+    for part in raw_parts:
+        if len(part) > chunk_size:
+            token_parts = [token.strip() for token in re.split(r"(?<=,)\s+|(?<=;)\s+|(?<=:)\s+", part) if token.strip()]
+            if len(token_parts) > 1:
+                parts.extend(token_parts)
+                continue
+        parts.append(part)
     if not parts:
         return [text[:chunk_size]]
     chunks: list[str] = []
@@ -912,7 +1080,31 @@ def _chunk_text(value: str, *, chunk_size: int = 180) -> list[str]:
             current = part
     if current:
         chunks.append(current[:chunk_size])
-    return chunks
+    return [chunk for chunk in chunks if len(_normalize_text(chunk)) >= 24] or chunks
+
+
+def _chunk_quality_score(chunk: str) -> float:
+    normalized = _normalize_text(chunk)
+    if len(normalized) < 24:
+        return 0.0
+    token_count = len(_tokenize(normalized))
+    phrase_count = len(_high_signal_phrases(normalized, limit=4))
+    rare_count = len({token for token in _tokenize(normalized) if len(token) >= 5 and token not in RARE_TERM_STOPWORDS})
+    punctuation_bonus = 1.0 if any(mark in chunk for mark in ("(", ")", ":", ".", "/", "_", "#")) else 0.0
+    return (min(token_count, 30) * 0.04) + (phrase_count * 0.45) + (min(rare_count, 10) * 0.18) + punctuation_bonus
+
+
+def _prioritized_chunks(value: str, *, limit: int = 8, chunk_size: int = 200) -> list[str]:
+    chunks = _chunk_text(value, chunk_size=chunk_size)
+    if not chunks:
+        return []
+    ranked = sorted(
+        enumerate(chunks),
+        key=lambda item: (_chunk_quality_score(item[1]), -item[0]),
+        reverse=True,
+    )
+    selected = [chunk for _, chunk in ranked[:limit]]
+    return selected
 
 
 def _best_preview_pair(candidate_text: str, reference_text: str) -> tuple[str, str]:
@@ -942,23 +1134,36 @@ def _build_match_reason(
     similarity_score: float,
     token_overlap: float,
     phrase_overlap: float,
+    rare_term_overlap: float,
+    title_snippet_relevance: float,
     chunk_similarity: float,
     source_candidate: SourceCandidate,
+    behavioral_correlation: list[str] | None = None,
 ) -> str:
     reasons: list[str] = []
-    if chunk_similarity >= 0.5:
-        reasons.append("Strong chunk-level overlap was detected in a submitted answer segment.")
+    if chunk_similarity >= 0.58:
+        reasons.append("Candidate excerpt closely matches a reference chunk.")
+    elif chunk_similarity >= 0.46:
+        reasons.append("Meaningful chunk-level overlap was detected in the submitted answer.")
+    if phrase_overlap >= 0.24:
+        reasons.append("Strong phrase overlap with submitted answer.")
     elif similarity_score >= 0.45:
         reasons.append("A meaningful normalized text similarity pattern was detected.")
 
     if token_overlap >= 0.35:
-        reasons.append("Key technical terms and sequence language overlapped with the reference.")
-    if phrase_overlap >= 0.2:
+        reasons.append("Technical terms overlap with the retrieved source.")
+    if rare_term_overlap >= 0.18:
+        reasons.append("Rare technical terms aligned across the answer and reference.")
+    if title_snippet_relevance >= 0.22:
+        reasons.append("Source title or snippet context was relevant to the submitted answer.")
+    if phrase_overlap >= 0.16 and all("phrase overlap" not in reason.lower() for reason in reasons):
         reasons.append("Short phrase structure aligned with the reference wording.")
     if source_candidate.source_domain:
         reasons.append(f"Reference context came from {source_candidate.source_domain}.")
     elif source_candidate.source_type:
         reasons.append(f"Reference context matched a {source_candidate.source_type.lower()} style source.")
+    if behavioral_correlation:
+        reasons.append(f"Behavioral correlation: {behavioral_correlation[0]}")
 
     return " ".join(reasons).strip() or "Observed similarity pattern should be reviewed in context."
 
@@ -994,6 +1199,30 @@ def _match_sort_key(item: dict[str, Any]) -> tuple[int, float, float, int, int]:
         0 if match_origin == "web_retrieval" else 1,
         -int(item.get("behavioral_signal_count") or 0),
     )
+
+
+def _dedupe_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked = sorted(matches, key=_match_sort_key)
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    seen_domains_by_question: set[tuple[str, str]] = set()
+    for item in ranked:
+        question_id = str(item.get("question_id") or "")
+        source_url = str(item.get("source_url") or "").strip().lower()
+        source_domain = str(item.get("source_domain") or "").strip().lower()
+        source_title = str(item.get("source_title") or "").strip().lower()
+        base_key = (question_id, source_url, source_title)
+        domain_key = (question_id, source_domain)
+        if source_url and base_key in seen_keys:
+            continue
+        if source_domain and domain_key in seen_domains_by_question:
+            continue
+        if source_url:
+            seen_keys.add(base_key)
+        if source_domain:
+            seen_domains_by_question.add(domain_key)
+        deduped.append(item)
+    return deduped
 
 
 @lru_cache(maxsize=1)
@@ -1200,7 +1429,12 @@ def analyze_answer_provenance(
 
         for reference in relevant_references:
             reference_text = str(reference.get("content") or "").strip()
-            similarity = _similarity_score(answer_text, reference_text)
+            similarity = _similarity_score(
+                answer_text,
+                reference_text,
+                source_candidate=source_candidate,
+                question_title=str(answer.get("question_title") or ""),
+            )
             if similarity < minimum_match_threshold:
                 continue
             source_candidate = _build_source_candidate(reference)
@@ -1229,7 +1463,7 @@ def analyze_answer_provenance(
         validation_mode=validation_mode,
     )
     matches.extend(retrieved_matches)
-
+    matches = _dedupe_matches(matches)
     matches.sort(key=_match_sort_key)
     top_matches = matches[:3]
     best_match = top_matches[0] if top_matches else None
@@ -1245,6 +1479,14 @@ def analyze_answer_provenance(
     best_signal_count = int(best_match.get("behavioral_signal_count") or 0) if best_match else 0
     overall_likelihood = _likelihood_from_score(best_score, best_signal_count, validation_mode)
     overall_confidence = _confidence_from_score(best_score, best_signal_count, validation_mode) if best_match else 0.0
+    logger.info(
+        "provenance_analysis_summary attempt_id=%s corpus_match_count=%s web_match_count=%s top_match_origin=%s top_match_provider=%s",
+        attempt_id,
+        len([item for item in matches if str(item.get("match_origin") or "controlled_corpus") == "controlled_corpus"]),
+        len([item for item in matches if str(item.get("match_origin") or "") == "web_retrieval"]),
+        best_match.get("match_origin") if best_match else "none",
+        best_match.get("retrieval_source") if best_match else "none",
+    )
 
     summary = "No meaningful reference overlap was detected in submitted answers."
     if best_match:
