@@ -6,7 +6,7 @@ import os
 import random
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -30,6 +30,7 @@ from app.main import (  # noqa: E402
 from app.models.user import User, UserRole  # noqa: E402
 from app.services.evidence_service import build_violation_overview_counts, normalize_evidence  # noqa: E402
 from app.services.final_assessment_service import build_final_risk_assessment  # noqa: E402
+from app.services.provenance_analysis_service import analyze_answer_provenance  # noqa: E402
 from engine.core import risk_engine  # noqa: E402
 from engine.core.event_processor import normalize_events  # noqa: E402
 from engine.core.feature_engineering import build_features  # noqa: E402
@@ -133,6 +134,75 @@ class CandidateSeedRecord:
     assigned_reviewer_id: int | None
     assigned_reviewer_name: str | None
     action_count: int
+    demo_story: str | None = None
+    submitted_answers: list[dict[str, Any]] = field(default_factory=list)
+    provenance_result: dict[str, Any] | None = None
+
+
+SEED_PROVENANCE_ANSWERS = {
+    "Frontend Debugging": {
+        "question_id": "seed_react_reconciliation_keys",
+        "question_title": "React Reconciliation and Stable Keys",
+        "answer_text": (
+            "React reconciliation compares the previous virtual DOM tree with the next render output to decide "
+            "which real DOM nodes should change. Keys are how React identifies list items across renders. When a "
+            "developer uses array indexes or another unstable key, React can reuse the wrong component instance after "
+            "insert, remove, or reorder operations. That often produces stale rows, incorrect local state, or UI "
+            "updates appearing on the wrong item. A practical fix is to use stable unique identifiers from the data "
+            "model, inspect dynamic list rendering paths, and verify keys do not change unless the item identity changes."
+        ),
+        "story": "Provenance-heavy frontend explanation for reviewer-side source overlap validation.",
+    },
+    "SQL Analysis": {
+        "question_id": "seed_sql_queue_indexing",
+        "question_title": "Operational Review Queue Index Redesign",
+        "answer_text": (
+            "A large operational triage query should not rely on a broad full-table scan once the queue reaches millions "
+            "of rows. The production-safe redesign is to index the columns used for risk filtering, status filtering, "
+            "and recent activity ordering, and then shape the query so the planner can use a selective composite or "
+            "partial index. This usually means filtering open review states first, reducing wide joins, and sorting on "
+            "a recent timestamp that is already covered by the index. That keeps reviewer workloads responsive and makes "
+            "high-risk queue triage predictable even as the dataset grows."
+        ),
+        "story": "Queue performance scenario for enterprise review-operations demos.",
+    },
+    "Java Backend": {
+        "question_id": "seed_java_concurrent_queue",
+        "question_title": "Concurrent Queue and Cache Contention",
+        "answer_text": (
+            "A synchronized ArrayList becomes a bottleneck when multiple workers are reading and removing queue items "
+            "while a cache is also being updated. Even if every method is technically synchronized, contention grows and "
+            "read-remove interleaving still creates throughput issues. A production-safe fix is to move to a collection "
+            "designed for concurrent access, such as BlockingQueue or ConcurrentLinkedQueue, and isolate cache mutation "
+            "from queue-drain logic. That reduces lock contention and improves throughput under bursty workloads."
+        ),
+        "story": "Concurrency-focused provenance case modeled on forum-style backend answers.",
+    },
+    "Security Investigation": {
+        "question_id": "seed_security_telemetry",
+        "question_title": "Telemetry Interpretation and Integrity Analysis",
+        "answer_text": (
+            "Telemetry is structured operational data collected remotely so investigators can observe system behavior over "
+            "time. In an integrity workflow it includes focus changes, clipboard metadata, navigation events, timing "
+            "patterns, and other behavioral signals rather than invasive content capture. Monitoring tells you whether a "
+            "service is healthy right now, while telemetry gives you richer event data for correlation, latency analysis, "
+            "and evidence review. The design challenge is balancing data volume, privacy constraints, and signal quality."
+        ),
+        "story": "Enterprise investigation narrative emphasizing privacy-safe telemetry interpretation.",
+    },
+    "Data Reasoning": {
+        "question_id": "seed_triage_automation",
+        "question_title": "Triage Automation Evaluation",
+        "answer_text": (
+            "A credible triage automation study should evaluate whether prioritization logic actually improves reviewer "
+            "throughput and decision quality on realistic software engineering datasets. That means measuring precision, "
+            "recall, analyst workload reduction, and time to first action instead of relying on a single aggregate score. "
+            "Industrial and open-source studies usually stress reproducibility, comparable baselines, and an explanation "
+            "of how automated ranking behaves on noisy real-world issue queues."
+        ),
+        "story": "Research-style reasoning answer for provenance-heavy operational analytics demos.",
+    },
+}
 
 
 def _slugify(value: str) -> str:
@@ -145,6 +215,41 @@ def _question_count_for_bucket(bucket: str, rng: random.Random) -> int:
     if bucket == "MEDIUM":
         return rng.randint(8, 11)
     return rng.randint(8, 12)
+
+
+def _build_seeded_provenance_payload(
+    *,
+    attempt_id: str,
+    assessment_name: str,
+    bucket: str,
+    bucket_position: int,
+    events: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str | None]:
+    template = SEED_PROVENANCE_ANSWERS.get(assessment_name) or SEED_PROVENANCE_ANSWERS.get("Frontend Debugging")
+    if not template:
+        return [], None, None
+    if bucket not in {"MEDIUM", "HIGH"}:
+        return [], None, None
+    if bucket_position > 2 and bucket != "HIGH":
+        return [], None, None
+
+    answers = [
+        {
+            "question_id": template["question_id"],
+            "question_title": template["question_title"],
+            "assessment_type": assessment_name,
+            "input_type": "textarea",
+            "answer_text": template["answer_text"],
+            "marked_for_review": bucket == "HIGH",
+        }
+    ]
+    provenance_result = analyze_answer_provenance(
+        attempt_id=attempt_id,
+        assessment_name=assessment_name,
+        submitted_answers=answers,
+        events=events,
+    )
+    return answers, provenance_result, template.get("story")
 
 
 def _distribution_for_count(total: int, *, target_low: float, target_medium: float, target_high: float) -> dict[str, int]:
@@ -469,6 +574,12 @@ def _dataset_attempt_id(bucket: str, ordinal: int) -> str:
 
 def _build_manual_log_entry(record: CandidateSeedRecord) -> dict[str, Any]:
     result = record.result
+    merged_signals = {
+        **(result.signals or {}),
+        **({"submitted_answers": record.submitted_answers} if record.submitted_answers else {}),
+        **({"answer_provenance": record.provenance_result} if record.provenance_result else {}),
+        **({"demo_story": record.demo_story} if record.demo_story else {}),
+    }
     return {
         "timestamp": record.session_end.isoformat(),
         "attempt_id": record.attempt_id,
@@ -480,7 +591,7 @@ def _build_manual_log_entry(record: CandidateSeedRecord) -> dict[str, Any]:
         "confidence_score": float(result.confidence_score),
         "combined_score": float(result.combined_score),
         "features": record.features,
-        "signals": result.signals,
+        "signals": merged_signals,
         "session_intelligence": getattr(result, "session_intelligence", {}),
         "dataset_seed": True,
     }
@@ -532,6 +643,12 @@ def _seed_candidate_record(
 ) -> None:
     result = record.result
     features = record.features
+    merged_signals = {
+        **(result.signals or {}),
+        **({"submitted_answers": record.submitted_answers} if record.submitted_answers else {}),
+        **({"answer_provenance": record.provenance_result} if record.provenance_result else {}),
+        **({"demo_story": record.demo_story} if record.demo_story else {}),
+    }
     for event in record.events:
         db.add(
             RawExamEvent(
@@ -556,7 +673,7 @@ def _seed_candidate_record(
             confidence_score=float(result.confidence_score),
             combined_score=float(result.combined_score),
             features=features,
-            signals=result.signals,
+            signals=merged_signals,
             timestamp=record.session_end.isoformat(),
         )
     )
@@ -658,7 +775,7 @@ def _seed_candidate_record(
         ),
         risk_history=serialized_history,
         features=features,
-        signals=result.signals,
+        signals=merged_signals,
     )
 
     action_timestamp = record.session_start + timedelta(minutes=2)
@@ -756,6 +873,12 @@ def _generate_candidate_record(
     assigned_reviewer_id = None
     assigned_reviewer_name = None
     case_status = _select_case_status(bucket, rng)
+    if bucket == "LOW" and bucket_position == 1:
+        case_status = CaseStatus.FALSE_POSITIVE.value
+    if bucket == "MEDIUM" and bucket_position == 1:
+        case_status = CaseStatus.UNDER_INVESTIGATION.value
+    if bucket == "HIGH" and bucket_position == 1:
+        case_status = CaseStatus.ESCALATED.value
     if reviewer_pool and case_status in {
         CaseStatus.TRIAGED.value,
         CaseStatus.UNDER_INVESTIGATION.value,
@@ -768,6 +891,14 @@ def _generate_candidate_record(
         reviewer = reviewer_pool[ordinal % len(reviewer_pool)]
         assigned_reviewer_id = reviewer.id
         assigned_reviewer_name = reviewer.full_name or reviewer.email
+
+    submitted_answers, provenance_result, demo_story = _build_seeded_provenance_payload(
+        attempt_id=attempt_id,
+        assessment_name=assessment_name,
+        bucket=bucket,
+        bucket_position=bucket_position,
+        events=events,
+    )
 
     return CandidateSeedRecord(
         attempt_id=attempt_id,
@@ -788,6 +919,9 @@ def _generate_candidate_record(
         assigned_reviewer_id=assigned_reviewer_id,
         assigned_reviewer_name=assigned_reviewer_name,
         action_count=2 if assigned_reviewer_id is not None else 0,
+        demo_story=demo_story,
+        submitted_answers=submitted_answers,
+        provenance_result=provenance_result,
     )
 
 
@@ -915,6 +1049,7 @@ def main() -> int:
                             "score": round(float(record.result.combined_score), 4),
                             "status": record.case_status,
                             "profile": record.profile_name,
+                            "demo_story": record.demo_story,
                             "session_end": record.session_end.isoformat(),
                         }
                         for record in records_to_seed[:8]

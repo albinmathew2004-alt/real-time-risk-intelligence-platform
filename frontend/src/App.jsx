@@ -68,9 +68,22 @@ const DEMO_SIGNAL_TOASTS_ENABLED = String(
   ?? import.meta.env.DEMO_SIGNAL_TOASTS_ENABLED
   ?? "true",
 ).toLowerCase() !== "false";
+const DEMO_BROWSER_NOTIFICATIONS_ENABLED = String(
+  import.meta.env.VITE_DEMO_BROWSER_NOTIFICATIONS_ENABLED
+  ?? import.meta.env.DEMO_BROWSER_NOTIFICATIONS_ENABLED
+  ?? "true",
+).toLowerCase() !== "false";
 const DEMO_SIGNAL_TOAST_DISMISS_MS = 4800;
 const DEMO_SIGNAL_TOAST_COOLDOWN_MS = 4500;
 const DEMO_SIGNAL_TOAST_LIMIT = 2;
+const DEMO_BROWSER_NOTIFICATION_COOLDOWN_MS = 10000;
+const DEMO_BROWSER_NOTIFICATION_DUPLICATE_MS = 20000;
+const DEMO_BROWSER_NOTIFICATION_KEYS = new Set([
+  "focus_loss",
+  "visibility_hidden",
+  "clipboard_paste",
+  "large_answer_insert",
+]);
 
 /* ── Shared Demo Signal Map ─────────────────────────────────────────────
    Maps telemetry signal keys → toast label, severity, and report-style
@@ -2408,6 +2421,62 @@ function detectDemoSequence(recentSignals) {
   return null;
 }
 
+function canUseDemoBrowserNotifications() {
+  return typeof window !== "undefined" && typeof Notification !== "undefined";
+}
+
+async function requestDemoNotificationPermission() {
+  if (!DEMO_BROWSER_NOTIFICATIONS_ENABLED || !canUseDemoBrowserNotifications()) return "unsupported";
+  if (Notification.permission !== "default") return Notification.permission;
+  try {
+    return await Notification.requestPermission();
+  } catch {
+    return "denied";
+  }
+}
+
+function getDemoBrowserNotification(signal) {
+  if (!signal?.key) return null;
+  if (signal.isSequence) {
+    return {
+      title: "ProctorIQ integrity signal",
+      body: "Correlated sequence detected",
+      tag: `proctoriq-sequence-${signal.key}`,
+    };
+  }
+
+  switch (signal.key) {
+    case "focus_loss":
+    case "visibility_hidden":
+      return { title: "ProctorIQ integrity signal", body: "Focus change observed", tag: "proctoriq-focus-change" };
+    case "clipboard_paste":
+      return { title: "ProctorIQ integrity signal", body: "Clipboard activity recorded", tag: "proctoriq-clipboard-paste" };
+    case "large_answer_insert":
+      return { title: "ProctorIQ integrity signal", body: "Large answer insert recorded", tag: "proctoriq-large-insert" };
+    default:
+      return null;
+  }
+}
+
+function showDemoBrowserNotification(signal) {
+  if (!DEMO_BROWSER_NOTIFICATIONS_ENABLED || !canUseDemoBrowserNotifications()) return false;
+  if (Notification.permission !== "granted") return false;
+  const payload = getDemoBrowserNotification(signal);
+  if (!payload) return false;
+
+  try {
+    const notification = new Notification(payload.title, {
+      body: payload.body,
+      tag: payload.tag,
+      silent: true,
+    });
+    window.setTimeout(() => notification.close(), 5000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function PublicDemoPage({ apiBaseUrl }) {
   const initialCompletion = useMemo(() => getDemoCompletionFromLocation(), []);
   const tracker = useMemo(() => ({ visited: new Set(), lastSectionId: "" }), []);
@@ -2417,6 +2486,11 @@ function PublicDemoPage({ apiBaseUrl }) {
     lastAnswerChangeByQuestion: {},
     recentTelemetrySignatures: {},
     recentSignals: [],
+  });
+  const notificationTracker = useRef({
+    lastShownAt: 0,
+    lastShownByKey: {},
+    permissionRequested: false,
   });
   const [consented, setConsented] = useState(false);
   const [candidateName, setCandidateName] = useState(() => initialCompletion?.candidateName || "");
@@ -2510,6 +2584,25 @@ function PublicDemoPage({ apiBaseUrl }) {
     }, DEMO_SIGNAL_TOAST_DISMISS_MS);
   }, [dismissSignalToast, stage]);
 
+  const maybeShowDemoBrowserNotification = useCallback((signal) => {
+    if (!DEMO_BROWSER_NOTIFICATIONS_ENABLED || stage !== "assessment" || !signal?.key) return;
+    if (!canUseDemoBrowserNotifications()) return;
+    if (document.visibilityState === "visible") return;
+    if (!signal.isSequence && !DEMO_BROWSER_NOTIFICATION_KEYS.has(signal.key)) return;
+    if (Notification.permission !== "granted") return;
+
+    const now = Date.now();
+    if (now - notificationTracker.current.lastShownAt < DEMO_BROWSER_NOTIFICATION_COOLDOWN_MS) return;
+    const dedupeKey = signal.isSequence ? signal.key : (signal.group || signal.key);
+    const lastShownForKey = notificationTracker.current.lastShownByKey[dedupeKey] || 0;
+    if (now - lastShownForKey < DEMO_BROWSER_NOTIFICATION_DUPLICATE_MS) return;
+
+    const shown = showDemoBrowserNotification(signal);
+    if (!shown) return;
+    notificationTracker.current.lastShownAt = now;
+    notificationTracker.current.lastShownByKey[dedupeKey] = now;
+  }, [stage]);
+
   useEffect(() => {
     return () => {
       Object.values(toastTracker.current.dismissTimers).forEach((timerId) => window.clearTimeout(timerId));
@@ -2574,7 +2667,7 @@ function PublicDemoPage({ apiBaseUrl }) {
   }, [stage]);
 
   useEffect(() => {
-    if (!DEMO_SIGNAL_TOASTS_ENABLED || stage !== "assessment" || typeof window === "undefined") return undefined;
+    if ((!DEMO_SIGNAL_TOASTS_ENABLED && !DEMO_BROWSER_NOTIFICATIONS_ENABLED) || stage !== "assessment" || typeof window === "undefined") return undefined;
 
     function handleTelemetryToast(event) {
       const toast = getDemoSignalToast(event.detail);
@@ -2605,17 +2698,21 @@ function PublicDemoPage({ apiBaseUrl }) {
         if (sequence) {
           // Clear the window so the same sequence doesn't re-fire
           toastTracker.current.recentSignals = [];
+          maybeShowDemoBrowserNotification(sequence);
           addDemoSignalToast(sequence);
           return;
         }
       }
 
-      if (toast) addDemoSignalToast(toast);
+      if (toast) {
+        maybeShowDemoBrowserNotification(toast);
+        addDemoSignalToast(toast);
+      }
     }
 
     window.addEventListener("proctoriq:telemetry-event", handleTelemetryToast);
     return () => window.removeEventListener("proctoriq:telemetry-event", handleTelemetryToast);
-  }, [addDemoSignalToast, stage]);
+  }, [addDemoSignalToast, maybeShowDemoBrowserNotification, stage]);
 
   const emitDemoEvent = useCallback((eventType, payload = {}) => {
     if (!attemptId) return;
@@ -2794,9 +2891,20 @@ function PublicDemoPage({ apiBaseUrl }) {
     toastTracker.current.lastAnswerChangeByQuestion = {};
     toastTracker.current.recentTelemetrySignatures = {};
     toastTracker.current.recentSignals = [];
+    notificationTracker.current.lastShownAt = 0;
+    notificationTracker.current.lastShownByKey = {};
     setTelemetryError("");
     tracker.visited.clear();
     tracker.lastSectionId = "";
+    if (
+      DEMO_BROWSER_NOTIFICATIONS_ENABLED
+      && canUseDemoBrowserNotifications()
+      && Notification.permission === "default"
+      && !notificationTracker.current.permissionRequested
+    ) {
+      notificationTracker.current.permissionRequested = true;
+      void requestDemoNotificationPermission();
+    }
 
     try {
       if (!window.RiskTelemetry) {
@@ -3106,6 +3214,9 @@ function PublicDemoPage({ apiBaseUrl }) {
     toastTracker.current.lastAnswerChangeByQuestion = {};
     toastTracker.current.recentTelemetrySignatures = {};
     toastTracker.current.recentSignals = [];
+    notificationTracker.current.lastShownAt = 0;
+    notificationTracker.current.lastShownByKey = {};
+    notificationTracker.current.permissionRequested = false;
     setStage("welcome");
     setTimeRemaining(selectedAssessment.durationMinutes * 60);
     tracker.visited.clear();
@@ -3162,6 +3273,11 @@ function PublicDemoPage({ apiBaseUrl }) {
                       <li>No answer text stored as telemetry</li>
                       <li>Only metadata from timing, focus, typing rhythm, navigation, and clipboard behavior is analyzed</li>
                     </ul>
+                    {DEMO_BROWSER_NOTIFICATIONS_ENABLED ? (
+                      <p className="public-demo-support-copy">
+                        Browser notifications are used only during this demo to show integrity signals when the assessment tab is not visible.
+                      </p>
+                    ) : null}
                   </div>
                   <div className="public-demo-telemetry-panel">
                     <div className="public-demo-mini-kicker">Telemetry inputs</div>

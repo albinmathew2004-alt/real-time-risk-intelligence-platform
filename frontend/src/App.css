@@ -881,6 +881,13 @@ body::-webkit-scrollbar-thumb:hover,
   font-size: 14px;
 }
 
+.public-demo-support-copy {
+  margin: 0;
+  color: #91b6ff;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .public-demo-consent {
   margin: 18px 0 12px;
   padding: 14px 16px;
