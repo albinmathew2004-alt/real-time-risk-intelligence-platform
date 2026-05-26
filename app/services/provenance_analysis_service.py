@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from html import unescape
 import json
 import logging
+import math
 import os
 import re
 from difflib import SequenceMatcher
@@ -23,8 +24,10 @@ PROVENANCE_VALIDATION_TRACK = "Testing Post-Submission Answer Provenance Analysi
 LIMITATIONS_NOTE = "Source matches indicate potential reference overlap, not definitive proof of copying."
 WEB_RETRIEVAL_LIMITATIONS_NOTE = "Web retrieval matches are experimental and may contain approximate or indirect overlaps."
 ENABLE_EXPERIMENTAL_WEB_RETRIEVAL = os.getenv("ENABLE_EXPERIMENTAL_WEB_RETRIEVAL", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SEMANTIC_PROVENANCE = os.getenv("ENABLE_SEMANTIC_PROVENANCE", "false").strip().lower() in {"1", "true", "yes", "on"}
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", os.getenv("SERPER_SEARCH_API_KEY", "")).strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("OPENAI_EMBEDDING_API_KEY", "")).strip()
 WEB_RETRIEVAL_MAX_RESULTS = max(1, int(os.getenv("WEB_RETRIEVAL_MAX_RESULTS", "3") or "3"))
 WEB_RETRIEVAL_TIMEOUT_SECONDS = max(1, int(os.getenv("WEB_RETRIEVAL_TIMEOUT_SECONDS", "6") or "6"))
 BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -62,6 +65,9 @@ class MatchEvidence:
     rare_term_overlap: float
     title_snippet_relevance: float
     chunk_similarity: float
+    semantic_similarity: float | None
+    semantic_provider: str | None
+    semantic_enabled: bool
     matched_candidate_excerpt: str
     matched_reference_excerpt: str
     confidence_label: str
@@ -99,10 +105,26 @@ class RetrievalResult:
     note: str
 
 
+@dataclass(slots=True)
+class EmbeddingResult:
+    enabled: bool
+    provider_name: str
+    vectors: list[list[float] | None]
+    dimensions: int
+    note: str = ""
+
+
 class RetrievalProvider(Protocol):
     provider_name: str
 
     def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        ...
+
+
+class EmbeddingProvider(Protocol):
+    provider_name: str
+
+    def embed_texts(self, texts: list[str]) -> EmbeddingResult:
         ...
 
 
@@ -133,6 +155,53 @@ class InactiveProvenanceProviders:
     crawler_provider: CrawlerProvider | None = None
     OCR_provider: OCRProvider | None = None
     vector_search_provider: VectorSearchProvider | None = None
+
+
+class DisabledEmbeddingProvider:
+    provider_name = "semantic_disabled"
+
+    def embed_texts(self, texts: list[str]) -> EmbeddingResult:
+        return EmbeddingResult(
+            enabled=False,
+            provider_name=self.provider_name,
+            vectors=[None for _ in texts],
+            dimensions=0,
+            note="Semantic provenance is disabled by feature flag.",
+        )
+
+
+class LocalSentenceTransformerProvider:
+    provider_name = "local_sentence_transformer"
+
+    def embed_texts(self, texts: list[str]) -> EmbeddingResult:
+        return EmbeddingResult(
+            enabled=False,
+            provider_name=self.provider_name,
+            vectors=[None for _ in texts],
+            dimensions=0,
+            note="Local sentence-transformer provider is not installed in this environment.",
+        )
+
+
+class OpenAIEmbeddingProvider:
+    provider_name = "openai_embeddings"
+
+    def embed_texts(self, texts: list[str]) -> EmbeddingResult:
+        if not OPENAI_API_KEY:
+            return EmbeddingResult(
+                enabled=False,
+                provider_name=self.provider_name,
+                vectors=[None for _ in texts],
+                dimensions=0,
+                note="OpenAI embedding provider is not configured.",
+            )
+        return EmbeddingResult(
+            enabled=False,
+            provider_name=self.provider_name,
+            vectors=[None for _ in texts],
+            dimensions=0,
+            note="OpenAI embedding provider is reserved for a future semantic provenance integration.",
+        )
 
 
 class SearchQueryBuilder:
@@ -588,6 +657,94 @@ def _future_vector_search_hook(text: str) -> dict[str, Any]:
     }
 
 
+def _future_vector_db_lookup_hook(text: str) -> dict[str, Any]:
+    return {
+        "query_text_length": len(_normalize_text(text)),
+        "status": "disabled",
+        "matches": [],
+        "note": "Vector database integration is reserved for future semantic provenance retrieval.",
+    }
+
+
+def _active_embedding_provider() -> EmbeddingProvider:
+    if not ENABLE_SEMANTIC_PROVENANCE:
+        return DisabledEmbeddingProvider()
+    if OPENAI_API_KEY:
+        return OpenAIEmbeddingProvider()
+    return LocalSentenceTransformerProvider()
+
+
+def _cosine_similarity(left: list[float] | None, right: list[float] | None) -> float | None:
+    if not left or not right or len(left) != len(right):
+        return None
+    dot = sum(l * r for l, r in zip(left, right))
+    left_norm = math.sqrt(sum(l * l for l in left))
+    right_norm = math.sqrt(sum(r * r for r in right))
+    if left_norm == 0 or right_norm == 0:
+        return None
+    return dot / (left_norm * right_norm)
+
+
+def _semantic_embedding_chunks(text: str, *, limit: int = 6, chunk_size: int = 220) -> list[str]:
+    return _prioritized_chunks(text, limit=limit, chunk_size=chunk_size)
+
+
+def _semantic_similarity_details(
+    candidate_text: str,
+    reference_text: str,
+) -> dict[str, Any]:
+    provider = _active_embedding_provider()
+    if not ENABLE_SEMANTIC_PROVENANCE:
+        return {
+            "semantic_similarity": None,
+            "semantic_provider": provider.provider_name,
+            "semantic_enabled": False,
+        }
+
+    candidate_chunks = _semantic_embedding_chunks(candidate_text, limit=4)
+    reference_chunks = _semantic_embedding_chunks(reference_text, limit=4)
+    if not candidate_chunks or not reference_chunks:
+        return {
+            "semantic_similarity": None,
+            "semantic_provider": provider.provider_name,
+            "semantic_enabled": False,
+        }
+
+    texts = [*candidate_chunks, *reference_chunks]
+    try:
+        embedding_result = provider.embed_texts(texts)
+    except Exception as exc:
+        logger.info("semantic_provenance_provider_failed provider=%s error=%s", provider.provider_name, exc)
+        return {
+            "semantic_similarity": None,
+            "semantic_provider": provider.provider_name,
+            "semantic_enabled": False,
+        }
+
+    if not embedding_result.enabled:
+        return {
+            "semantic_similarity": None,
+            "semantic_provider": embedding_result.provider_name,
+            "semantic_enabled": False,
+        }
+
+    candidate_vectors = embedding_result.vectors[: len(candidate_chunks)]
+    reference_vectors = embedding_result.vectors[len(candidate_chunks):]
+    best_similarity: float | None = None
+    for candidate_vector in candidate_vectors:
+        for reference_vector in reference_vectors:
+            score = _cosine_similarity(candidate_vector, reference_vector)
+            if score is None:
+                continue
+            if best_similarity is None or score > best_similarity:
+                best_similarity = score
+    return {
+        "semantic_similarity": round(best_similarity, 4) if best_similarity is not None else None,
+        "semantic_provider": embedding_result.provider_name,
+        "semantic_enabled": best_similarity is not None,
+    }
+
+
 def _build_match_payload(
     *,
     attempt_id: str,
@@ -614,6 +771,7 @@ def _build_match_payload(
         ),
         4,
     )
+    semantic_details = _semantic_similarity_details(answer_text, reference_text)
     chunk_similarity, chunk_candidate_excerpt, chunk_reference_excerpt = _best_chunk_similarity_details(answer_text, reference_text)
     candidate_excerpt, reference_excerpt = _best_preview_pair(answer_text, reference_text)
     matched_candidate_excerpt = chunk_candidate_excerpt or candidate_excerpt
@@ -628,6 +786,9 @@ def _build_match_payload(
         rare_term_overlap=rare_term_overlap,
         title_snippet_relevance=title_snippet_relevance,
         chunk_similarity=round(chunk_similarity, 4),
+        semantic_similarity=semantic_details["semantic_similarity"],
+        semantic_provider=semantic_details["semantic_provider"],
+        semantic_enabled=semantic_details["semantic_enabled"],
         matched_candidate_excerpt=matched_candidate_excerpt,
         matched_reference_excerpt=matched_reference_excerpt,
         confidence_label=_confidence_label(confidence),
@@ -669,6 +830,9 @@ def _build_match_payload(
         "rare_term_overlap": match_evidence.rare_term_overlap,
         "title_snippet_relevance": match_evidence.title_snippet_relevance,
         "chunk_similarity": match_evidence.chunk_similarity,
+        "semantic_similarity": match_evidence.semantic_similarity,
+        "semantic_provider": match_evidence.semantic_provider,
+        "semantic_enabled": match_evidence.semantic_enabled,
         "confidence_label": match_evidence.confidence_label,
         "match_reason": match_evidence.match_reason,
         "candidate_excerpt": match_evidence.matched_candidate_excerpt,
@@ -730,6 +894,9 @@ def _experimental_retrieval_hooks(
             "vector_search": _future_vector_search_hook(
                 " ".join(str(answer.get("answer_text") or "") for answer in answers[:1])
             ),
+            "vector_db": _future_vector_db_lookup_hook(
+                " ".join(str(answer.get("answer_text") or "") for answer in answers[:1])
+            ),
             "limitations_note": WEB_RETRIEVAL_LIMITATIONS_NOTE,
         }
     providers: list[RetrievalProvider] = [
@@ -761,6 +928,9 @@ def _experimental_retrieval_hooks(
         "results": retrieval_results,
         "page_content_extraction": _future_page_content_extraction(sample_url or ""),
         "vector_search": _future_vector_search_hook(
+            " ".join(str(answer.get("answer_text") or "") for answer in answers[:1])
+        ),
+        "vector_db": _future_vector_db_lookup_hook(
             " ".join(str(answer.get("answer_text") or "") for answer in answers[:1])
         ),
         "limitations_note": WEB_RETRIEVAL_LIMITATIONS_NOTE,
@@ -1516,6 +1686,10 @@ def analyze_answer_provenance(
         },
         "reviewer_summary": result.reviewer_summary,
         "limitations_note": result.limitations_note,
+        "semantic_provenance": {
+            "enabled": ENABLE_SEMANTIC_PROVENANCE,
+            "provider": _active_embedding_provider().provider_name,
+        },
         "experimental_web_retrieval": retrieval_hooks,
         "web_retrieval_disclaimer": WEB_RETRIEVAL_LIMITATIONS_NOTE if ENABLE_EXPERIMENTAL_WEB_RETRIEVAL else "",
         "top_matches": result.top_matches,

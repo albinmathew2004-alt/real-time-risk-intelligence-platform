@@ -6454,6 +6454,12 @@ function ProvenanceIntelligenceCard({
                       <span>Token overlap {formatNumber(match.token_overlap, 2)}</span>
                       <span>Phrase overlap {formatNumber(match.phrase_overlap, 2)}</span>
                       <span>Chunk similarity {formatNumber(match.chunk_similarity, 2)}</span>
+                      {match.semantic_enabled && match.semantic_similarity != null ? (
+                        <span>
+                          Semantic similarity {formatNumber(match.semantic_similarity, 2)}
+                          {match.semantic_provider ? ` · ${match.semantic_provider}` : ""}
+                        </span>
+                      ) : null}
                       <span>{match.confidence_label || "Low confidence"}</span>
                     </div>
                     {(match.behavioral_correlation || []).length ? (
@@ -7155,6 +7161,15 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
                           <div>
                             <span>Retrieved</span>
                             <strong>{formatDateTime(match.retrieval_timestamp)}</strong>
+                          </div>
+                        ) : null}
+                        {match.semantic_enabled && match.semantic_similarity != null ? (
+                          <div>
+                            <span>Semantic similarity</span>
+                            <strong>
+                              {formatNumber(match.semantic_similarity, 2)}
+                              {match.semantic_provider ? ` · ${match.semantic_provider}` : ""}
+                            </strong>
                           </div>
                         ) : null}
                         {match.source_url ? (
