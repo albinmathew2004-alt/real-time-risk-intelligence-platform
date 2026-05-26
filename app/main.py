@@ -1509,6 +1509,12 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
         evidence_items=evidence_items,
         session_narrative=session_narrative,
     )
+    hybrid_reasoning = _build_hybrid_reasoning_context(
+        final_risk_level=risk_level,
+        session_intelligence=dict(metadata_source.get("session_intelligence", {}) or {}),
+        recommendation=str(summary.get("recommendation") or ""),
+        why_this_score=str(summary.get("why_this_score") or ""),
+    )
     computed_overview_counts = build_violation_overview_counts(events=event_payloads, features=features)
     persisted_overview_counts = dict(getattr(persisted_state, "violation_overview", None) or {})
     overview_counts = persisted_overview_counts if persisted_overview_counts else computed_overview_counts
@@ -1523,6 +1529,14 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
 
     return {
         **summary,
+        "summary_text": hybrid_reasoning.get("summary_text") or summary.get("recommendation"),
+        "why_score_text": hybrid_reasoning.get("why_score_text") or summary.get("why_this_score"),
+        "hybrid_reasoning": {
+            "ml_advisory_level": hybrid_reasoning.get("ml_advisory_level"),
+            "deterministic_risk_level": hybrid_reasoning.get("deterministic_risk_level"),
+            "behavioral_correlation_strength": hybrid_reasoning.get("behavioral_correlation_strength"),
+            "escalation_reason": hybrid_reasoning.get("escalation_reason"),
+        },
         "attempt_id": attempt_id,
         "event_count": max(len(events), int(getattr(persisted_state, "event_count", 0) or 0)),
         "evidence_items": evidence_items,
@@ -1556,9 +1570,53 @@ def _is_public_demo_attempt_id(attempt_id: str) -> bool:
     return normalized.startswith("demo_public_")
 
 
+def _build_hybrid_reasoning_context(
+    *,
+    final_risk_level: str,
+    session_intelligence: Dict[str, Any] | None,
+    recommendation: str,
+    why_this_score: str,
+) -> Dict[str, Any]:
+    intelligence = dict(session_intelligence or {})
+    hybrid = dict(intelligence.get("hybrid_reasoning") or {})
+    ml_advisory_level = str(hybrid.get("ml_advisory_level") or "").strip().upper() or None
+    deterministic_risk_level = str(hybrid.get("deterministic_risk_level") or "").strip().upper() or None
+    behavioral_correlation_strength = str(hybrid.get("behavioral_correlation_strength") or "").strip().upper() or None
+    escalation_reason = str(hybrid.get("escalation_reason") or "").strip() or None
+
+    summary_text = recommendation
+    why_score_text = why_this_score
+
+    if escalation_reason:
+        summary_text = escalation_reason
+        why_score_text = (
+            f"{escalation_reason} {why_this_score}".strip()
+            if why_this_score and why_this_score not in escalation_reason
+            else escalation_reason
+        )
+    elif ml_advisory_level:
+        summary_text = (
+            "The final risk level reflects combined deterministic analysis, behavioral telemetry correlation, and ML-assisted scoring."
+        )
+        why_score_text = (
+            f"ML-assisted assessment indicated {ml_advisory_level} concern while the final integrity risk settled at {final_risk_level} after deterministic review and behavioral correlation."
+        )
+
+    return {
+        "ml_advisory_level": ml_advisory_level,
+        "deterministic_risk_level": deterministic_risk_level,
+        "behavioral_correlation_strength": behavioral_correlation_strength,
+        "escalation_reason": escalation_reason,
+        "summary_text": summary_text,
+        "why_score_text": why_score_text,
+    }
+
+
 def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
     provenance = dict(report.get("provenance_analysis") or {})
-    submitted_answers = list((((report.get("signals") or {}) if isinstance(report.get("signals"), dict) else {}) or {}).get("submitted_answers") or [])
+    signals = ((report.get("signals") or {}) if isinstance(report.get("signals"), dict) else {}) or {}
+    submitted_answers = list(signals.get("submitted_answers") or [])
+    saved_provenance_status = str(signals.get("provenance_status") or "").strip().lower()
     provenance_ready = bool(
         provenance
         and (
@@ -1567,11 +1625,14 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
             or "external_similarity_likelihood" in provenance
         )
     )
-    provenance_status = "processing"
     if provenance_ready:
         provenance_status = "ready"
+    elif saved_provenance_status in {"processing", "ready", "unavailable"}:
+        provenance_status = saved_provenance_status
     elif submitted_answers == []:
         provenance_status = "unavailable"
+    else:
+        provenance_status = "processing"
     possible_matches = [
         {
             "source_title": match.get("source_title"),
@@ -1590,7 +1651,11 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "likelihood": match.get("likelihood") or "LOW",
             "token_overlap": round(safe_float(match.get("token_overlap"), 0.0), 4),
             "phrase_overlap": round(safe_float(match.get("phrase_overlap"), 0.0), 4),
+            "rare_term_overlap": round(safe_float(match.get("rare_term_overlap"), 0.0), 4),
             "chunk_similarity": round(safe_float(match.get("chunk_similarity"), 0.0), 4),
+            "semantic_similarity": round(safe_float(match.get("semantic_similarity"), 0.0), 4) if match.get("semantic_similarity") is not None else None,
+            "semantic_provider": match.get("semantic_provider"),
+            "semantic_enabled": bool(match.get("semantic_enabled")),
             "confidence_label": match.get("confidence_label") or "Low confidence",
             "match_reason": match.get("match_reason") or "",
             "candidate_excerpt": match.get("candidate_excerpt") or "",
@@ -1612,6 +1677,8 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
             "reviewer_summary": provenance.get("reviewer_summary") or provenance.get("summary") or "",
             "limitations_note": provenance.get("limitations_note") or "",
             "web_retrieval_disclaimer": provenance.get("web_retrieval_disclaimer") or "",
+            "generated_at": provenance.get("generated_at"),
+            "retrieval_duration_ms": provenance.get("retrieval_duration_ms"),
             "provenance_status": provenance_status,
         }
 
@@ -1630,9 +1697,10 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "risk_score": round(safe_float((report.get("final_risk_assessment") or {}).get("combined_score"), 0.0), 4),
         "confidence": round(safe_float((report.get("final_risk_assessment") or {}).get("confidence"), 0.0), 4),
         "strongest_reason": report.get("strongest_reason") or "Behavioral signals were reviewed in context after submission.",
-        "summary_text": report.get("summary_text") or report.get("why_score_text") or "Behavioral signals were analyzed after assessment submission.",
-        "why_score_text": report.get("why_score_text") or report.get("summary_text") or "Behavioral signals were analyzed after assessment submission.",
-        "behavioral_summary": report.get("summary_text") or report.get("why_score_text") or "Behavioral signals were analyzed after assessment submission.",
+        "summary_text": report.get("summary_text") or report.get("recommendation") or report.get("why_score_text") or "Behavioral signals were analyzed after assessment submission.",
+        "why_score_text": report.get("why_score_text") or report.get("summary_text") or report.get("recommendation") or "Behavioral signals were analyzed after assessment submission.",
+        "behavioral_summary": report.get("summary_text") or report.get("why_score_text") or report.get("recommendation") or "Behavioral signals were analyzed after assessment submission.",
+        "hybrid_reasoning": dict(report.get("hybrid_reasoning") or {}),
         "most_suspicious_behaviors": list(report.get("investigation_insights") or [])[:6],
         "violation_summary": dict(report.get("violation_overview_counts") or {}),
         "evidence_items": list(report.get("evidence_items") or []),
@@ -2114,6 +2182,39 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
             payload.assessment_name or attempt_state.assessment_name or "",
             ",".join(str(length) for length in answer_lengths[:12]),
         )
+        logger.info(
+            "answers_received_count attempt_id=%s count=%s answer_lengths=%s provenance_input_question_count=%s",
+            attempt_id,
+            len(answers),
+            ",".join(str(length) for length in answer_lengths[:12]),
+            len(answers),
+        )
+
+        existing_signals = dict(getattr(attempt_state, "signals", None) or {})
+        existing_signals["submitted_answers"] = answers
+        existing_signals["provenance_status"] = "unavailable" if not answers else "processing"
+        existing_signals.pop("provenance_error", None)
+        attempt_state.candidate_id = payload.candidate_id or attempt_state.candidate_id
+        attempt_state.candidate_name = payload.candidate_name or attempt_state.candidate_name
+        attempt_state.candidate_email = payload.candidate_email or attempt_state.candidate_email
+        attempt_state.assessment_id = payload.assessment_id or attempt_state.assessment_id
+        attempt_state.assessment_name = payload.assessment_name or attempt_state.assessment_name
+        attempt_state.signals = existing_signals
+        attempt_state.updated_at = utc_now()
+        if not attempt_state.submitted_at:
+            attempt_state.submitted_at = attempt_state.updated_at
+        if attempt_state.status in {"ONGOING", "IN_PROGRESS", ""}:
+            attempt_state.status = "SUBMITTED"
+        db.commit()
+        logger.info("persisted_answers_count attempt_id=%s count=%s", attempt_id, len(answers))
+
+        if not answers:
+            logger.info("provenance_analysis_completed attempt_id=%s matches=0 likelihood=LOW confidence=0.00", attempt_id)
+            return {
+                "status": "success",
+                "attempt_id": attempt_id,
+                "data": None,
+            }
 
         events = [
             {
@@ -2128,48 +2229,62 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
                 .all()
             )
         ]
+        logger.info("provenance_analysis_started attempt_id=%s answer_count=%s", attempt_id, len(answers))
+        try:
+            provenance_result = analyze_answer_provenance(
+                attempt_id=attempt_id,
+                assessment_name=payload.assessment_name or attempt_state.assessment_name or "",
+                submitted_answers=answers,
+                events=events,
+            )
+            logger.info(
+                "provenance_analysis_completed attempt_id=%s matches=%s likelihood=%s confidence=%.2f",
+                attempt_id,
+                len(provenance_result.get("possible_reference_matches") or []),
+                provenance_result.get("external_similarity_likelihood") or "LOW",
+                safe_float(provenance_result.get("confidence_score"), 0.0),
+            )
 
-        provenance_result = analyze_answer_provenance(
-            attempt_id=attempt_id,
-            assessment_name=payload.assessment_name or attempt_state.assessment_name or "",
-            submitted_answers=answers,
-            events=events,
-        )
-        logger.info(
-            "provenance_computed attempt_id=%s matches=%s likelihood=%s confidence=%.2f",
-            attempt_id,
-            len(provenance_result.get("possible_reference_matches") or []),
-            provenance_result.get("external_similarity_likelihood") or "LOW",
-            safe_float(provenance_result.get("confidence_score"), 0.0),
-        )
-
-        existing_signals = dict(getattr(attempt_state, "signals", None) or {})
-        existing_signals["submitted_answers"] = answers
-        existing_signals["answer_provenance"] = provenance_result
-
-        attempt_state.candidate_id = payload.candidate_id or attempt_state.candidate_id
-        attempt_state.candidate_name = payload.candidate_name or attempt_state.candidate_name
-        attempt_state.candidate_email = payload.candidate_email or attempt_state.candidate_email
-        attempt_state.assessment_id = payload.assessment_id or attempt_state.assessment_id
-        attempt_state.assessment_name = payload.assessment_name or attempt_state.assessment_name
-        attempt_state.signals = existing_signals
-        attempt_state.updated_at = utc_now()
-        if not attempt_state.submitted_at:
-            attempt_state.submitted_at = attempt_state.updated_at
-        if attempt_state.status in {"ONGOING", "IN_PROGRESS", ""}:
-            attempt_state.status = "SUBMITTED"
-
-        db.commit()
-        logger.info(
-            "provenance_persisted attempt_id=%s signals_keys=%s",
-            attempt_id,
-            ",".join(sorted(existing_signals.keys())),
-        )
-        return {
-            "status": "success",
-            "attempt_id": attempt_id,
-            "data": provenance_result,
-        }
+            refreshed_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+            persisted_signals = dict(getattr(refreshed_state, "signals", None) or {})
+            persisted_signals["submitted_answers"] = answers
+            persisted_signals["answer_provenance"] = provenance_result
+            persisted_signals["provenance_status"] = "ready"
+            persisted_signals.pop("provenance_error", None)
+            refreshed_state.signals = persisted_signals
+            refreshed_state.updated_at = utc_now()
+            db.commit()
+            logger.info(
+                "provenance_persisted attempt_id=%s signals_keys=%s",
+                attempt_id,
+                ",".join(sorted(persisted_signals.keys())),
+            )
+            return {
+                "status": "success",
+                "attempt_id": attempt_id,
+                "data": provenance_result,
+            }
+        except Exception as exc:
+            logger.exception(
+                "provenance_analysis_failed attempt_id=%s answer_count=%s lengths=%s",
+                attempt_id,
+                len(answers),
+                ",".join(str(length) for length in answer_lengths[:12]),
+            )
+            failure_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+            failure_signals = dict(getattr(failure_state, "signals", None) or {})
+            failure_signals["submitted_answers"] = answers
+            failure_signals["provenance_status"] = "processing"
+            failure_signals["provenance_error"] = "transient_analysis_failure"
+            failure_state.signals = failure_signals
+            failure_state.updated_at = utc_now()
+            db.commit()
+            return {
+                "status": "processing",
+                "attempt_id": attempt_id,
+                "data": None,
+                "message": "Submitted answers were stored; provenance analysis is still finalizing.",
+            }
     except HTTPException:
         db.rollback()
         raise
@@ -2379,6 +2494,8 @@ def get_attempt_report_status(attempt_id: str):
                 "data": {
                     "report_exists": False,
                     "provenance_ready": False,
+                    "provenance_status": "processing",
+                    "provenance_finalized": False,
                     "attempt_status": None,
                     "submitted_at": None,
                     "report_url": report_url,
@@ -2387,6 +2504,8 @@ def get_attempt_report_status(attempt_id: str):
 
         signals = dict(getattr(persisted_state, "signals", None) or {})
         provenance_result = dict(signals.get("answer_provenance") or {})
+        provenance_status = str(signals.get("provenance_status") or "").strip().lower()
+        submitted_answers = list(signals.get("submitted_answers") or [])
         provenance_ready = bool(
             provenance_result
             and (
@@ -2395,6 +2514,7 @@ def get_attempt_report_status(attempt_id: str):
                 or "external_similarity_likelihood" in provenance_result
             )
         )
+        provenance_finalized = provenance_ready or provenance_status == "unavailable" or submitted_answers == []
         report_exists = bool(
             getattr(persisted_state, "final_risk_level", None)
             or getattr(persisted_state, "final_risk_score", None) is not None
@@ -2408,6 +2528,8 @@ def get_attempt_report_status(attempt_id: str):
             "data": {
                 "report_exists": report_exists,
                 "provenance_ready": provenance_ready,
+                "provenance_status": "ready" if provenance_ready else provenance_status or ("unavailable" if submitted_answers == [] else "processing"),
+                "provenance_finalized": provenance_finalized,
                 "attempt_status": getattr(persisted_state, "status", None),
                 "submitted_at": getattr(persisted_state, "submitted_at", None),
                 "report_url": report_url,
@@ -2422,6 +2544,8 @@ def get_attempt_report_status(attempt_id: str):
             "data": {
                     "report_exists": False,
                     "provenance_ready": False,
+                    "provenance_status": "processing",
+                    "provenance_finalized": False,
                     "attempt_status": None,
                     "submitted_at": None,
                     "report_url": report_url,
@@ -2468,8 +2592,10 @@ def get_public_demo_attempt_report(attempt_id: str):
         )
         attempt_status = str(report.get("attempt_status") or getattr(persisted_state, "status", None) or "").upper()
         status_ready = attempt_status in {"SUBMITTED", "UNDER_REVIEW", "RESOLVED", "COMPLETED"}
-        submitted_answers = list((dict(getattr(persisted_state, "signals", None) or {}).get("submitted_answers") or []))
-        provenance_finalized = provenance_ready or submitted_answers == []
+        persisted_signals = dict(getattr(persisted_state, "signals", None) or {})
+        submitted_answers = list((persisted_signals.get("submitted_answers") or []))
+        saved_provenance_status = str(persisted_signals.get("provenance_status") or "").strip().lower()
+        provenance_finalized = provenance_ready or saved_provenance_status == "unavailable" or submitted_answers == []
         report_ready = bool(
             status_ready
             and (
@@ -2484,6 +2610,7 @@ def get_public_demo_attempt_report(attempt_id: str):
                 "status": "processing",
                 "attempt_id": attempt_id,
                 "provenance_ready": provenance_ready,
+                "provenance_status": "ready" if provenance_ready else saved_provenance_status or ("unavailable" if submitted_answers == [] else "processing"),
                 "provenance_finalized": provenance_finalized,
                 "attempt_status": attempt_status or None,
             }

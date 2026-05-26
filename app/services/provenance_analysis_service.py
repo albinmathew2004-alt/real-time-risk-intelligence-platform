@@ -306,6 +306,7 @@ class BraveSearchProvider:
                     break
         except Exception as exc:
             logger.warning("brave_retrieval_failed provider=%s error=%s", self.provider_name, exc)
+            logger.info("retrieval_provider_failed provider=%s", self.provider_name)
             return RetrievalResult(
                 enabled=True,
                 provider_name=self.provider_name,
@@ -405,6 +406,7 @@ class SerperSearchProvider:
                     break
         except Exception as exc:
             logger.warning("web_retrieval_failed provider=%s error=%s", self.provider_name, exc)
+            logger.info("retrieval_provider_failed provider=%s", self.provider_name)
             return RetrievalResult(
                 enabled=True,
                 provider_name=self.provider_name,
@@ -695,6 +697,7 @@ def _semantic_similarity_details(
 ) -> dict[str, Any]:
     provider = _active_embedding_provider()
     if not ENABLE_SEMANTIC_PROVENANCE:
+        logger.info("semantic_provider_disabled provider=%s", provider.provider_name)
         return {
             "semantic_similarity": None,
             "semantic_provider": provider.provider_name,
@@ -722,6 +725,7 @@ def _semantic_similarity_details(
         }
 
     if not embedding_result.enabled:
+        logger.info("semantic_provider_disabled provider=%s", embedding_result.provider_name)
         return {
             "semantic_similarity": None,
             "semantic_provider": embedding_result.provider_name,
@@ -1561,6 +1565,15 @@ def _confidence_from_score(best_score: float, behavioral_signal_count: int, vali
     return _confidence_from_match(best_score, behavioral_signal_count)
 
 
+def _log_provenance_stage_failure(*, attempt_id: str, stage_name: str, exc: Exception) -> None:
+    logger.exception(
+        "provenance_stage_failed attempt_id=%s stage_name=%s exception_class=%s",
+        attempt_id,
+        stage_name,
+        exc.__class__.__name__,
+    )
+
+
 def analyze_answer_provenance(
     *,
     attempt_id: str,
@@ -1568,7 +1581,37 @@ def analyze_answer_provenance(
     submitted_answers: Iterable[Dict[str, Any]],
     events: Iterable[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    analysis_started_at = datetime.now(timezone.utc)
     answers = [item for item in submitted_answers if str(item.get("answer_text") or "").strip()]
+    logger.info(
+        "provenance_analysis_entered attempt_id=%s answers_received_count=%s provenance_input_question_count=%s",
+        attempt_id,
+        len(answers),
+        len(answers),
+    )
+    if not answers:
+        logger.info("provenance_analysis_skipped attempt_id=%s reason=no_nonempty_answers", attempt_id)
+        return {
+            "attempt_id": attempt_id,
+            "summary": "No meaningful reference overlap was detected in submitted answers.",
+            "external_similarity_likelihood": LOW,
+            "confidence_score": 0.0,
+            "possible_reference_matches": [],
+            "behavioral_correlation": [],
+            "matching_segment_preview": {"candidate_excerpt": "", "reference_excerpt": ""},
+            "reviewer_summary": "No meaningful reference overlap was detected in submitted answers.",
+            "limitations_note": LIMITATIONS_NOTE,
+            "generated_at": analysis_started_at.isoformat(),
+            "retrieval_duration_ms": None,
+            "semantic_provenance": {
+                "enabled": ENABLE_SEMANTIC_PROVENANCE,
+                "provider": _active_embedding_provider().provider_name,
+            },
+            "experimental_web_retrieval": _experimental_retrieval_hooks(answers=[], assessment_name=assessment_name),
+            "web_retrieval_disclaimer": WEB_RETRIEVAL_LIMITATIONS_NOTE if ENABLE_EXPERIMENTAL_WEB_RETRIEVAL else "",
+            "top_matches": [],
+            "evidence_title": None,
+        }
     event_list = list(events or [])
     corpus = load_reference_corpus()
     validation_mode = _is_validation_mode(assessment_name, answers)
@@ -1587,50 +1630,69 @@ def analyze_answer_provenance(
             continue
 
         answer_assessment_type = str(answer.get("assessment_type") or assessment_name or "").strip()
-        ranked_references = sorted(
-            corpus,
-            key=lambda item: _reference_relevance_score(item, answer, assessment_name),
-            reverse=True,
-        )
-        relevant_references = [
-            item for item in ranked_references
-            if validation_mode or not answer_assessment_type or _reference_relevance_score(item, answer, assessment_name) > 0
-        ] or ranked_references
+        logger.info("using_controlled_corpus_fallback attempt_id=%s question_id=%s", attempt_id, str(answer.get("question_id") or ""))
+        try:
+            ranked_references = sorted(
+                corpus,
+                key=lambda item: _reference_relevance_score(item, answer, assessment_name),
+                reverse=True,
+            )
+            relevant_references = [
+                item for item in ranked_references
+                if validation_mode or not answer_assessment_type or _reference_relevance_score(item, answer, assessment_name) > 0
+            ] or ranked_references
+        except Exception as exc:
+            _log_provenance_stage_failure(attempt_id=attempt_id, stage_name="controlled_corpus_ranking", exc=exc)
+            relevant_references = corpus
 
         for reference in relevant_references:
-            reference_text = str(reference.get("content") or "").strip()
-            similarity = _similarity_score(
-                answer_text,
-                reference_text,
-                source_candidate=source_candidate,
-                question_title=str(answer.get("question_title") or ""),
-            )
-            if similarity < minimum_match_threshold:
-                continue
-            source_candidate = _build_source_candidate(reference)
-            matches.append(
-                _build_match_payload(
-                    attempt_id=attempt_id,
-                    answer=answer,
-                    assessment_name=answer_assessment_type or assessment_name,
+            try:
+                reference_text = str(reference.get("content") or "").strip()
+                source_candidate = _build_source_candidate(reference)
+                similarity = _similarity_score(
+                    answer_text,
+                    reference_text,
                     source_candidate=source_candidate,
-                    similarity=similarity,
-                    answer_text=answer_text,
-                    reference_text=reference_text,
-                    event_list=event_list,
-                    validation_mode=validation_mode,
-                    retrieval_confidence=similarity,
-                    retrieval_timestamp=None,
-                    retrieval_source=source_candidate.retrieved_from,
+                    question_title=str(answer.get("question_title") or ""),
                 )
-            )
+                if similarity < minimum_match_threshold:
+                    continue
+                matches.append(
+                    _build_match_payload(
+                        attempt_id=attempt_id,
+                        answer=answer,
+                        assessment_name=answer_assessment_type or assessment_name,
+                        source_candidate=source_candidate,
+                        similarity=similarity,
+                        answer_text=answer_text,
+                        reference_text=reference_text,
+                        event_list=event_list,
+                        validation_mode=validation_mode,
+                        retrieval_confidence=similarity,
+                        retrieval_timestamp=None,
+                        retrieval_source=source_candidate.retrieved_from,
+                    )
+                )
+            except Exception as exc:
+                _log_provenance_stage_failure(attempt_id=attempt_id, stage_name="controlled_corpus_similarity", exc=exc)
+                continue
 
-    retrieved_matches, retrieval_hooks = _retrieved_web_matches_for_answers(
-        attempt_id=attempt_id,
-        answers=answers,
-        assessment_name=assessment_name,
-        event_list=event_list,
-        validation_mode=validation_mode,
+    retrieval_started_at = datetime.now(timezone.utc)
+    try:
+        retrieved_matches, retrieval_hooks = _retrieved_web_matches_for_answers(
+            attempt_id=attempt_id,
+            answers=answers,
+            assessment_name=assessment_name,
+            event_list=event_list,
+            validation_mode=validation_mode,
+        )
+    except Exception as exc:
+        _log_provenance_stage_failure(attempt_id=attempt_id, stage_name="web_retrieval", exc=exc)
+        logger.info("retrieval_provider_failed attempt_id=%s provider=unknown", attempt_id)
+        retrieved_matches, retrieval_hooks = [], _experimental_retrieval_hooks(answers=answers, assessment_name=assessment_name)
+    retrieval_duration_ms = max(
+        0,
+        int((datetime.now(timezone.utc) - retrieval_started_at).total_seconds() * 1000),
     )
     matches.extend(retrieved_matches)
     matches = _dedupe_matches(matches)
@@ -1656,6 +1718,12 @@ def analyze_answer_provenance(
         len([item for item in matches if str(item.get("match_origin") or "") == "web_retrieval"]),
         best_match.get("match_origin") if best_match else "none",
         best_match.get("retrieval_source") if best_match else "none",
+    )
+    logger.info(
+        "provenance_matches_found attempt_id=%s total_matches=%s top_matches=%s",
+        attempt_id,
+        len(matches),
+        len(top_matches),
     )
 
     summary = "No meaningful reference overlap was detected in submitted answers."
@@ -1686,6 +1754,8 @@ def analyze_answer_provenance(
         },
         "reviewer_summary": result.reviewer_summary,
         "limitations_note": result.limitations_note,
+        "generated_at": analysis_started_at.isoformat(),
+        "retrieval_duration_ms": retrieval_duration_ms if ENABLE_EXPERIMENTAL_WEB_RETRIEVAL else None,
         "semantic_provenance": {
             "enabled": ENABLE_SEMANTIC_PROVENANCE,
             "provider": _active_embedding_provider().provider_name,
