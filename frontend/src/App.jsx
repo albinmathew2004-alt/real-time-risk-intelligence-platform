@@ -6411,6 +6411,10 @@ function ProvenanceIntelligenceCard({
                     </div>
                     <div className="provenance-match-footer">
                       <div>
+                        <span>Match Origin</span>
+                        <strong>{match.match_origin || "controlled_corpus"}</strong>
+                      </div>
+                      <div>
                         <span>Source</span>
                         <strong>{match.source_type || "Reference"}</strong>
                       </div>
@@ -7127,6 +7131,10 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
                         <span className={`pdf-report-badge risk ${String(match.likelihood || "LOW").toLowerCase()}`}>{match.similarity_percent}% similarity</span>
                       </div>
                       <div className="pdf-report-detail-grid">
+                        <div>
+                          <span>Match origin</span>
+                          <strong>{match.match_origin || "controlled_corpus"}</strong>
+                        </div>
                         <div>
                           <span>Possible source match</span>
                           <strong>{match.match_reason || match.confidence_label || "Observed similarity pattern"}</strong>

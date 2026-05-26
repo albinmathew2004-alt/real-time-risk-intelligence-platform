@@ -24,9 +24,11 @@ LIMITATIONS_NOTE = "Source matches indicate potential reference overlap, not def
 WEB_RETRIEVAL_LIMITATIONS_NOTE = "Web retrieval matches are experimental and may contain approximate or indirect overlaps."
 ENABLE_EXPERIMENTAL_WEB_RETRIEVAL = os.getenv("ENABLE_EXPERIMENTAL_WEB_RETRIEVAL", "false").strip().lower() in {"1", "true", "yes", "on"}
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", os.getenv("SERPER_SEARCH_API_KEY", "")).strip()
 WEB_RETRIEVAL_MAX_RESULTS = max(1, int(os.getenv("WEB_RETRIEVAL_MAX_RESULTS", "3") or "3"))
 WEB_RETRIEVAL_TIMEOUT_SECONDS = max(1, int(os.getenv("WEB_RETRIEVAL_TIMEOUT_SECONDS", "6") or "6"))
 BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+SERPER_SEARCH_ENDPOINT = "https://google.serper.dev/search"
 logger = logging.getLogger(__name__)
 
 
@@ -167,6 +169,7 @@ class BraveSearchProvider:
         retrieved_at = _utcnow_iso()
         candidates: list[RetrievedWebCandidate] = []
         seen_urls: set[str] = set()
+        logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
         try:
             for query in queries[:3]:
                 response = requests.get(
@@ -228,6 +231,7 @@ class BraveSearchProvider:
                 note="Brave retrieval failed. Falling back to controlled corpus matching only.",
             )
 
+        logger.info("web_retrieval_urls_retrieved provider=%s url_count=%s", self.provider_name, len(candidates))
         return RetrievalResult(
             enabled=True,
             provider_name=self.provider_name,
@@ -235,6 +239,97 @@ class BraveSearchProvider:
             candidates=candidates[:limit],
             retrieved_at=retrieved_at,
             note="Experimental Brave retrieval completed.",
+        )
+
+
+class SerperSearchProvider:
+    provider_name = "serper_search"
+
+    def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL:
+            return _disabled_retrieval_result(self.provider_name, queries)
+        if not SERPER_API_KEY:
+            return RetrievalResult(
+                enabled=True,
+                provider_name=self.provider_name,
+                generated_queries=queries,
+                candidates=[],
+                retrieved_at=_utcnow_iso(),
+                note="Serper API key is not configured. Falling back to controlled corpus matching only.",
+            )
+
+        retrieved_at = _utcnow_iso()
+        candidates: list[RetrievedWebCandidate] = []
+        seen_urls: set[str] = set()
+        logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
+        try:
+            for query in queries[:3]:
+                response = requests.post(
+                    SERPER_SEARCH_ENDPOINT,
+                    headers={
+                        "X-API-KEY": SERPER_API_KEY,
+                        "Content-Type": "application/json",
+                        "User-Agent": "ProctorIQ/1.0 experimental provenance retrieval",
+                    },
+                    json={
+                        "q": query,
+                        "num": min(max(1, limit), 5),
+                        "gl": "us",
+                        "hl": "en",
+                    },
+                    timeout=WEB_RETRIEVAL_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                results = list(payload.get("organic") or [])
+                for result in results:
+                    source_url = str(result.get("link") or "").strip()
+                    if not _is_retrievable_url(source_url) or source_url in seen_urls:
+                        continue
+                    seen_urls.add(source_url)
+                    extracted = _fetch_webpage_candidate(
+                        url=source_url,
+                        source_title=str(result.get("title") or "Possible web reference"),
+                        source_type="Web reference",
+                        retrieved_from=self.provider_name,
+                        query=query,
+                    )
+                    if extracted is None:
+                        continue
+                    candidates.append(
+                        RetrievedWebCandidate(
+                            source_candidate=extracted,
+                            retrieval_source=self.provider_name,
+                            retrieval_confidence=0.68,
+                            retrieved_at=retrieved_at,
+                            ranking_position=len(candidates) + 1,
+                            query=query,
+                            extraction_status="content_extracted",
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(candidates) >= limit:
+                    break
+        except Exception as exc:
+            logger.warning("web_retrieval_failed provider=%s error=%s", self.provider_name, exc)
+            return RetrievalResult(
+                enabled=True,
+                provider_name=self.provider_name,
+                generated_queries=queries,
+                candidates=[],
+                retrieved_at=retrieved_at,
+                note="Serper retrieval failed. Falling back to controlled corpus matching only.",
+            )
+
+        logger.info("web_retrieval_urls_retrieved provider=%s url_count=%s", self.provider_name, len(candidates))
+        return RetrievalResult(
+            enabled=True,
+            provider_name=self.provider_name,
+            generated_queries=queries,
+            candidates=candidates[:limit],
+            retrieved_at=retrieved_at,
+            note="Experimental Serper retrieval completed.",
         )
 
 
@@ -307,6 +402,25 @@ def _disabled_retrieval_result(provider_name: str, queries: list[str]) -> Retrie
     )
 
 
+def _active_web_retrieval_providers() -> list[RetrievalProvider]:
+    providers: list[RetrievalProvider] = []
+    if SERPER_API_KEY:
+        providers.append(SerperSearchProvider())
+    if BRAVE_SEARCH_API_KEY:
+        providers.append(BraveSearchProvider())
+    if not providers:
+        providers.append(SerperSearchProvider())
+        providers.append(BraveSearchProvider())
+    return providers
+
+
+def _match_origin(retrieved_from: str | None) -> str:
+    normalized = str(retrieved_from or "").strip().lower()
+    if normalized in {"controlled_corpus", "internal_corpus", ""}:
+        return "controlled_corpus"
+    return "web_retrieval"
+
+
 def _is_retrievable_url(url: str) -> bool:
     normalized = str(url or "").strip().lower()
     return normalized.startswith("http://") or normalized.startswith("https://")
@@ -315,14 +429,47 @@ def _is_retrievable_url(url: str) -> bool:
 def _extract_text_from_html(html: str) -> str:
     if not html:
         return ""
-    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html)
+    text = re.sub(r"(?is)<!--.*?-->", " ", html)
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
     text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
     text = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", text)
     text = re.sub(r"(?is)<svg[^>]*>.*?</svg>", " ", text)
-    text = re.sub(r"(?is)<[^>]+>", " ", text)
-    text = unescape(text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    text = re.sub(r"(?is)<iframe[^>]*>.*?</iframe>", " ", text)
+    text = re.sub(r"(?is)<(nav|footer|header|aside|form|button|label|select|option)[^>]*>.*?</\1>", " ", text)
+
+    title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    meta_description_match = re.search(
+        r'(?is)<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\'](.*?)["\'][^>]*>',
+        text,
+    )
+
+    block_fragments = re.findall(
+        r"(?is)<(?:article|main|section|p|li|pre|code|blockquote|h1|h2|h3|td)[^>]*>(.*?)</(?:article|main|section|p|li|pre|code|blockquote|h1|h2|h3|td)>",
+        text,
+    )
+    extracted_blocks = [
+        re.sub(r"\s+", " ", unescape(re.sub(r"(?is)<[^>]+>", " ", fragment))).strip()
+        for fragment in block_fragments
+    ]
+    extracted_blocks = [fragment for fragment in extracted_blocks if len(fragment) >= 24]
+
+    fallback_text = re.sub(r"(?is)<[^>]+>", " ", text)
+    fallback_text = re.sub(r"\s+", " ", unescape(fallback_text)).strip()
+
+    composed_parts: list[str] = []
+    if title_match:
+        composed_parts.append(re.sub(r"\s+", " ", unescape(title_match.group(1))).strip())
+    if meta_description_match:
+        composed_parts.append(re.sub(r"\s+", " ", unescape(meta_description_match.group(1))).strip())
+    composed_parts.extend(extracted_blocks[:40])
+    if not composed_parts and fallback_text:
+        composed_parts.append(fallback_text)
+
+    composed = "\n\n".join(part for part in composed_parts if part)
+    composed = re.sub(r"\n{3,}", "\n\n", composed).strip()
+    if len(composed) < 120 and fallback_text:
+        return fallback_text
+    return composed
 
 
 def _fetch_webpage_candidate(
@@ -440,6 +587,7 @@ def _build_match_payload(
         "source_url": source_candidate.source_url,
         "source_domain": source_candidate.source_domain,
         "retrieved_from": source_candidate.retrieved_from,
+        "match_origin": _match_origin(source_candidate.retrieved_from),
         "retrieval_source": retrieval_source or source_candidate.retrieved_from,
         "retrieval_confidence": round(_safe_float(retrieval_confidence, similarity), 4),
         "retrieval_timestamp": retrieval_timestamp,
@@ -518,7 +666,7 @@ def _experimental_retrieval_hooks(
         }
     providers: list[RetrievalProvider] = [
         InternalCorpusProvider(),
-        BraveSearchProvider(),
+        *_active_web_retrieval_providers(),
         BingSearchProvider(),
     ]
     retrieval_results = [
@@ -560,11 +708,12 @@ def _retrieved_web_matches_for_answers(
     validation_mode: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     retrieval_hooks = _experimental_retrieval_hooks(answers=answers, assessment_name=assessment_name)
-    if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL or not BRAVE_SEARCH_API_KEY:
+    if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL:
         return [], retrieval_hooks
 
     minimum_match_threshold, _, _ = _match_thresholds(validation_mode)
     matches: list[dict[str, Any]] = []
+    providers = _active_web_retrieval_providers()
     for answer in answers:
         answer_text = str(answer.get("answer_text") or "").strip()
         if len(answer_text) < 20:
@@ -573,9 +722,15 @@ def _retrieved_web_matches_for_answers(
             answer=answer,
             assessment_name=assessment_name,
             query_builder=SearchQueryBuilder(),
-            providers=[BraveSearchProvider()],
+            providers=providers,
         )
         for retrieval in retrieval_results:
+            logger.info(
+                "web_retrieval_result provider=%s retrieved_url_count=%s query_count=%s",
+                retrieval.provider_name,
+                len(retrieval.candidates),
+                len(retrieval.generated_queries),
+            )
             for candidate in retrieval.candidates:
                 reference_text = candidate.source_candidate.normalized_text or ""
                 similarity = _similarity_score(answer_text, reference_text)
@@ -824,6 +979,23 @@ def _build_source_candidate(reference: dict[str, Any]) -> SourceCandidate:
     )
 
 
+def _match_sort_key(item: dict[str, Any]) -> tuple[int, float, float, int, int]:
+    likelihood = str(item.get("likelihood") or LOW).upper()
+    likelihood_rank = 0 if likelihood == HIGH else 1 if likelihood == MEDIUM else 2
+    similarity_score = _safe_float(item.get("similarity_score"), 0.0)
+    match_origin = str(item.get("match_origin") or "controlled_corpus").strip().lower()
+    retrieval_confidence = _safe_float(item.get("retrieval_confidence"), 0.0)
+    source_bonus = 0.025 if match_origin == "web_retrieval" else 0.0
+    confidence_bonus = min(0.01, retrieval_confidence * 0.01) if match_origin == "web_retrieval" else 0.0
+    return (
+        likelihood_rank,
+        -(similarity_score + source_bonus + confidence_bonus),
+        -similarity_score,
+        0 if match_origin == "web_retrieval" else 1,
+        -int(item.get("behavioral_signal_count") or 0),
+    )
+
+
 @lru_cache(maxsize=1)
 def load_reference_corpus() -> list[dict[str, Any]]:
     with CORPUS_PATH.open("r", encoding="utf-8") as handle:
@@ -1058,13 +1230,7 @@ def analyze_answer_provenance(
     )
     matches.extend(retrieved_matches)
 
-    matches.sort(
-        key=lambda item: (
-            0 if item["likelihood"] == HIGH else 1 if item["likelihood"] == MEDIUM else 2,
-            -item["similarity_score"],
-            -item["behavioral_signal_count"],
-        )
-    )
+    matches.sort(key=_match_sort_key)
     top_matches = matches[:3]
     best_match = top_matches[0] if top_matches else None
     aggregate_behavioral_signals = []
