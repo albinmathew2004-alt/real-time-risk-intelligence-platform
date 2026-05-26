@@ -1,6 +1,8 @@
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi.responses import JSONResponse
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -272,6 +274,49 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(request: Request, exc: RequestValidationError):
+    path = request.url.path or ""
+    if path.startswith("/v1/attempts/") and path.endswith("/answers"):
+        body_bytes = await request.body()
+        parsed_body = None
+        received_answer_count = None
+        if body_bytes:
+            try:
+                parsed_body = json.loads(body_bytes.decode("utf-8"))
+                if isinstance(parsed_body, dict) and isinstance(parsed_body.get("answers"), list):
+                    received_answer_count = len(parsed_body.get("answers") or [])
+            except Exception:
+                parsed_body = None
+
+        missing_fields: List[str] = []
+        invalid_field_types: List[str] = []
+        invalid_field_constraints: List[str] = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc", []) if part != "body")
+            error_type = str(error.get("type") or "")
+            if error_type == "missing":
+                if location:
+                    missing_fields.append(location)
+                continue
+            if error_type.endswith("_type") or "parsing" in error_type:
+                if location:
+                    invalid_field_types.append(location)
+                continue
+            if location:
+                invalid_field_constraints.append(f"{location}:{error_type}")
+
+        logger.warning(
+            "answers_payload_validation_failed path=%s received_answer_count=%s missing_fields=%s invalid_field_types=%s invalid_constraints=%s",
+            path,
+            received_answer_count if received_answer_count is not None else "unknown",
+            ",".join(sorted(set(missing_fields))) or "none",
+            ",".join(sorted(set(invalid_field_types))) or "none",
+            ",".join(sorted(set(invalid_field_constraints))) or "none",
+        )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 @app.on_event("startup")
 def startup_event():
     try:
@@ -409,24 +454,120 @@ class ExamEventIngest(BaseModel):
 
 
 class SubmittedAnswerIn(BaseModel):
-    question_id: str = Field(..., min_length=1, max_length=255)
-    question_title: Optional[str] = Field(default=None, max_length=255)
-    section_id: Optional[str] = Field(default=None, max_length=255)
-    section_title: Optional[str] = Field(default=None, max_length=255)
-    assessment_type: Optional[str] = Field(default=None, max_length=255)
-    input_type: Optional[str] = Field(default=None, max_length=64)
-    answer_text: str = Field(..., min_length=1, max_length=12000)
+    question_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        validation_alias=AliasChoices("question_id", "questionId"),
+    )
+    question_title: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("question_title", "questionTitle", "title"),
+    )
+    section_id: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("section_id", "sectionId"),
+    )
+    section_title: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("section_title", "sectionTitle"),
+    )
+    assessment_type: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("assessment_type", "assessmentType"),
+    )
+    input_type: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        validation_alias=AliasChoices("input_type", "inputType"),
+    )
+    answer_text: str = Field(
+        ...,
+        min_length=1,
+        max_length=50000,
+        validation_alias=AliasChoices("answer_text", "answerText"),
+    )
     marked_for_review: bool = False
+
+    @field_validator("question_id", "question_title", "section_id", "section_title", "assessment_type", "input_type", "answer_text", mode="before")
+    @classmethod
+    def _coerce_answer_strings(cls, value):
+        if value is None:
+            return value
+        text = str(value).strip()
+        return text
+
+    @field_validator("question_title", "section_id", "section_title", "assessment_type", "input_type", mode="after")
+    @classmethod
+    def _normalize_optional_answer_strings(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value or None
+
+    @field_validator("marked_for_review", mode="before")
+    @classmethod
+    def _coerce_marked_for_review(cls, value):
+        if isinstance(value, bool):
+            return value
+        if value in (None, ""):
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
 
 
 class SubmittedAnswersPayload(BaseModel):
-    attempt_id: str = Field(..., min_length=1, max_length=255)
-    candidate_id: Optional[str] = Field(default=None, max_length=255)
-    candidate_name: Optional[str] = Field(default=None, max_length=255)
-    candidate_email: Optional[str] = Field(default=None, max_length=320)
-    assessment_id: Optional[str] = Field(default=None, max_length=255)
-    assessment_name: Optional[str] = Field(default=None, max_length=255)
+    attempt_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        validation_alias=AliasChoices("attempt_id", "attemptId"),
+    )
+    candidate_id: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("candidate_id", "candidateId"),
+    )
+    candidate_name: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("candidate_name", "candidateName"),
+    )
+    candidate_email: Optional[str] = Field(
+        default=None,
+        max_length=320,
+        validation_alias=AliasChoices("candidate_email", "candidateEmail"),
+    )
+    assessment_id: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("assessment_id", "assessmentId"),
+    )
+    assessment_name: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        validation_alias=AliasChoices("assessment_name", "assessmentName"),
+    )
     answers: List[SubmittedAnswerIn] = Field(default_factory=list)
+
+    @field_validator("attempt_id", "candidate_id", "candidate_name", "candidate_email", "assessment_id", "assessment_name", mode="before")
+    @classmethod
+    def _coerce_payload_strings(cls, value):
+        if value is None:
+            return value
+        text = str(value).strip()
+        return text
+
+    @field_validator("candidate_id", "candidate_name", "candidate_email", "assessment_id", "assessment_name", mode="after")
+    @classmethod
+    def _normalize_optional_payload_strings(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value or None
 
 
 def utc_now():
@@ -1762,6 +1903,13 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
         provenance_status = "unavailable"
     else:
         provenance_status = "processing"
+    if submitted_answers and not provenance and provenance_status == "unavailable":
+        logger.info(
+            "provenance_unavailable_with_submitted_answers attempt_id=%s reason=missing_persisted_provenance saved_status=%s submitted_answer_count=%s",
+            report.get("attempt_id"),
+            saved_provenance_status or "none",
+            len(submitted_answers),
+        )
     possible_matches = [
         {
             "source_title": match.get("source_title"),
@@ -2399,6 +2547,13 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
                 assessment_name=resolved_assessment_name or assessment_name,
                 submitted_answers=answers,
                 events=events,
+            )
+            logger.info(
+                "provenance_persistence_decision attempt_id=%s decision=%s match_count=%s result_present=%s",
+                attempt_id,
+                "persist_ready" if provenance_result is not None else "persist_unavailable",
+                len((provenance_result or {}).get("possible_reference_matches") or []),
+                provenance_result is not None,
             )
             logger.info(
                 "provenance_analysis_completed attempt_id=%s matches=%s likelihood=%s confidence=%.2f",
