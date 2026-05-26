@@ -687,6 +687,8 @@ body::-webkit-scrollbar-thumb:hover,
   padding-top: 14px;
   margin-top: 14px;
   border-top: 1px solid #e2e8f0;
+  break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .pdf-export-mode .pdf-report-match-card:first-of-type {
@@ -2591,6 +2593,14 @@ body {
   padding: 0 0 10px;
 }
 
+.provenance-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .provenance-intelligence-body {
   display: grid;
   gap: 14px;
@@ -2648,6 +2658,30 @@ body {
 .provenance-limitations-note {
   margin-top: 12px !important;
   color: #9ca9c1 !important;
+  font-size: 12px;
+}
+
+.provenance-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  background: rgba(59, 130, 246, 0.08);
+  color: #cfe1ff;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.provenance-meta-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 10px;
+  color: #9ca9c1;
   font-size: 12px;
 }
 
@@ -2761,6 +2795,23 @@ body {
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.provenance-full-excerpt {
+  margin-top: 8px;
+}
+
+.provenance-full-excerpt summary {
+  cursor: pointer;
+  color: #9ac8ff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.provenance-full-excerpt div {
+  margin-top: 8px;
+  color: #cfd9ea;
+  line-height: 1.55;
 }
 
 .provenance-match-footer {

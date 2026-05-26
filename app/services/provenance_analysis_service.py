@@ -27,11 +27,13 @@ ENABLE_EXPERIMENTAL_WEB_RETRIEVAL = os.getenv("ENABLE_EXPERIMENTAL_WEB_RETRIEVAL
 ENABLE_SEMANTIC_PROVENANCE = os.getenv("ENABLE_SEMANTIC_PROVENANCE", "false").strip().lower() in {"1", "true", "yes", "on"}
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", os.getenv("SERPER_SEARCH_API_KEY", "")).strip()
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", os.getenv("OPENAI_EMBEDDING_API_KEY", "")).strip()
 WEB_RETRIEVAL_MAX_RESULTS = max(1, int(os.getenv("WEB_RETRIEVAL_MAX_RESULTS", "3") or "3"))
 WEB_RETRIEVAL_TIMEOUT_SECONDS = max(1, int(os.getenv("WEB_RETRIEVAL_TIMEOUT_SECONDS", "6") or "6"))
 BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 SERPER_SEARCH_ENDPOINT = "https://google.serper.dev/search"
+TAVILY_SEARCH_ENDPOINT = "https://api.tavily.com/search"
 logger = logging.getLogger(__name__)
 GENERIC_QUERY_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "because", "by", "can", "could", "describe",
@@ -41,6 +43,16 @@ GENERIC_QUERY_STOPWORDS = {
 }
 RARE_TERM_STOPWORDS = GENERIC_QUERY_STOPWORDS | {
     "answer", "assessment", "candidate", "demo", "question", "review", "submission",
+}
+PREFERRED_REAL_SOURCE_DOMAINS = {
+    "splunk.com",
+    "www.splunk.com",
+    "docs.splunk.com",
+    "ncbi.nlm.nih.gov",
+    "www.ncbi.nlm.nih.gov",
+    "react.dev",
+    "developer.mozilla.org",
+    "developer.mozilla.org/en-us",
 }
 
 
@@ -252,6 +264,9 @@ class BraveSearchProvider:
         candidates: list[RetrievedWebCandidate] = []
         seen_urls: set[str] = set()
         fetch_stats = {"fetch_success_count": 0, "fetch_failure_count": 0}
+        snippet_lengths: list[int] = []
+        extracted_lengths: list[int] = []
+        extracted_chunk_counts: list[int] = []
         logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
         try:
             for query in queries[:3]:
@@ -353,6 +368,9 @@ class SerperSearchProvider:
         candidates: list[RetrievedWebCandidate] = []
         seen_urls: set[str] = set()
         fetch_stats = {"fetch_success_count": 0, "fetch_failure_count": 0}
+        snippet_lengths: list[int] = []
+        extracted_lengths: list[int] = []
+        extracted_chunk_counts: list[int] = []
         logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
         try:
             for query in queries[:3]:
@@ -433,6 +451,172 @@ class SerperSearchProvider:
         )
 
 
+class TavilySearchProvider:
+    provider_name = "tavily"
+
+    def retrieve(self, queries: list[str], *, limit: int = 5) -> RetrievalResult:
+        if not ENABLE_EXPERIMENTAL_WEB_RETRIEVAL:
+            return _disabled_retrieval_result(self.provider_name, queries)
+        if not TAVILY_API_KEY:
+            return RetrievalResult(
+                enabled=True,
+                provider_name=self.provider_name,
+                generated_queries=queries,
+                candidates=[],
+                retrieved_at=_utcnow_iso(),
+                note="Tavily API key is not configured. Falling back to controlled corpus matching only.",
+            )
+
+        retrieved_at = _utcnow_iso()
+        candidates: list[RetrievedWebCandidate] = []
+        seen_urls: set[str] = set()
+        fetch_stats = {"fetch_success_count": 0, "fetch_failure_count": 0}
+        logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
+        try:
+            for query in queries[:3]:
+                response = requests.post(
+                    TAVILY_SEARCH_ENDPOINT,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "ProctorIQ/1.0 experimental provenance retrieval",
+                    },
+                    json={
+                        "api_key": TAVILY_API_KEY,
+                        "query": query,
+                        "max_results": min(max(1, limit), 5),
+                        "search_depth": "basic",
+                        "include_answer": False,
+                        "include_images": False,
+                        "include_raw_content": True,
+                    },
+                    timeout=WEB_RETRIEVAL_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                results = list(payload.get("results") or [])
+                for result in results:
+                    source_url = str(result.get("url") or "").strip()
+                    if not _is_retrievable_url(source_url) or source_url in seen_urls:
+                        continue
+                    seen_urls.add(source_url)
+
+                    raw_content = str(result.get("raw_content") or "").strip()
+                    content_snippet = str(result.get("content") or result.get("snippet") or "").strip()
+                    snippet_lengths.append(len(content_snippet))
+                    source_title = str(result.get("title") or "Possible web reference").strip() or "Possible web reference"
+                    cleaned_provider_text = _clean_provider_text(raw_content or content_snippet)
+                    normalized_text = _normalize_text(cleaned_provider_text)
+
+                    if not normalized_text:
+                        logger.info(
+                            "tavily_extraction_empty query=%s source_url=%s snippet_length=%s raw_length=%s",
+                            query,
+                            source_url,
+                            len(content_snippet),
+                            len(raw_content),
+                        )
+                        extracted = _fetch_webpage_candidate(
+                            url=source_url,
+                            source_title=source_title,
+                            source_type="Web reference",
+                            retrieved_from=self.provider_name,
+                            query=query,
+                            stats=fetch_stats,
+                        )
+                        if extracted is None:
+                            continue
+                        source_candidate = extracted
+                        extraction_status = "content_extracted"
+                        extracted_lengths.append(len(source_candidate.normalized_text or ""))
+                        extracted_chunk_counts.append(len(_chunk_text(source_candidate.normalized_text or "")))
+                    else:
+                        fetch_stats["fetch_success_count"] += 1
+                        extracted_lengths.append(len(normalized_text))
+                        extracted_chunk_counts.append(len(_chunk_text(cleaned_provider_text)))
+                        source_candidate = SourceCandidate(
+                            source_title=source_title,
+                            source_url=source_url,
+                            source_domain=_source_domain(source_url),
+                            source_type="Web reference",
+                            retrieved_from=self.provider_name,
+                            content_snippet=cleaned_provider_text[:1200].strip(),
+                            normalized_text=normalized_text,
+                            tags=[],
+                            created_at=retrieved_at,
+                        )
+                        extraction_status = "provider_content"
+
+                    candidates.append(
+                        RetrievedWebCandidate(
+                            source_candidate=source_candidate,
+                            retrieval_source=self.provider_name,
+                            retrieval_confidence=round(_safe_float(result.get("score"), 0.72), 4),
+                            retrieved_at=retrieved_at,
+                            ranking_position=len(candidates) + 1,
+                            query=query,
+                            extraction_status=extraction_status,
+                        )
+                    )
+                    if len(candidates) >= limit:
+                        break
+                if len(candidates) >= limit:
+                    break
+        except Exception as exc:
+            logger.warning("web_retrieval_failed provider=%s error=%s", self.provider_name, exc)
+            logger.info("retrieval_provider_failed provider=%s", self.provider_name)
+            return RetrievalResult(
+                enabled=True,
+                provider_name=self.provider_name,
+                generated_queries=queries,
+                candidates=[],
+                retrieved_at=retrieved_at,
+                note="Tavily retrieval failed. Falling back to controlled corpus matching only.",
+            )
+
+        try:
+            if not candidates:
+                logger.info(
+                    "tavily_results_empty query_count=%s snippet_lengths=%s extracted_text_lengths=%s extracted_chunk_counts=%s",
+                    len(queries[:3]),
+                    snippet_lengths[:5],
+                    extracted_lengths[:5],
+                    extracted_chunk_counts[:5],
+                )
+            logger.info(
+                "tavily_result_diagnostics url_count=%s snippet_lengths=%s extracted_text_lengths=%s extracted_chunk_counts=%s",
+                len(candidates),
+                snippet_lengths[:5],
+                extracted_lengths[:5],
+                extracted_chunk_counts[:5],
+            )
+        except Exception as diagnostics_exc:
+            logger.info(
+                "tavily_diagnostics_failed exception_class=%s",
+                diagnostics_exc.__class__.__name__,
+            )
+        logger.info(
+            "web_retrieval_urls_retrieved provider=%s url_count=%s fetch_success_count=%s fetch_failure_count=%s",
+            self.provider_name,
+            len(candidates),
+            fetch_stats["fetch_success_count"],
+            fetch_stats["fetch_failure_count"],
+        )
+        logger.info(
+            "web_retrieval_result provider=%s candidate_count=%s first_origin=%s",
+            self.provider_name,
+            len(candidates),
+            "web_retrieval" if candidates else "none",
+        )
+        return RetrievalResult(
+            enabled=True,
+            provider_name=self.provider_name,
+            generated_queries=queries,
+            candidates=candidates[:limit],
+            retrieved_at=retrieved_at,
+            note="Experimental Tavily retrieval completed.",
+        )
+
+
 class BingSearchProvider:
     provider_name = "bing_search"
 
@@ -491,6 +675,26 @@ class InternalCorpusProvider:
         )
 
 
+def get_provenance_retrieval_diagnostics() -> dict[str, Any]:
+    selected_provider = "none"
+    if ENABLE_EXPERIMENTAL_WEB_RETRIEVAL:
+        if TAVILY_API_KEY:
+            selected_provider = "tavily"
+        elif SERPER_API_KEY:
+            selected_provider = "serper"
+        elif BRAVE_SEARCH_API_KEY:
+            selected_provider = "brave"
+    return {
+        "experimental_web_retrieval_enabled": ENABLE_EXPERIMENTAL_WEB_RETRIEVAL,
+        "tavily_key_present": bool(TAVILY_API_KEY),
+        "serper_key_present": bool(SERPER_API_KEY),
+        "brave_key_present": bool(BRAVE_SEARCH_API_KEY),
+        "selected_retrieval_provider": selected_provider,
+        "max_results": WEB_RETRIEVAL_MAX_RESULTS,
+        "timeout_seconds": WEB_RETRIEVAL_TIMEOUT_SECONDS,
+    }
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -508,19 +712,25 @@ def _disabled_retrieval_result(provider_name: str, queries: list[str]) -> Retrie
 
 def _active_web_retrieval_providers() -> list[RetrievalProvider]:
     providers: list[RetrievalProvider] = []
+    if TAVILY_API_KEY:
+        providers.append(TavilySearchProvider())
     if SERPER_API_KEY:
         providers.append(SerperSearchProvider())
     if BRAVE_SEARCH_API_KEY:
         providers.append(BraveSearchProvider())
     if not providers:
+        providers.append(TavilySearchProvider())
         providers.append(SerperSearchProvider())
         providers.append(BraveSearchProvider())
+    diagnostics = get_provenance_retrieval_diagnostics()
     logger.info(
-        "web_retrieval_provider_selection enabled=%s provider_candidates=%s has_serper_key=%s has_brave_key=%s",
-        ENABLE_EXPERIMENTAL_WEB_RETRIEVAL,
+        "web_retrieval_provider_selection enabled=%s provider_candidates=%s has_tavily_key=%s has_serper_key=%s has_brave_key=%s selected_retrieval_provider=%s",
+        diagnostics["experimental_web_retrieval_enabled"],
         ",".join(provider.provider_name for provider in providers),
-        bool(SERPER_API_KEY),
-        bool(BRAVE_SEARCH_API_KEY),
+        diagnostics["tavily_key_present"],
+        diagnostics["serper_key_present"],
+        diagnostics["brave_key_present"],
+        diagnostics["selected_retrieval_provider"],
     )
     return providers
 
@@ -581,6 +791,27 @@ def _extract_text_from_html(html: str) -> str:
     if len(composed) < 120 and fallback_text:
         return fallback_text
     return composed
+
+
+def _clean_provider_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if "<" in raw and ">" in raw and re.search(r"(?is)<[a-z][^>]*>", raw):
+        return _extract_text_from_html(raw)
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in re.split(r"[\r\n]+", raw)
+    ]
+    filtered_lines = [
+        line for line in lines
+        if len(line) >= 30
+        and not re.match(r"(?i)^(menu|navigation|search|sign in|sign up|privacy|cookie|copyright|all rights reserved)\b", line)
+    ]
+    if filtered_lines:
+        return "\n\n".join(filtered_lines[:40]).strip()
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    return normalized
 
 
 def _fetch_webpage_candidate(
@@ -956,6 +1187,14 @@ def _retrieved_web_matches_for_answers(
     minimum_match_threshold, _, _ = _match_thresholds(validation_mode)
     matches: list[dict[str, Any]] = []
     providers = _active_web_retrieval_providers()
+    logger.info(
+        "web_retrieval_attempt_started attempt_id=%s provider_candidates=%s answer_count=%s",
+        attempt_id,
+        ",".join(provider.provider_name for provider in providers),
+        len(answers),
+    )
+    provider_stats: dict[str, dict[str, Any]] = {}
+    tavily_scores: list[float] = []
     for answer in answers:
         answer_text = str(answer.get("answer_text") or "").strip()
         if len(answer_text) < 20:
@@ -967,6 +1206,26 @@ def _retrieved_web_matches_for_answers(
             providers=providers,
         )
         for retrieval in retrieval_results:
+            provider_key = retrieval.provider_name
+            provider_state = provider_stats.setdefault(
+                provider_key,
+                {
+                    "query_count": 0,
+                    "retrieved_url_count": 0,
+                    "match_count": 0,
+                    "below_threshold_count": 0,
+                    "empty_extraction_count": 0,
+                    "top_score": 0.0,
+                },
+            )
+            provider_state["query_count"] += len(retrieval.generated_queries)
+            provider_state["retrieved_url_count"] += len(retrieval.candidates)
+            logger.info(
+                "web_retrieval_query_count attempt_id=%s provider=%s query_count=%s",
+                attempt_id,
+                retrieval.provider_name,
+                len(retrieval.generated_queries),
+            )
             logger.info(
                 "web_retrieval_result provider=%s retrieved_url_count=%s query_count=%s",
                 retrieval.provider_name,
@@ -975,14 +1234,35 @@ def _retrieved_web_matches_for_answers(
             )
             for candidate in retrieval.candidates:
                 reference_text = candidate.source_candidate.normalized_text or ""
+                if not reference_text.strip():
+                    provider_state["empty_extraction_count"] += 1
+                    logger.info(
+                        "web_retrieval_candidate_skipped attempt_id=%s provider=%s reason=extraction_empty source_url=%s",
+                        attempt_id,
+                        retrieval.provider_name,
+                        candidate.source_candidate.source_url or "",
+                    )
+                    continue
                 similarity = _similarity_score(
                     answer_text,
                     reference_text,
                     source_candidate=candidate.source_candidate,
                     question_title=str(answer.get("question_title") or ""),
                 )
+                if retrieval.provider_name == "tavily":
+                    tavily_scores.append(similarity)
+                    logger.info(
+                        "tavily_similarity_score source_url=%s score=%s extracted_text_length=%s extracted_chunk_count=%s",
+                        candidate.source_candidate.source_url or "",
+                        round(float(similarity), 4),
+                        len(reference_text),
+                        len(_chunk_text(reference_text)),
+                    )
+                provider_state["top_score"] = max(provider_state["top_score"], similarity)
                 if similarity < minimum_match_threshold:
+                    provider_state["below_threshold_count"] += 1
                     continue
+                provider_state["match_count"] += 1
                 matches.append(
                     _build_match_payload(
                         attempt_id=attempt_id,
@@ -999,6 +1279,26 @@ def _retrieved_web_matches_for_answers(
                         retrieval_source=candidate.retrieval_source,
                     )
                 )
+    for provider_name, stats in provider_stats.items():
+        logger.info(
+            "web_retrieval_provider_summary attempt_id=%s provider=%s retrieved_url_count=%s web_retrieval_fetch_success_count=%s web_retrieval_fetch_failure_count=%s web_retrieval_match_count=%s web_retrieval_top_score=%s filtered_reason_below_threshold=%s filtered_reason_extraction_empty=%s",
+            attempt_id,
+            provider_name,
+            stats["retrieved_url_count"],
+            stats["retrieved_url_count"] - stats["empty_extraction_count"],
+            stats["empty_extraction_count"],
+            stats["match_count"],
+            round(float(stats["top_score"]), 4),
+            stats["below_threshold_count"],
+            stats["empty_extraction_count"],
+        )
+    if "tavily" in provider_stats and provider_stats["tavily"]["match_count"] == 0 and provider_stats["tavily"]["below_threshold_count"] > 0:
+        logger.info(
+            "tavily_scores_below_threshold attempt_id=%s top_candidate_score=%s below_threshold_count=%s",
+            attempt_id,
+            round(float(provider_stats["tavily"]["top_score"]), 4),
+            provider_stats["tavily"]["below_threshold_count"],
+        )
     return matches, retrieval_hooks
 
 
@@ -1364,7 +1664,12 @@ def _match_sort_key(item: dict[str, Any]) -> tuple[int, float, float, int, int]:
     similarity_score = _safe_float(item.get("similarity_score"), 0.0)
     match_origin = str(item.get("match_origin") or "controlled_corpus").strip().lower()
     retrieval_confidence = _safe_float(item.get("retrieval_confidence"), 0.0)
+    source_domain = str(item.get("source_domain") or "").strip().lower()
     source_bonus = 0.025 if match_origin == "web_retrieval" else 0.0
+    if match_origin == "web_retrieval" and source_domain and "example.com" not in source_domain:
+        source_bonus += 0.015
+    if source_domain in PREFERRED_REAL_SOURCE_DOMAINS:
+        source_bonus += 0.015
     confidence_bonus = min(0.01, retrieval_confidence * 0.01) if match_origin == "web_retrieval" else 0.0
     return (
         likelihood_rank,
@@ -1695,7 +2000,9 @@ def analyze_answer_provenance(
         int((datetime.now(timezone.utc) - retrieval_started_at).total_seconds() * 1000),
     )
     matches.extend(retrieved_matches)
+    pre_dedupe_matches = len(matches)
     matches = _dedupe_matches(matches)
+    dedupe_removed_count = max(0, pre_dedupe_matches - len(matches))
     matches.sort(key=_match_sort_key)
     top_matches = matches[:3]
     best_match = top_matches[0] if top_matches else None
@@ -1711,13 +2018,49 @@ def analyze_answer_provenance(
     best_signal_count = int(best_match.get("behavioral_signal_count") or 0) if best_match else 0
     overall_likelihood = _likelihood_from_score(best_score, best_signal_count, validation_mode)
     overall_confidence = _confidence_from_score(best_score, best_signal_count, validation_mode) if best_match else 0.0
+    controlled_corpus_match_count = len([item for item in matches if str(item.get("match_origin") or "controlled_corpus") == "controlled_corpus"])
+    web_retrieval_match_count = len([item for item in matches if str(item.get("match_origin") or "") == "web_retrieval"])
+    final_match_origins = ",".join(sorted({str(item.get("match_origin") or "controlled_corpus") for item in top_matches})) if top_matches else "none"
+    top_web_score = max((_safe_float(item.get("similarity_score"), 0.0) for item in matches if str(item.get("match_origin") or "") == "web_retrieval"), default=0.0)
+    top_corpus_score = max((_safe_float(item.get("similarity_score"), 0.0) for item in matches if str(item.get("match_origin") or "controlled_corpus") == "controlled_corpus"), default=0.0)
+    logger.info(
+        "controlled_corpus_match_count attempt_id=%s count=%s",
+        attempt_id,
+        controlled_corpus_match_count,
+    )
+    logger.info(
+        "web_retrieval_match_count attempt_id=%s count=%s top_score=%s",
+        attempt_id,
+        web_retrieval_match_count,
+        round(float(top_web_score), 4),
+    )
+    if web_retrieval_match_count > 0 and final_match_origins == "controlled_corpus":
+        logger.info(
+            "web_retrieval_ranking_filtered attempt_id=%s reason=web_score_too_low_or_deduped top_web_score=%s top_corpus_score=%s dedupe_removed_count=%s",
+            attempt_id,
+            round(float(top_web_score), 4),
+            round(float(top_corpus_score), 4),
+            dedupe_removed_count,
+        )
+        logger.info(
+            "tavily_matches_replaced_by_controlled_corpus attempt_id=%s top_web_score=%s top_corpus_score=%s",
+            attempt_id,
+            round(float(top_web_score), 4),
+            round(float(top_corpus_score), 4),
+        )
     logger.info(
         "provenance_analysis_summary attempt_id=%s corpus_match_count=%s web_match_count=%s top_match_origin=%s top_match_provider=%s",
         attempt_id,
-        len([item for item in matches if str(item.get("match_origin") or "controlled_corpus") == "controlled_corpus"]),
-        len([item for item in matches if str(item.get("match_origin") or "") == "web_retrieval"]),
+        controlled_corpus_match_count,
+        web_retrieval_match_count,
         best_match.get("match_origin") if best_match else "none",
         best_match.get("retrieval_source") if best_match else "none",
+    )
+    logger.info(
+        "final_match_origins attempt_id=%s origins=%s dedupe_removed_count=%s",
+        attempt_id,
+        final_match_origins,
+        dedupe_removed_count,
     )
     logger.info(
         "provenance_matches_found attempt_id=%s total_matches=%s top_matches=%s",

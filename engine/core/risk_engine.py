@@ -37,6 +37,18 @@ class RiskResult:
     session_intelligence: Dict[str, Any]
 
 
+def _behavioral_correlation_strength(
+    *,
+    correlation_amplification: float,
+    patterns: List[PatternMatch],
+) -> str:
+    if correlation_amplification >= 0.2 or len(patterns) >= 2:
+        return "HIGH"
+    if correlation_amplification > 0 or len(patterns) == 1:
+        return "MEDIUM"
+    return "LOW"
+
+
 @dataclass(frozen=True)
 class ConfidenceScoreConfig:
     support_threshold: float = 0.20
@@ -339,6 +351,27 @@ def score_event_batch(
     )
     explanation["reasons"].extend(session_intelligence.explanation_factors)
 
+    behavioral_strength = _behavioral_correlation_strength(
+        correlation_amplification=float(session_intelligence.correlation_amplification),
+        patterns=patterns,
+    )
+    if _risk_rank(final_risk) > _risk_rank(ml_risk):
+        escalation_reason = (
+            f"ML-assisted assessment indicated {ml_risk} concern, however correlated behavioral signals elevated the final integrity risk to {final_risk}."
+        )
+    elif _risk_rank(final_risk) > _risk_rank(rule_risk):
+        escalation_reason = (
+            f"The ML-assisted advisory signal supported promotion from deterministic {rule_risk} to final {final_risk} after corroborating behavioral evidence was present."
+        )
+    elif _risk_rank(rule_risk) > _risk_rank(ml_risk):
+        escalation_reason = (
+            "Behavioral correlation and deterministic integrity signals increased the final system risk beyond the ML advisory prediction."
+        )
+    else:
+        escalation_reason = (
+            "The final risk level reflects combined deterministic analysis, behavioral telemetry correlation, and ML-assisted scoring."
+        )
+
     explanation_text = (
         " ".join(explanation.get("summary", [])) + " "
         + " ".join(explanation.get("reasons", []))
@@ -369,6 +402,12 @@ def score_event_batch(
             "session_narrative": session_intelligence.session_narrative,
             "timeline_points": session_intelligence.timeline_points,
             "explanation_factors": session_intelligence.explanation_factors,
+            "hybrid_reasoning": {
+                "ml_advisory_level": ml_risk,
+                "deterministic_risk_level": rule_risk,
+                "behavioral_correlation_strength": behavioral_strength,
+                "escalation_reason": escalation_reason,
+            },
         },
     )
 

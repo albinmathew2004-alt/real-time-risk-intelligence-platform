@@ -43,7 +43,10 @@ Usage:
    *  assessmentId?: string,
    *  assessmentName?: string,
    *  devMode?: boolean,
+   *  demoMode?: boolean,
+   *  idleWarningMs?: number,
    *  idleTimeoutMs?: number,
+   *  idleMouseMovementThresholdPx?: number,
    *  typingStopMs?: number,
    *  flushIntervalMs?: number,
    *  maxQueueSize?: number,
@@ -118,14 +121,18 @@ Usage:
     var _queue = [];
 
     var _destroyed = false;
+    var _submissionFinalized = false;
     var _flushTimer = null;
     var _flushInFlightPromise = null;
 
     // Idle detection
+    var _idleWarningTimeout = null;
     var _idleTimeout = null;
     var _lastActivityAtMs = 0;
     var _idle = false;
     var _idleStartedAtMs = 0;
+    var _idleMonitoringWindowOpen = false;
+    var _lastMousePosition = null;
 
     // Typing detection (per question)
     var _typingTimersByQ = new Map();
@@ -158,6 +165,16 @@ Usage:
       try {
         // eslint-disable-next-line no-console
         console.warn.apply(console, ['[RiskTelemetry]'].concat([].slice.call(arguments)));
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    function _telemetryInfo(eventName, payload) {
+      if (!_opts || (!_opts.devMode && !_opts.demoMode)) return;
+      try {
+        // eslint-disable-next-line no-console
+        console.info('[RiskTelemetry]', Object.assign({ event: eventName }, payload || {}));
       } catch (e) {
         // ignore
       }
@@ -222,6 +239,23 @@ Usage:
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+    }
+
+    function _detachInteractiveListeners() {
+      try {
+        document.removeEventListener('visibilitychange', _handleVisibilityChange);
+        window.removeEventListener('focus', _handleWindowFocus);
+        window.removeEventListener('blur', _handleWindowBlur);
+        window.removeEventListener('mousemove', _markActivity);
+        window.removeEventListener('keydown', _markActivity);
+        window.removeEventListener('scroll', _markActivity);
+        window.removeEventListener('mousedown', _markActivity);
+        window.removeEventListener('touchstart', _markActivity);
+        document.removeEventListener('paste', _handlePaste);
+        document.removeEventListener('copy', _handleCopy);
+      } catch (e) {
+        // ignore
+      }
     }
 
     async function _trySendQueueInternal() {
@@ -354,6 +388,7 @@ Usage:
 
     function _send(eventType, payload, occurredAtIso) {
       if (_destroyed || !_opts) return;
+      if (_submissionFinalized && eventType !== 'exam_submitted') return;
       var ev = _buildBaseEvent(eventType, payload, occurredAtIso);
       _enqueue(ev);
       try {
@@ -370,7 +405,7 @@ Usage:
     // -------------------------
 
     function _handleVisibilityChange() {
-      if (_destroyed) return;
+      if (_destroyed || _submissionFinalized) return;
       var nowMs = Date.now();
       if (_shouldIgnoreFocusNoise(nowMs) || (nowMs - _lastVisibilityEventAtMs) < 1200) return;
 
@@ -398,7 +433,7 @@ Usage:
     }
 
     function _handleWindowFocus() {
-      if (_destroyed) return;
+      if (_destroyed || _submissionFinalized) return;
       var nowMs = Date.now();
       if (_shouldIgnoreFocusNoise(nowMs) || document.visibilityState === 'hidden' || (nowMs - _lastFocusEventAtMs) < 1200) return;
       _lastFocusEventAtMs = nowMs;
@@ -406,15 +441,54 @@ Usage:
     }
 
     function _handleWindowBlur() {
-      if (_destroyed) return;
+      if (_destroyed || _submissionFinalized) return;
       var nowMs = Date.now();
       if (_shouldIgnoreFocusNoise(nowMs) || document.visibilityState === 'hidden' || (nowMs - _lastBlurEventAtMs) < 1200) return;
       _lastBlurEventAtMs = nowMs;
       _send('blur', { state: 'blurred' });
     }
 
-    function _markActivity() {
-      if (_destroyed) return;
+    function _getIdleTimeoutMs() {
+      var idleTimeoutMs = Number.isFinite(_opts && _opts.idleTimeoutMs) ? _opts.idleTimeoutMs : 30000;
+      return clamp(idleTimeoutMs, 5000, 10 * 60 * 1000);
+    }
+
+    function _getIdleWarningMs(idleTimeoutMs) {
+      if (!_opts || !Number.isFinite(_opts.idleWarningMs)) return null;
+      return clamp(_opts.idleWarningMs, 5000, Math.max(5000, idleTimeoutMs - 1000));
+    }
+
+    function _shouldIgnoreMouseJitter(ev) {
+      if (!_opts || String((ev && ev.type) || '') !== 'mousemove') return false;
+
+      var thresholdPx = Number.isFinite(_opts.idleMouseMovementThresholdPx) ? _opts.idleMouseMovementThresholdPx : 0;
+      thresholdPx = clamp(thresholdPx, 0, 100);
+      if (thresholdPx <= 0) return false;
+
+      var nextX = Number(ev && ev.clientX);
+      var nextY = Number(ev && ev.clientY);
+      if (!Number.isFinite(nextX) || !Number.isFinite(nextY)) return false;
+
+      if (!_lastMousePosition) {
+        _lastMousePosition = { x: nextX, y: nextY };
+        return false;
+      }
+
+      var dx = nextX - _lastMousePosition.x;
+      var dy = nextY - _lastMousePosition.y;
+      var distancePx = Math.sqrt((dx * dx) + (dy * dy));
+
+      if (distancePx < thresholdPx) {
+        return true;
+      }
+
+      _lastMousePosition = { x: nextX, y: nextY };
+      return false;
+    }
+
+    function _markActivity(ev) {
+      if (_destroyed || _submissionFinalized) return;
+      if (_shouldIgnoreMouseJitter(ev)) return;
 
       var nowMs = Date.now();
       _lastActivityAtMs = nowMs;
@@ -422,6 +496,7 @@ Usage:
       // If we were idle, we end the idle period now.
       if (_idle) {
         _idle = false;
+        _idleMonitoringWindowOpen = false;
 
         var idleEndMs = nowMs;
         var idleDurationS = Math.max(0, (idleEndMs - _idleStartedAtMs) / 1000.0);
@@ -438,6 +513,11 @@ Usage:
           state: 'active',
           reason: 'inactivity',
         }, new Date(idleEndMs).toISOString());
+
+        _telemetryInfo('idle_recovery_detected', {
+          idleDurationSeconds: Math.round(idleDurationS * 1000) / 1000,
+          activityType: String((ev && ev.type) || 'unknown'),
+        });
       }
 
       _armIdleTimer();
@@ -446,12 +526,35 @@ Usage:
     function _armIdleTimer() {
       if (_destroyed || !_opts) return;
 
-      var idleTimeoutMs = Number.isFinite(_opts.idleTimeoutMs) ? _opts.idleTimeoutMs : 30000;
-      idleTimeoutMs = clamp(idleTimeoutMs, 5000, 10 * 60 * 1000);
+      var idleTimeoutMs = _getIdleTimeoutMs();
+      var idleWarningMs = _getIdleWarningMs(idleTimeoutMs);
 
+      if (_idleWarningTimeout) {
+        clearTimeout(_idleWarningTimeout);
+        _idleWarningTimeout = null;
+      }
       if (_idleTimeout) {
         clearTimeout(_idleTimeout);
         _idleTimeout = null;
+      }
+
+      if (!_idleMonitoringWindowOpen) {
+        _idleMonitoringWindowOpen = true;
+        _telemetryInfo('idle_timer_started', {
+          idleWarningMs: idleWarningMs,
+          idleTimeoutMs: idleTimeoutMs,
+        });
+      }
+
+      if (idleWarningMs !== null) {
+        _idleWarningTimeout = setTimeout(function () {
+          if (_destroyed || _idle) return;
+          _telemetryInfo('idle_threshold_reached', {
+            thresholdType: 'warning',
+            idleWarningMs: idleWarningMs,
+            idleTimeoutMs: idleTimeoutMs,
+          });
+        }, idleWarningMs);
       }
 
       _idleTimeout = setTimeout(function () {
@@ -460,7 +563,12 @@ Usage:
         // We became idle.
         _idle = true;
         _idleStartedAtMs = _lastActivityAtMs || Date.now();
+        _idleMonitoringWindowOpen = false;
 
+        _telemetryInfo('idle_threshold_reached', {
+          thresholdType: 'idle_event',
+          idleTimeoutMs: idleTimeoutMs,
+        });
         _log('idle started');
       }, idleTimeoutMs);
     }
@@ -479,7 +587,7 @@ Usage:
     }
 
     function _handlePaste(ev) {
-      if (_destroyed) return;
+      if (_destroyed || _submissionFinalized) return;
 
       // PRIVACY: We read text ONLY to compute a length and then immediately discard it.
       // We do NOT store or transmit clipboard text.
@@ -509,7 +617,7 @@ Usage:
     }
 
     function _handleCopy() {
-      if (_destroyed) return;
+      if (_destroyed || _submissionFinalized) return;
       var qid = _detectActiveQuestionIdFromDom() || _activeQuestionId;
 
       _send('clipboard', {
@@ -544,7 +652,10 @@ Usage:
         assessmentName: safeStr(options.assessmentName),
 
         devMode: !!options.devMode,
+        demoMode: !!options.demoMode,
+        idleWarningMs: options.idleWarningMs,
         idleTimeoutMs: options.idleTimeoutMs,
+        idleMouseMovementThresholdPx: options.idleMouseMovementThresholdPx,
         typingStopMs: options.typingStopMs,
         flushIntervalMs: options.flushIntervalMs,
         maxQueueSize: options.maxQueueSize,
@@ -552,6 +663,7 @@ Usage:
       };
 
       _destroyed = false;
+      _submissionFinalized = false;
 
       // Load persisted queue (e.g., if the page refreshed while offline).
       _queue = tryLoadQueue(_opts.attemptId);
@@ -559,6 +671,8 @@ Usage:
       _lastActivityAtMs = Date.now();
       _idle = false;
       _idleStartedAtMs = 0;
+      _idleMonitoringWindowOpen = false;
+      _lastMousePosition = null;
       _focusNoiseMuteUntilMs = Date.now() + 1500;
       _lastVisibilityEventAtMs = 0;
       _lastBlurEventAtMs = 0;
@@ -591,8 +705,31 @@ Usage:
     }
 
     function startExam() {
+      _submissionFinalized = false;
       _muteFocusNoise(1800);
       _send('exam_started', {});
+      return RiskTelemetry;
+    }
+
+    function beginSubmit() {
+      if (_destroyed || !_opts) return RiskTelemetry;
+      _submissionFinalized = true;
+      _detachInteractiveListeners();
+      if (_flushTimer) {
+        clearInterval(_flushTimer);
+        _flushTimer = null;
+      }
+      if (_idleTimeout) {
+        clearTimeout(_idleTimeout);
+        _idleTimeout = null;
+      }
+      if (_idleWarningTimeout) {
+        clearTimeout(_idleWarningTimeout);
+        _idleWarningTimeout = null;
+      }
+      _telemetryInfo('telemetry_stopped_before_submit', {
+        queueLength: _queue.length,
+      });
       return RiskTelemetry;
     }
 
@@ -605,6 +742,7 @@ Usage:
     }
 
     function enterQuestion(questionId) {
+      if (_submissionFinalized) return RiskTelemetry;
       var qid = String(questionId || '');
       if (!qid) return RiskTelemetry;
       _muteFocusNoise(1200);
@@ -620,6 +758,7 @@ Usage:
     }
 
     function leaveQuestion(questionId) {
+      if (_submissionFinalized) return RiskTelemetry;
       var qid = String(questionId || '');
       if (!qid) return RiskTelemetry;
       _muteFocusNoise(1200);
@@ -651,6 +790,7 @@ Usage:
     }
 
     function trackAnswerChange(questionId, answerValue) {
+      if (_submissionFinalized) return RiskTelemetry;
       var qid = String(questionId || '');
       if (!qid) return RiskTelemetry;
 
@@ -729,21 +869,10 @@ Usage:
     function destroy() {
       if (_destroyed) return;
       _destroyed = true;
+      _submissionFinalized = true;
 
       try {
-        document.removeEventListener('visibilitychange', _handleVisibilityChange);
-        window.removeEventListener('focus', _handleWindowFocus);
-        window.removeEventListener('blur', _handleWindowBlur);
-
-        window.removeEventListener('mousemove', _markActivity);
-        window.removeEventListener('keydown', _markActivity);
-        window.removeEventListener('scroll', _markActivity);
-        window.removeEventListener('mousedown', _markActivity);
-        window.removeEventListener('touchstart', _markActivity);
-
-        document.removeEventListener('paste', _handlePaste);
-        document.removeEventListener('copy', _handleCopy);
-
+        _detachInteractiveListeners();
         window.removeEventListener('online', _handleOnline);
       } catch (e) {
         // ignore
@@ -757,6 +886,10 @@ Usage:
       if (_idleTimeout) {
         clearTimeout(_idleTimeout);
         _idleTimeout = null;
+      }
+      if (_idleWarningTimeout) {
+        clearTimeout(_idleWarningTimeout);
+        _idleWarningTimeout = null;
       }
 
       // Clear typing timers
@@ -777,6 +910,7 @@ Usage:
     return {
       init: init,
       startExam: startExam,
+      beginSubmit: beginSubmit,
       endExam: endExam,
       enterQuestion: enterQuestion,
       leaveQuestion: leaveQuestion,

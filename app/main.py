@@ -19,8 +19,9 @@ load_local_env()
 
 from engine.core.scorer import run_scoring
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
-from engine.db.database import Base, engine, SessionLocal, current_database_mode, ensure_demo_schema
+from engine.db.database import Base, engine, SessionLocal, current_database_mode, ensure_demo_schema, is_sqlite_url
 from engine.db.models import AttemptLog, AttemptState, InvestigationCase, RawExamEvent, RiskHistory
 
 from engine.cache.redis_client import (
@@ -50,10 +51,14 @@ from app.services.demo_attempt_cleanup import (
     DEMO_ABANDONED_STATUS,
     DEMO_EXPIRED_MESSAGE,
     DEMO_EXPIRED_STATUS,
-    expire_stale_demo_attempts,
+    expire_stale_demo_attempts_if_due,
 )
 from app.services.final_assessment_service import build_final_risk_assessment
-from app.services.provenance_analysis_service import analyze_answer_provenance, build_provenance_evidence_item
+from app.services.provenance_analysis_service import (
+    analyze_answer_provenance,
+    build_provenance_evidence_item,
+    get_provenance_retrieval_diagnostics,
+)
 from app.services.report_summary_service import build_report_summary
 
 RISK_HISTORY_SCORE_EPSILON = 0.01
@@ -67,6 +72,9 @@ COMPLETED_CASE_STATUSES = {"CONFIRMED_RISK", "FALSE_POSITIVE", "CLEARED", "RESOL
 PERSIST_DEMO_DATA = os.getenv("PERSIST_DEMO_DATA", "true").strip().lower() in {"1", "true", "yes", "on"}
 SUBMISSION_EVENT_TYPES = {"exam_submitted", "assessment_submitted", "submit", "completed"}
 ACTIVE_SESSION_WINDOW_MINUTES = int(os.getenv("ACTIVE_SESSION_WINDOW_MINUTES", "5"))
+PROVENANCE_FINALIZATION_TIMEOUT_SECONDS = int(os.getenv("PROVENANCE_FINALIZATION_TIMEOUT_SECONDS", "45"))
+SQLITE_LOCK_RETRY_ATTEMPTS = int(os.getenv("SQLITE_LOCK_RETRY_ATTEMPTS", "5"))
+SQLITE_LOCK_RETRY_BASE_DELAY_MS = int(os.getenv("SQLITE_LOCK_RETRY_BASE_DELAY_MS", "180"))
 FEED_SUSPICIOUS_EVENT_TYPES = {
     "clipboard",
     "visibility_change",
@@ -110,6 +118,47 @@ def _is_local_mode() -> bool:
 
 def _is_controlled_demo_mode() -> bool:
     return APP_MODE.strip().lower() == "controlled-demo"
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    return is_sqlite_url() and "database is locked" in str(exc or "").lower()
+
+
+def _run_with_sqlite_lock_retry(operation_name: str, func, *, attempts: int | None = None):
+    max_attempts = max(1, attempts or SQLITE_LOCK_RETRY_ATTEMPTS)
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = func()
+            if attempt > 1:
+                logger.info("sqlite_lock_retry_succeeded operation=%s attempt=%s", operation_name, attempt)
+            return result
+        except OperationalError as exc:
+            if not _is_sqlite_lock_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= max_attempts:
+                logger.error("sqlite_lock_retry_exhausted operation=%s attempts=%s", operation_name, max_attempts)
+                raise
+            delay_seconds = (SQLITE_LOCK_RETRY_BASE_DELAY_MS * attempt) / 1000.0
+            logger.warning("sqlite_lock_retry operation=%s attempt=%s/%s delay_ms=%s", operation_name, attempt, max_attempts, int(delay_seconds * 1000))
+            time.sleep(delay_seconds)
+    if last_exc is not None:
+        raise last_exc
+
+
+def _with_retry_session(operation_name: str, func, *, attempts: int | None = None):
+    def _attempt():
+        db = SessionLocal()
+        try:
+            return func(db)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    return _run_with_sqlite_lock_retry(operation_name, _attempt, attempts=attempts)
 
 
 def _attempt_data_exists(db) -> bool:
@@ -232,6 +281,7 @@ def startup_event():
         print("[OK] Database tables created/verified")
         print(f"[OK] Database backend: {current_database_mode()}")
         print("[OK] Connection pool initialized")
+        _log_provenance_retrieval_diagnostics()
         if should_verify_demo_admin_on_startup(APP_MODE):
             db = SessionLocal()
             try:
@@ -242,7 +292,7 @@ def startup_event():
         _maybe_seed_hosted_demo_dataset()
         db = SessionLocal()
         try:
-            cleanup_result = expire_stale_demo_attempts(db)
+            cleanup_result = expire_stale_demo_attempts_if_due(db, force=True)
             if cleanup_result["updated_count"]:
                 db.commit()
             print(f"[OK] Stale demo attempts expired: {cleanup_result['updated_count']}")
@@ -383,6 +433,10 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def utc_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def parse_timestamp(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -398,6 +452,19 @@ def parse_timestamp(value: Any) -> Optional[datetime]:
     else:
         parsed = parsed.astimezone(timezone.utc)
     return parsed
+
+
+def normalize_datetime_value(value: Any, *, field_name: str = "timestamp") -> Optional[datetime]:
+    parsed = parse_timestamp(value)
+    if parsed is not None:
+        return parsed
+    if value not in (None, "", {}):
+        logger.warning(
+            "datetime_parse_failed field_name=%s value_type=%s",
+            field_name,
+            type(value).__name__,
+        )
+    return None
 
 
 def normalize_timestamp_input(value: Any, *, fallback_to_now: bool = False) -> str:
@@ -1050,9 +1117,6 @@ def _event_counts_by_attempt(db) -> Dict[str, int]:
 
 
 def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, sync_cases: bool = False) -> List[Dict[str, Any]]:
-    cleanup_result = expire_stale_demo_attempts(db)
-    if cleanup_result["updated_count"]:
-        db.commit()
     if sync_cases:
         _sync_cases_from_attempts(db)
     latest_event_by_attempt = _latest_event_metadata(db)
@@ -1178,7 +1242,7 @@ def _build_persisted_attempt_rows(db, *, recent_hours: Optional[int] = None, syn
 
 
 def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[str, Any]:
-    cleanup_result = expire_stale_demo_attempts(db)
+    cleanup_result = expire_stale_demo_attempts_if_due(db)
     if cleanup_result["updated_count"]:
         db.commit()
     latest_event_by_attempt = _latest_event_metadata(db)
@@ -1421,7 +1485,7 @@ def get_review_queue(
 
 
 def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
-    cleanup_result = expire_stale_demo_attempts(db)
+    cleanup_result = expire_stale_demo_attempts_if_due(db)
     if cleanup_result["updated_count"]:
         db.commit()
     persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
@@ -1565,9 +1629,74 @@ def _build_attempt_report(db, attempt_id: str) -> Dict[str, Any]:
     }
 
 
+def _log_provenance_retrieval_diagnostics() -> None:
+    diagnostics = get_provenance_retrieval_diagnostics()
+    logger.info(
+        "provenance_retrieval_config experimental_web_retrieval_enabled=%s tavily_key_present=%s serper_key_present=%s brave_key_present=%s selected_retrieval_provider=%s max_results=%s timeout_seconds=%s",
+        diagnostics["experimental_web_retrieval_enabled"],
+        diagnostics["tavily_key_present"],
+        diagnostics["serper_key_present"],
+        diagnostics["brave_key_present"],
+        diagnostics["selected_retrieval_provider"],
+        diagnostics["max_results"],
+        diagnostics["timeout_seconds"],
+    )
+
+
 def _is_public_demo_attempt_id(attempt_id: str) -> bool:
     normalized = str(attempt_id or "").strip().lower()
     return normalized.startswith("demo_public_")
+
+
+def _finalize_stale_provenance_state(db, persisted_state: AttemptState) -> dict[str, Any]:
+    signals = dict(getattr(persisted_state, "signals", None) or {})
+    provenance_status = str(signals.get("provenance_status") or "").strip().lower()
+    submitted_answers = list(signals.get("submitted_answers") or [])
+    if provenance_status != "processing" or submitted_answers == []:
+        return signals
+
+    started_at = (
+        normalize_datetime_value(signals.get("provenance_started_at"), field_name="provenance_started_at")
+        or normalize_datetime_value(getattr(persisted_state, "submitted_at", None), field_name="submitted_at")
+    )
+    if not started_at:
+        logger.warning(
+            "provenance_started_at_invalid attempt_id=%s action=finalize_failed",
+            getattr(persisted_state, "attempt_id", None),
+        )
+        signals["provenance_status"] = "failed"
+        signals["provenance_finalized"] = True
+        signals["provenance_error"] = str(signals.get("provenance_error") or "invalid_provenance_started_at")
+        signals["provenance_finalized_at"] = utc_now()
+        persisted_state.signals = signals
+        persisted_state.updated_at = utc_now()
+        db.add(persisted_state)
+        db.commit()
+        return signals
+
+    age_seconds = (utc_now_dt() - started_at).total_seconds()
+    if age_seconds < PROVENANCE_FINALIZATION_TIMEOUT_SECONDS:
+        return signals
+
+    signals["provenance_status"] = "failed"
+    signals["provenance_finalized"] = True
+    signals["provenance_error"] = str(signals.get("provenance_error") or "analysis_timeout")
+    signals["provenance_finalized_at"] = utc_now()
+    persisted_state.signals = signals
+    persisted_state.updated_at = utc_now()
+    db.add(persisted_state)
+    db.commit()
+    logger.info(
+        "provenance_timeout_reached attempt_id=%s age_seconds=%s",
+        getattr(persisted_state, "attempt_id", None),
+        int(age_seconds),
+    )
+    logger.info(
+        "provenance_status_finalized attempt_id=%s status=%s",
+        getattr(persisted_state, "attempt_id", None),
+        "failed",
+    )
+    return signals
 
 
 def _build_hybrid_reasoning_context(
@@ -1627,7 +1756,7 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
     )
     if provenance_ready:
         provenance_status = "ready"
-    elif saved_provenance_status in {"processing", "ready", "unavailable"}:
+    elif saved_provenance_status in {"processing", "ready", "unavailable", "failed"}:
         provenance_status = saved_provenance_status
     elif submitted_answers == []:
         provenance_status = "unavailable"
@@ -1707,7 +1836,7 @@ def _build_candidate_safe_demo_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "answer_provenance": provenance_summary,
         "provenance_status": provenance_status,
         "provenance_ready": provenance_ready,
-        "provenance_finalized": provenance_status in {"ready", "unavailable"},
+        "provenance_finalized": provenance_status in {"ready", "unavailable", "failed"},
         "privacy_note": "This summary reflects metadata-based integrity analysis only. It does not use webcam, microphone, screen recording, or clipboard contents.",
     }
 
@@ -1731,6 +1860,16 @@ def health():
         "version": APP_VERSION,
         "mode": APP_MODE,
         "timestamp": utc_now(),
+    }
+
+
+@app.get("/v1/debug/provenance-config")
+def debug_provenance_config():
+    if not _is_local_mode():
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "status": "success",
+        "data": get_provenance_retrieval_diagnostics(),
     }
 
 
@@ -1876,7 +2015,6 @@ async def score(batch: EventBatch):
 
 @app.post("/v1/events/ingest")
 async def ingest_event(event: ExamEventIngest):
-    db = SessionLocal()
     started_at = time.perf_counter()
 
     try:
@@ -1886,22 +2024,22 @@ async def ingest_event(event: ExamEventIngest):
         received_at = utc_now()
         is_submission_event = _is_submission_event_type(event.event_type)
         persist_raw_event_started_at = time.perf_counter()
-
-        raw_event = RawExamEvent(
-            attempt_id=event.attempt_id,
-            candidate_id=event.candidate_id,
-            candidate_name=event.candidate_name,
-            candidate_email=event.candidate_email,
-            assessment_id=event.assessment_id,
-            assessment_name=event.assessment_name,
-            event_type=event.event_type,
-            payload=event.payload,
-            occurred_at=event.occurred_at,
-            received_at=received_at,
+        raw_event_data = {
+            "attempt_id": event.attempt_id,
+            "candidate_id": event.candidate_id,
+            "candidate_name": event.candidate_name,
+            "candidate_email": event.candidate_email,
+            "assessment_id": event.assessment_id,
+            "assessment_name": event.assessment_name,
+            "event_type": event.event_type,
+            "payload": event.payload,
+            "occurred_at": event.occurred_at,
+            "received_at": received_at,
+        }
+        _with_retry_session(
+            "event_ingest_raw_event",
+            lambda db: (db.add(RawExamEvent(**raw_event_data)), db.commit()),
         )
-
-        db.add(raw_event)
-        db.flush()
         persist_raw_event_ms = round((time.perf_counter() - persist_raw_event_started_at) * 1000, 2)
 
         redis_event = {
@@ -1914,19 +2052,23 @@ async def ingest_event(event: ExamEventIngest):
         scoring_events = get_events(event.attempt_id)
 
         if not scoring_events:
-            scoring_events = [
-                {
-                    "event_type": item.event_type,
-                    "payload": item.payload or {},
-                    "occurred_at": item.occurred_at,
-                }
-                for item in (
-                    db.query(RawExamEvent.event_type, RawExamEvent.payload, RawExamEvent.occurred_at)
-                    .filter(RawExamEvent.attempt_id == event.attempt_id)
-                    .order_by(RawExamEvent.occurred_at.asc())
-                    .all()
-                )
-            ]
+            scoring_events = _with_retry_session(
+                "event_ingest_load_events",
+                lambda db: [
+                    {
+                        "event_type": item.event_type,
+                        "payload": item.payload or {},
+                        "occurred_at": item.occurred_at,
+                    }
+                    for item in (
+                        db.query(RawExamEvent.event_type, RawExamEvent.payload, RawExamEvent.occurred_at)
+                        .filter(RawExamEvent.attempt_id == event.attempt_id)
+                        .order_by(RawExamEvent.occurred_at.asc())
+                        .all()
+                    )
+                ],
+                attempts=2,
+            )
 
         scoring_started_at = time.perf_counter()
         result = run_scoring(scoring_events, event.attempt_id)
@@ -1968,71 +2110,79 @@ async def ingest_event(event: ExamEventIngest):
         }
 
         persistence_started_at = time.perf_counter()
-        _persist_timeline_snapshots(
-            db,
-            attempt_id=event.attempt_id,
-            candidate_id=event.candidate_id,
-            candidate_name=event.candidate_name,
-            candidate_email=event.candidate_email,
-            assessment_id=event.assessment_id,
-            assessment_name=event.assessment_name,
-            timeline_points=timeline_points,
-            final_confidence=confidence_value,
-        )
+        def _persist_scoring_state(db):
+            _persist_timeline_snapshots(
+                db,
+                attempt_id=event.attempt_id,
+                candidate_id=event.candidate_id,
+                candidate_name=event.candidate_name,
+                candidate_email=event.candidate_email,
+                assessment_id=event.assessment_id,
+                assessment_name=event.assessment_name,
+                timeline_points=timeline_points,
+                final_confidence=confidence_value,
+            )
+            latest_history = _latest_risk_history_entry(db, event.attempt_id)
+            _record_risk_snapshot_if_needed(
+                db,
+                attempt_id=event.attempt_id,
+                candidate_id=event.candidate_id,
+                candidate_name=event.candidate_name,
+                candidate_email=event.candidate_email,
+                assessment_id=event.assessment_id,
+                assessment_name=event.assessment_name,
+                risk_level=risk_level,
+                confidence=confidence_value,
+                score=score_value,
+                reason=reason,
+                timestamp=snapshot_timestamp,
+                force=is_submission_event or _risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
+            )
+            _upsert_attempt_log(
+                db,
+                attempt_id=event.attempt_id,
+                risk_level=risk_level,
+                confidence=confidence_value,
+                score=score_value,
+                features=features,
+                signals=signals,
+                timestamp=snapshot_timestamp,
+            )
+            case_record = _ensure_case_for_attempt(db, event.attempt_id)
+            attempt_state = _upsert_attempt_state(
+                db,
+                attempt_id=event.attempt_id,
+                candidate_id=event.candidate_id,
+                candidate_name=event.candidate_name,
+                candidate_email=event.candidate_email,
+                assessment_id=event.assessment_id,
+                assessment_name=event.assessment_name,
+                review_status=getattr(case_record, "status", None),
+                latest_event_type=event.event_type,
+                latest_event_at=event.occurred_at or received_at,
+                event_count=len(scoring_events),
+                risk_level=risk_level,
+                score=score_value,
+                confidence=confidence_value,
+                strongest_reason=reason,
+                violation_overview=violation_overview,
+                evidence_summary=evidence_items,
+                risk_history=_serialize_risk_history_points(timeline_points),
+                features=features,
+                signals=signals,
+            )
+            db.commit()
+            return {
+                "attempt_status": getattr(attempt_state, "status", None),
+                "submitted_at": getattr(attempt_state, "submitted_at", None),
+                "case_id": getattr(case_record, "id", None),
+                "case_status": getattr(case_record, "status", None),
+            }
 
-        latest_history = _latest_risk_history_entry(db, event.attempt_id)
-        _record_risk_snapshot_if_needed(
-            db,
-            attempt_id=event.attempt_id,
-            candidate_id=event.candidate_id,
-            candidate_name=event.candidate_name,
-            candidate_email=event.candidate_email,
-            assessment_id=event.assessment_id,
-            assessment_name=event.assessment_name,
-            risk_level=risk_level,
-            confidence=confidence_value,
-            score=score_value,
-            reason=reason,
-            timestamp=snapshot_timestamp,
-            force=is_submission_event or _risk_history_gap_elapsed(latest_history, timestamp=snapshot_timestamp),
-        )
-        _upsert_attempt_log(
-            db,
-            attempt_id=event.attempt_id,
-            risk_level=risk_level,
-            confidence=confidence_value,
-            score=score_value,
-            features=features,
-            signals=signals,
-            timestamp=snapshot_timestamp,
-        )
-        case_record = _ensure_case_for_attempt(db, event.attempt_id)
-        attempt_state = _upsert_attempt_state(
-            db,
-            attempt_id=event.attempt_id,
-            candidate_id=event.candidate_id,
-            candidate_name=event.candidate_name,
-            candidate_email=event.candidate_email,
-            assessment_id=event.assessment_id,
-            assessment_name=event.assessment_name,
-            review_status=getattr(case_record, "status", None),
-            latest_event_type=event.event_type,
-            latest_event_at=event.occurred_at or received_at,
-            event_count=len(scoring_events),
-            risk_level=risk_level,
-            score=score_value,
-            confidence=confidence_value,
-            strongest_reason=reason,
-            violation_overview=violation_overview,
-            evidence_summary=evidence_items,
-            risk_history=_serialize_risk_history_points(timeline_points),
-            features=features,
-            signals=signals,
-        )
-        current_risk_state["attempt_status"] = getattr(attempt_state, "status", None)
-        current_risk_state["submitted_at"] = getattr(attempt_state, "submitted_at", None)
+        persistence_result = _with_retry_session("event_ingest_persist_state", _persist_scoring_state)
+        current_risk_state["attempt_status"] = persistence_result.get("attempt_status")
+        current_risk_state["submitted_at"] = persistence_result.get("submitted_at")
         set_current_risk(event.attempt_id, current_risk_state)
-        db.commit()
         persistence_ms = round((time.perf_counter() - persistence_started_at) * 1000, 2)
 
         broadcast_payload = {
@@ -2054,8 +2204,8 @@ async def ingest_event(event: ExamEventIngest):
             "combined_score": score_value,
             "explanation": result.get("explanation"),
             "event_count": len(scoring_events),
-            "attempt_status": getattr(attempt_state, "status", None),
-            "submitted_at": getattr(attempt_state, "submitted_at", None),
+            "attempt_status": persistence_result.get("attempt_status"),
+            "submitted_at": persistence_result.get("submitted_at"),
             "timeline_point": {
                 "risk": risk_level,
                 "combined_score": score_value,
@@ -2082,16 +2232,16 @@ async def ingest_event(event: ExamEventIngest):
                 "risk": risk_level,
                 "combined_score": score_value,
                 "confidence": confidence_value,
-                "attempt_status": getattr(attempt_state, "status", None),
-                "submitted_at": getattr(attempt_state, "submitted_at", None),
+                "attempt_status": persistence_result.get("attempt_status"),
+                "submitted_at": persistence_result.get("submitted_at"),
                 "occurred_at": event.occurred_at or received_at,
             })
-        if case_record is not None:
+        if persistence_result.get("case_id") is not None:
             websocket_payloads.append({
                 "type": "case_created_or_updated",
                 "attempt_id": event.attempt_id,
-                "case_id": getattr(case_record, "id", None),
-                "status": getattr(case_record, "status", None),
+                "case_id": persistence_result.get("case_id"),
+                "status": persistence_result.get("case_status"),
                 "risk": risk_level,
                 "combined_score": score_value,
                 "confidence": confidence_value,
@@ -2137,15 +2287,10 @@ async def ingest_event(event: ExamEventIngest):
         }
 
     except HTTPException:
-        db.rollback()
         raise
     except Exception as e:
-        db.rollback()
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to ingest event: {e}") from e
-
-    finally:
-        db.close()
 
 
 @app.post("/v1/attempts/{attempt_id}/answers")
@@ -2153,33 +2298,29 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
     if attempt_id != payload.attempt_id:
         raise HTTPException(status_code=400, detail="Attempt id mismatch")
 
-    db = SessionLocal()
-    try:
-        attempt_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
-        if attempt_state is None:
-            attempt_state = AttemptState(attempt_id=attempt_id, updated_at=utc_now(), status="SUBMITTED")
-            db.add(attempt_state)
+    answers = [
+        {
+            "question_id": item.question_id,
+            "question_title": item.question_title,
+            "section_id": item.section_id,
+            "section_title": item.section_title,
+            "assessment_type": item.assessment_type,
+            "input_type": item.input_type,
+            "answer_text": item.answer_text,
+            "marked_for_review": bool(item.marked_for_review),
+        }
+        for item in payload.answers
+        if str(item.answer_text or "").strip()
+    ]
+    answer_lengths = [len(str(item.get("answer_text") or "").strip()) for item in answers]
+    assessment_name = payload.assessment_name or ""
 
-        answers = [
-            {
-                "question_id": item.question_id,
-                "question_title": item.question_title,
-                "section_id": item.section_id,
-                "section_title": item.section_title,
-                "assessment_type": item.assessment_type,
-                "input_type": item.input_type,
-                "answer_text": item.answer_text,
-                "marked_for_review": bool(item.marked_for_review),
-            }
-            for item in payload.answers
-            if str(item.answer_text or "").strip()
-        ]
-        answer_lengths = [len(str(item.get("answer_text") or "").strip()) for item in answers]
+    try:
         logger.info(
             "provenance_answers_received attempt_id=%s answers=%s assessment=%s lengths=%s",
             attempt_id,
             len(answers),
-            payload.assessment_name or attempt_state.assessment_name or "",
+            assessment_name,
             ",".join(str(length) for length in answer_lengths[:12]),
         )
         logger.info(
@@ -2190,25 +2331,43 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
             len(answers),
         )
 
-        existing_signals = dict(getattr(attempt_state, "signals", None) or {})
-        existing_signals["submitted_answers"] = answers
-        existing_signals["provenance_status"] = "unavailable" if not answers else "processing"
-        existing_signals.pop("provenance_error", None)
-        attempt_state.candidate_id = payload.candidate_id or attempt_state.candidate_id
-        attempt_state.candidate_name = payload.candidate_name or attempt_state.candidate_name
-        attempt_state.candidate_email = payload.candidate_email or attempt_state.candidate_email
-        attempt_state.assessment_id = payload.assessment_id or attempt_state.assessment_id
-        attempt_state.assessment_name = payload.assessment_name or attempt_state.assessment_name
-        attempt_state.signals = existing_signals
-        attempt_state.updated_at = utc_now()
-        if not attempt_state.submitted_at:
-            attempt_state.submitted_at = attempt_state.updated_at
-        if attempt_state.status in {"ONGOING", "IN_PROGRESS", ""}:
-            attempt_state.status = "SUBMITTED"
-        db.commit()
+        def _persist_answers_state(db):
+            attempt_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+            if attempt_state is None:
+                attempt_state = AttemptState(attempt_id=attempt_id, updated_at=utc_now(), status="SUBMITTED")
+                db.add(attempt_state)
+            existing_signals = dict(getattr(attempt_state, "signals", None) or {})
+            existing_signals["submitted_answers"] = answers
+            existing_signals["provenance_status"] = "unavailable" if not answers else "processing"
+            existing_signals["provenance_finalized"] = bool(not answers)
+            existing_signals["provenance_started_at"] = utc_now() if answers else existing_signals.get("provenance_started_at")
+            existing_signals.pop("provenance_error", None)
+            existing_signals.pop("answer_provenance", None)
+            existing_signals.pop("provenance_finalized_at", None)
+            attempt_state.candidate_id = payload.candidate_id or attempt_state.candidate_id
+            attempt_state.candidate_name = payload.candidate_name or attempt_state.candidate_name
+            attempt_state.candidate_email = payload.candidate_email or attempt_state.candidate_email
+            attempt_state.assessment_id = payload.assessment_id or attempt_state.assessment_id
+            attempt_state.assessment_name = payload.assessment_name or attempt_state.assessment_name
+            attempt_state.signals = existing_signals
+            attempt_state.updated_at = utc_now()
+            if not attempt_state.submitted_at:
+                attempt_state.submitted_at = attempt_state.updated_at
+            if attempt_state.status in {"ONGOING", "IN_PROGRESS", ""}:
+                attempt_state.status = "SUBMITTED"
+            db.commit()
+            return attempt_state.assessment_name or assessment_name
+
+        try:
+            resolved_assessment_name = _with_retry_session("persist_submitted_answers_initial", _persist_answers_state)
+        except OperationalError as exc:
+            logger.error("sqlite_lock_retry_exhausted operation=%s attempt_id=%s", "persist_submitted_answers_initial", attempt_id)
+            raise exc
+
         logger.info("persisted_answers_count attempt_id=%s count=%s", attempt_id, len(answers))
 
         if not answers:
+            logger.info("provenance_status_finalized attempt_id=%s status=%s", attempt_id, "unavailable")
             logger.info("provenance_analysis_completed attempt_id=%s matches=0 likelihood=LOW confidence=0.00", attempt_id)
             return {
                 "status": "success",
@@ -2216,24 +2375,28 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
                 "data": None,
             }
 
-        events = [
-            {
-                "event_type": row.event_type,
-                "payload": row.payload or {},
-                "occurred_at": row.occurred_at,
-            }
-            for row in (
-                db.query(RawExamEvent)
-                .filter(RawExamEvent.attempt_id == attempt_id)
-                .order_by(RawExamEvent.occurred_at.asc())
-                .all()
-            )
-        ]
+        events = _with_retry_session(
+            "persist_submitted_answers_load_events",
+            lambda db: [
+                {
+                    "event_type": row.event_type,
+                    "payload": row.payload or {},
+                    "occurred_at": row.occurred_at,
+                }
+                for row in (
+                    db.query(RawExamEvent)
+                    .filter(RawExamEvent.attempt_id == attempt_id)
+                    .order_by(RawExamEvent.occurred_at.asc())
+                    .all()
+                )
+            ],
+            attempts=2,
+        )
         logger.info("provenance_analysis_started attempt_id=%s answer_count=%s", attempt_id, len(answers))
         try:
             provenance_result = analyze_answer_provenance(
                 attempt_id=attempt_id,
-                assessment_name=payload.assessment_name or attempt_state.assessment_name or "",
+                assessment_name=resolved_assessment_name or assessment_name,
                 submitted_answers=answers,
                 events=events,
             )
@@ -2245,15 +2408,24 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
                 safe_float(provenance_result.get("confidence_score"), 0.0),
             )
 
-            refreshed_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
-            persisted_signals = dict(getattr(refreshed_state, "signals", None) or {})
-            persisted_signals["submitted_answers"] = answers
-            persisted_signals["answer_provenance"] = provenance_result
-            persisted_signals["provenance_status"] = "ready"
-            persisted_signals.pop("provenance_error", None)
-            refreshed_state.signals = persisted_signals
-            refreshed_state.updated_at = utc_now()
-            db.commit()
+            def _persist_provenance_result(db):
+                refreshed_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+                persisted_signals = dict(getattr(refreshed_state, "signals", None) or {})
+                if persisted_signals.get("answer_provenance") and not provenance_result:
+                    return persisted_signals
+                persisted_signals["submitted_answers"] = answers
+                persisted_signals["answer_provenance"] = provenance_result
+                persisted_signals["provenance_status"] = "ready"
+                persisted_signals["provenance_finalized"] = True
+                persisted_signals["provenance_finalized_at"] = utc_now()
+                persisted_signals.pop("provenance_error", None)
+                refreshed_state.signals = persisted_signals
+                refreshed_state.updated_at = utc_now()
+                db.commit()
+                return persisted_signals
+
+            persisted_signals = _with_retry_session("persist_submitted_answers_provenance", _persist_provenance_result)
+            logger.info("provenance_status_finalized attempt_id=%s status=%s", attempt_id, "ready")
             logger.info(
                 "provenance_persisted attempt_id=%s signals_keys=%s",
                 attempt_id,
@@ -2271,36 +2443,43 @@ def persist_submitted_answers(attempt_id: str, payload: SubmittedAnswersPayload)
                 len(answers),
                 ",".join(str(length) for length in answer_lengths[:12]),
             )
-            failure_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
-            failure_signals = dict(getattr(failure_state, "signals", None) or {})
-            failure_signals["submitted_answers"] = answers
-            failure_signals["provenance_status"] = "processing"
-            failure_signals["provenance_error"] = "transient_analysis_failure"
-            failure_state.signals = failure_signals
-            failure_state.updated_at = utc_now()
-            db.commit()
+            def _persist_failed_provenance(db):
+                failure_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
+                failure_signals = dict(getattr(failure_state, "signals", None) or {})
+                if failure_signals.get("answer_provenance"):
+                    return failure_signals
+                failure_signals["submitted_answers"] = answers
+                failure_signals["provenance_status"] = "failed"
+                failure_signals["provenance_finalized"] = True
+                failure_signals["provenance_error"] = "transient_analysis_failure"
+                failure_signals["provenance_finalized_at"] = utc_now()
+                failure_state.signals = failure_signals
+                failure_state.updated_at = utc_now()
+                db.commit()
+                return failure_signals
+
+            _with_retry_session("persist_submitted_answers_failed_state", _persist_failed_provenance)
+            logger.info("provenance_status_finalized attempt_id=%s status=%s", attempt_id, "failed")
             return {
-                "status": "processing",
+                "status": "failed",
                 "attempt_id": attempt_id,
                 "data": None,
-                "message": "Submitted answers were stored; provenance analysis is still finalizing.",
+                "message": "Submitted answers were stored, but provenance analysis could not be completed for this attempt.",
             }
     except HTTPException:
-        db.rollback()
         raise
     except Exception as exc:
-        db.rollback()
+        if _is_sqlite_lock_error(exc):
+            logger.error("sqlite_lock_retry_exhausted operation=%s attempt_id=%s", "persist_submitted_answers", attempt_id)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to persist submitted answers: {exc}") from exc
-    finally:
-        db.close()
 
 
 @app.get("/v1/live-risk/{attempt_id}")
 def get_live_risk(attempt_id: str, _user=Depends(require_reviewer)):
     db = SessionLocal()
     try:
-        cleanup_result = expire_stale_demo_attempts(db)
+        cleanup_result = expire_stale_demo_attempts_if_due(db)
         if cleanup_result["updated_count"]:
             db.commit()
     finally:
@@ -2482,7 +2661,7 @@ def get_attempt_report(attempt_id: str, _user=Depends(require_reviewer)):
 def get_attempt_report_status(attempt_id: str):
     db = SessionLocal()
     try:
-        cleanup_result = expire_stale_demo_attempts(db)
+        cleanup_result = expire_stale_demo_attempts_if_due(db)
         if cleanup_result["updated_count"]:
             db.commit()
         report_url = f"/demo/report/{attempt_id}" if _is_public_demo_attempt_id(attempt_id) else f"/?attemptId={attempt_id}"
@@ -2502,7 +2681,7 @@ def get_attempt_report_status(attempt_id: str):
                 },
             }
 
-        signals = dict(getattr(persisted_state, "signals", None) or {})
+        signals = _finalize_stale_provenance_state(db, persisted_state)
         provenance_result = dict(signals.get("answer_provenance") or {})
         provenance_status = str(signals.get("provenance_status") or "").strip().lower()
         submitted_answers = list(signals.get("submitted_answers") or [])
@@ -2514,7 +2693,7 @@ def get_attempt_report_status(attempt_id: str):
                 or "external_similarity_likelihood" in provenance_result
             )
         )
-        provenance_finalized = provenance_ready or provenance_status == "unavailable" or submitted_answers == []
+        provenance_finalized = provenance_ready or bool(signals.get("provenance_finalized")) or provenance_status in {"unavailable", "failed"} or submitted_answers == []
         report_exists = bool(
             getattr(persisted_state, "final_risk_level", None)
             or getattr(persisted_state, "final_risk_score", None) is not None
@@ -2562,7 +2741,7 @@ def get_public_demo_attempt_report(attempt_id: str):
 
     db = SessionLocal()
     try:
-        cleanup_result = expire_stale_demo_attempts(db)
+        cleanup_result = expire_stale_demo_attempts_if_due(db)
         if cleanup_result["updated_count"]:
             db.commit()
         persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
@@ -2572,6 +2751,9 @@ def get_public_demo_attempt_report(attempt_id: str):
                 "status": "processing",
                 "attempt_id": attempt_id,
             }
+
+        _finalize_stale_provenance_state(db, persisted_state)
+        persisted_state = db.query(AttemptState).filter(AttemptState.attempt_id == attempt_id).first()
 
         report = _build_attempt_report(db, attempt_id)
         if not report:
@@ -2595,7 +2777,7 @@ def get_public_demo_attempt_report(attempt_id: str):
         persisted_signals = dict(getattr(persisted_state, "signals", None) or {})
         submitted_answers = list((persisted_signals.get("submitted_answers") or []))
         saved_provenance_status = str(persisted_signals.get("provenance_status") or "").strip().lower()
-        provenance_finalized = provenance_ready or saved_provenance_status == "unavailable" or submitted_answers == []
+        provenance_finalized = provenance_ready or bool(persisted_signals.get("provenance_finalized")) or saved_provenance_status in {"unavailable", "failed"} or submitted_answers == []
         report_ready = bool(
             status_ready
             and (

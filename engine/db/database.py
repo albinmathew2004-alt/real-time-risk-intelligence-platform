@@ -1,5 +1,6 @@
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.pool import NullPool
 import os
 
 from app.runtime_env import load_local_env
@@ -22,7 +23,11 @@ engine_kwargs = {
 }
 if DATABASE_URL.startswith("sqlite:"):
     # Needed for FastAPI + SQLAlchemy in multi-threaded dev servers.
-    connect_args = {"check_same_thread": False}
+    connect_args = {
+        "check_same_thread": False,
+        "timeout": 30,
+    }
+    engine_kwargs["poolclass"] = NullPool
 else:
     engine_kwargs.update({
         "pool_recycle": int(os.getenv("DB_POOL_RECYCLE_SECONDS", "1800")),
@@ -32,6 +37,17 @@ else:
 
 
 engine = create_engine(DATABASE_URL, connect_args=connect_args, **engine_kwargs)
+
+if DATABASE_URL.startswith("sqlite:"):
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout=30000;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+        finally:
+            cursor.close()
 
 SessionLocal = sessionmaker(
     autocommit=False,

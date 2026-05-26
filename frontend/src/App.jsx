@@ -231,6 +231,8 @@ function getDemoCompletionFromLocation() {
       assessmentId: params.get("demoAssessmentId") || "",
       reportReady: params.get("demoReportReady") === "true",
       provenanceReady: params.get("demoProvenanceReady") === "true",
+      provenanceFinalized: params.get("demoProvenanceFinalized") === "true",
+      provenanceStatus: params.get("demoProvenanceStatus") || "",
     };
   } catch {
     return null;
@@ -247,6 +249,8 @@ function replaceDemoCompletionInLocation(completion) {
     "demoAssessmentId",
     "demoReportReady",
     "demoProvenanceReady",
+    "demoProvenanceFinalized",
+    "demoProvenanceStatus",
   ];
   keys.forEach((key) => url.searchParams.delete(key));
   if (completion?.attemptId) {
@@ -256,6 +260,8 @@ function replaceDemoCompletionInLocation(completion) {
     if (completion.assessmentId) url.searchParams.set("demoAssessmentId", completion.assessmentId);
     url.searchParams.set("demoReportReady", completion.reportReady ? "true" : "false");
     url.searchParams.set("demoProvenanceReady", completion.provenanceReady ? "true" : "false");
+    url.searchParams.set("demoProvenanceFinalized", completion.provenanceFinalized ? "true" : "false");
+    if (completion.provenanceStatus) url.searchParams.set("demoProvenanceStatus", completion.provenanceStatus);
   }
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
 }
@@ -1223,6 +1229,23 @@ function buildTechnicalDetails({ attempt, events, eventCount, firstEvent, lastEv
   ];
 }
 
+function buildHybridReasoningDetails(hybridReasoning = {}) {
+  const items = [];
+  if (hybridReasoning?.ml_advisory_level) {
+    items.push({ label: "ML Advisory Level", value: String(hybridReasoning.ml_advisory_level) });
+  }
+  if (hybridReasoning?.deterministic_risk_level) {
+    items.push({ label: "Deterministic Risk Level", value: String(hybridReasoning.deterministic_risk_level) });
+  }
+  if (hybridReasoning?.behavioral_correlation_strength) {
+    items.push({ label: "Behavioral Correlation", value: String(hybridReasoning.behavioral_correlation_strength) });
+  }
+  if (hybridReasoning?.escalation_reason) {
+    items.push({ label: "Escalation Reason", value: String(hybridReasoning.escalation_reason) });
+  }
+  return items;
+}
+
 function formatRelativeTime(value) {
   const date = getDisplayDate(value);
   if (!date) return "No activity";
@@ -1451,6 +1474,14 @@ function formatWorkflowStatus(value) {
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+}
+
+function formatAttemptLifecycleStatus(value) {
+  const normalized = String(value || "").toUpperCase();
+  if (!normalized) return "ONGOING";
+  if (normalized === "UNDER_REVIEW") return "UNDER REVIEW";
+  if (normalized === "IN_PROGRESS") return "IN PROGRESS";
+  return normalized.replace(/_/g, " ");
 }
 
 function buildRiskHistorySvg(points = []) {
@@ -2512,6 +2543,9 @@ function PublicDemoPage({ apiBaseUrl }) {
   const [reportReadyState, setReportReadyState] = useState(() => ({
     reportReady: Boolean(initialCompletion?.reportReady),
     provenanceReady: Boolean(initialCompletion?.provenanceReady),
+    provenanceFinalized: Boolean(initialCompletion?.provenanceFinalized),
+    provenanceStatus: String(initialCompletion?.provenanceStatus || ""),
+    reportUrl: initialCompletion?.attemptId ? `/demo/report/${encodeURIComponent(initialCompletion.attemptId)}` : "",
     timedOut: false,
   }));
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -2800,6 +2834,8 @@ function PublicDemoPage({ apiBaseUrl }) {
     let lastKnown = {
       reportReady: false,
       provenanceReady: false,
+      provenanceFinalized: false,
+      provenanceStatus: "processing",
       timedOut: false,
       reportUrl: reportUrlFallback,
     };
@@ -2818,19 +2854,26 @@ function PublicDemoPage({ apiBaseUrl }) {
         lastKnown = {
           reportReady: Boolean(statusData.report_exists),
           provenanceReady: Boolean(statusData.provenance_ready),
+          provenanceFinalized: Boolean(statusData.provenance_finalized),
+          provenanceStatus: String(statusData.provenance_status || "processing"),
           timedOut: false,
           reportUrl: statusData.report_url || reportUrlFallback,
         };
+        console.info("[Demo Submit Lifecycle]", {
+          event: "report_ready_state_changed",
+          attemptId: targetAttemptId,
+          reportReady: lastKnown.reportReady,
+          provenanceReady: lastKnown.provenanceReady,
+          provenanceFinalized: lastKnown.provenanceFinalized,
+          provenanceStatus: lastKnown.provenanceStatus,
+        });
         if (lastKnown.provenanceReady) {
           console.info("[Demo Submit Lifecycle]", { event: "provenance_ready", attemptId: targetAttemptId });
         }
         if (lastKnown.reportReady) {
           console.info("[Demo Submit Lifecycle]", { event: "report_ready", attemptId: targetAttemptId });
         }
-        if (lastKnown.reportReady && lastKnown.provenanceReady) {
-          return lastKnown;
-        }
-        if (lastKnown.reportReady && elapsedMs >= Math.min(timeoutMs - 2000, 9000)) {
+        if (lastKnown.reportReady && lastKnown.provenanceFinalized) {
           return lastKnown;
         }
       }
@@ -2924,7 +2967,10 @@ function PublicDemoPage({ apiBaseUrl }) {
         candidateEmail: candidateEmail.trim(),
         assessmentId: selectedAssessment.id,
         assessmentName: selectedAssessment.name,
-        idleTimeoutMs: 25000,
+        demoMode: true,
+        idleWarningMs: 18000,
+        idleTimeoutMs: 28000,
+        idleMouseMovementThresholdPx: 12,
         typingStopMs: 1200,
         devMode: false,
       });
@@ -3061,15 +3107,22 @@ function PublicDemoPage({ apiBaseUrl }) {
     queueSubmissionMessage("Generating reviewer report...", 1400);
 
     try {
+      window.RiskTelemetry?.beginSubmit?.();
       const flushBeforeSubmitStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       const preSubmitFlush = await window.RiskTelemetry?.flush?.({ timeoutMs: 6000, settleMs: 100 });
       const flushBeforeSubmitDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - flushBeforeSubmitStartedAt;
+      console.info("[Demo Submit Lifecycle]", {
+        event: "telemetry_stopped_before_submit",
+        attemptId,
+        flushBeforeSubmitMs: Math.round(flushBeforeSubmitDurationMs),
+      });
 
       window.RiskTelemetry?.endExam();
 
       const flushAfterSubmitStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       const finalFlush = await window.RiskTelemetry?.flush?.({ timeoutMs: 12000, settleMs: 125 });
       const flushAfterSubmitDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - flushAfterSubmitStartedAt;
+      window.RiskTelemetry?.destroy?.();
       console.info("[Demo Submit Lifecycle]", {
         event: "telemetry_flushed",
         attemptId,
@@ -3105,20 +3158,54 @@ function PublicDemoPage({ apiBaseUrl }) {
             marked_for_review: Boolean(markedForReview[question.id]),
           })),
       };
+      console.info("[Demo Provenance Submit]", {
+        event: "provenance_answers_submit_started",
+        attemptId,
+        answerCount: submittedAnswersPayload.answers.length,
+        answerTextLengths: submittedAnswersPayload.answers.map((item) => String(item.answer_text || "").length).slice(0, 12),
+      });
       const provenancePersistStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
-      const provenancePersistResult = await authJsonFetch(
-        `${apiBaseUrl.replace(/\/$/, "")}/v1/attempts/${attemptId}/answers`,
-        {
-          method: "POST",
-          body: submittedAnswersPayload,
-          timeoutMs: 12000,
-          retries: 1,
-          retryDelayMs: 800,
-        },
-      );
+      let provenancePersistResult = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        provenancePersistResult = await authJsonFetch(
+          `${apiBaseUrl.replace(/\/$/, "")}/v1/attempts/${attemptId}/answers`,
+          {
+            method: "POST",
+            body: submittedAnswersPayload,
+            timeoutMs: 12000,
+            retries: 0,
+          },
+        );
+        const failureMessage = String(provenancePersistResult?.data?.detail || provenancePersistResult?.data?.message || "");
+        const locked = /database is locked/i.test(failureMessage);
+        if (!locked || provenancePersistResult?.ok || attempt >= 2) {
+          break;
+        }
+        console.warn("[Demo Provenance Submit]", {
+          event: "provenance_answers_retry_after_lock",
+          attemptId,
+          retryAttempt: attempt + 1,
+        });
+        setSubmissionMessage("Retrying answer provenance persistence...");
+        setTelemetryStatus("Retrying answer provenance persistence...");
+        await new Promise((resolve) => window.setTimeout(resolve, 650 * (attempt + 1)));
+      }
       const provenancePersistDurationMs = (typeof performance !== "undefined" ? performance.now() : Date.now()) - provenancePersistStartedAt;
       if (!provenancePersistResult.ok) {
+        console.warn("[Demo Provenance Submit]", {
+          event: "provenance_answers_submit_failed",
+          attemptId,
+          answerCount: submittedAnswersPayload.answers.length,
+          message: provenancePersistResult.data?.detail || "Unable to persist submitted answers for provenance analysis.",
+        });
         console.warn("[Demo Provenance Persist]", provenancePersistResult.data?.detail || "Unable to persist submitted answers for provenance analysis.");
+      } else {
+        console.info("[Demo Provenance Submit]", {
+          event: "provenance_answers_submit_success",
+          attemptId,
+          answerCount: submittedAnswersPayload.answers.length,
+          status: provenancePersistResult.data?.status || "success",
+        });
       }
 
       const reportState = await waitForReportReadiness(attemptId);
@@ -3145,6 +3232,8 @@ function PublicDemoPage({ apiBaseUrl }) {
         assessmentId: selectedAssessment.id,
         reportReady: reportState.reportReady,
         provenanceReady: reportState.provenanceReady,
+        provenanceFinalized: reportState.provenanceFinalized,
+        provenanceStatus: reportState.provenanceStatus,
       });
     } catch (error) {
       clearProgressTimers();
@@ -3159,6 +3248,41 @@ function PublicDemoPage({ apiBaseUrl }) {
     setSubmissionBusy(false);
     setStage("submitted");
   }, [answers, apiBaseUrl, attemptId, candidateEmail, candidateId, candidateName, flatQuestions, markedForReview, selectedAssessment.id, selectedAssessment.name, submissionBusy, waitForReportReadiness]);
+
+  const candidateReportOpenReady = Boolean(
+    reportReadyState.reportReady
+    && reportReadyState.provenanceFinalized
+    && (
+      reportReadyState.provenanceReady
+      || ["failed", "unavailable"].includes(String(reportReadyState.provenanceStatus || "").toLowerCase())
+    )
+  );
+
+  useEffect(() => {
+    if (stage !== "submitted") return;
+    console.info("[Demo Submit Lifecycle]", {
+      event: "report_ready_state_changed",
+      attemptId,
+      reportReady: reportReadyState.reportReady,
+      provenanceReady: reportReadyState.provenanceReady,
+      provenanceFinalized: reportReadyState.provenanceFinalized,
+      provenanceStatus: reportReadyState.provenanceStatus || "processing",
+      timedOut: reportReadyState.timedOut,
+    });
+    if (candidateReportOpenReady) {
+      console.info("[Demo Submit Lifecycle]", {
+        event: "candidate_report_button_enabled",
+        attemptId,
+        provenanceStatus: reportReadyState.provenanceStatus || "ready",
+      });
+    } else {
+      console.info("[Demo Submit Lifecycle]", {
+        event: "candidate_report_button_hidden_waiting",
+        attemptId,
+        provenanceStatus: reportReadyState.provenanceStatus || "processing",
+      });
+    }
+  }, [attemptId, candidateReportOpenReady, reportReadyState.provenanceFinalized, reportReadyState.provenanceReady, reportReadyState.provenanceStatus, reportReadyState.reportReady, reportReadyState.timedOut, stage]);
 
   const handleDemoRun = useCallback(() => {
     if (!currentQuestion?.id) return;
@@ -3901,14 +4025,14 @@ function PublicDemoPage({ apiBaseUrl }) {
                     <p>Your telemetry, behavioral analysis, and reviewer-facing investigation report were successfully generated.</p>
                   </div>
                   <span className="demo-status-chip success">
-                    {reportReadyState.provenanceReady ? "Report ready" : reportReadyState.timedOut ? "Ready to review" : "Telemetry delivered"}
+                    {candidateReportOpenReady ? "Report ready" : "Finalizing report"}
                   </span>
                 </div>
                 <div className="public-demo-copy-block">
                   <p>
-                    {reportReadyState.timedOut
-                      ? "The assessment has been submitted successfully. Report generation took longer than expected, but you can still open the generated investigation view and reviewer console safely."
-                      : "The assessment session is now available in the reviewer workflow. Risk history, evidence, answer provenance findings, and correlated suspicious sequences can now be reviewed."}
+                    {candidateReportOpenReady
+                      ? "The assessment session is now available in the reviewer workflow. Risk history, evidence, answer provenance findings, and correlated suspicious sequences can now be reviewed."
+                      : "The assessment has been submitted successfully. The candidate-safe report is still being finalized and will become available automatically once report and provenance processing are complete."}
                   </p>
                 </div>
                 <div className="public-demo-summary-grid">
@@ -3934,14 +4058,27 @@ function PublicDemoPage({ apiBaseUrl }) {
                   </div>
                   <div className="public-demo-summary-item">
                     <span>Report Readiness</span>
-                    <strong>{reportReadyState.provenanceReady ? "Provenance ready" : reportReadyState.reportReady ? "Report available" : "Processing fallback complete"}</strong>
+                    <strong>
+                      {candidateReportOpenReady
+                        ? "Finalized"
+                        : reportReadyState.reportReady
+                          ? "Finalizing provenance"
+                          : "Generating report"}
+                    </strong>
                   </div>
                 </div>
                 <div className="public-demo-actions">
-                  <button className="workflow-action-btn primary" onClick={handleOpenCandidateReport} type="button">
-                    <Eye size={16} />
-                    View My Candidate Report
-                  </button>
+                  {candidateReportOpenReady ? (
+                    <button className="workflow-action-btn primary" onClick={handleOpenCandidateReport} type="button">
+                      <Eye size={16} />
+                      View My Candidate Report
+                    </button>
+                  ) : (
+                    <button className="workflow-action-btn primary" disabled type="button">
+                      <Eye size={16} />
+                      Preparing Candidate Report...
+                    </button>
+                  )}
                   <button className="workflow-action-btn" onClick={handleOpenReviewerConsole} type="button">
                     <ArrowUpRight size={16} />
                     Open Reviewer Console
@@ -5531,14 +5668,18 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   const finalDecision = reportData?.final_decision_title || decisionText(displayRisk);
   const summaryText = reportData?.recommendation || decisionSummaryLine(displayRisk);
   const whyScoreText = reportData?.why_this_score || reportAttempt?.explanation_text || reportAttempt?.explanation || reportSummary(reportAttempt);
-  const technicalDetails = buildTechnicalDetails({
+  const hybridReasoningDetails = buildHybridReasoningDetails(reportData?.hybrid_reasoning || {});
+  const technicalDetails = [
+    ...buildTechnicalDetails({
     attempt: reportAttempt,
     events,
     eventCount,
     firstEvent,
     lastEvent,
     durationSeconds,
-  });
+    }),
+    ...hybridReasoningDetails,
+  ];
   const headerMetadata = [
     { label: "Assessment", value: getAssessmentName(reportAttempt) },
     { label: "Attempt ID", value: reportAttempt?.attempt_id || "—" },
@@ -5567,6 +5708,15 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
   const topEvidenceRows = sortedEvidenceRows.slice(0, 5);
   const investigationInsights = buildInvestigationInsights(reportData, sortedEvidenceRows, displayRisk);
   const provenanceAnalysis = reportData?.provenance_analysis || null;
+  const provenanceStatus = String(reportData?.provenance_status || provenanceAnalysis?.provenance_status || "").toLowerCase();
+  const provenanceWaitingMessage = provenanceStatus === "processing"
+    ? "Answer provenance analysis is still finalizing."
+    : provenanceStatus === "failed"
+      ? "Answer provenance analysis could not be completed for this attempt."
+      : "Answer provenance analysis was not available for this attempt.";
+  const exportStatus = reportData?.attempt_status
+    ? formatAttemptLifecycleStatus(reportData.attempt_status)
+    : (activeCase?.status ? formatWorkflowStatus(activeCase.status) : status);
   const canExportPdf = ["ADMIN", "REVIEWER"].includes(String(currentUser?.role || "").toUpperCase());
 
   const handleExportPdf = useCallback(async () => {
@@ -5621,6 +5771,108 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
             </div>
           `).join("")
         : `<div class="pdf-empty">No reviewer workflow actions recorded yet.</div>`;
+      const provenanceHtml = provenanceAnalysis ? `
+        <div class="pdf-provenance">
+          <div class="pdf-scoreboard pdf-provenance-scoreboard">
+            <div class="pdf-score-item">
+              <span>Potential Reference Overlap</span>
+              <strong>${escapeHtml(provenanceAnalysis.external_similarity_likelihood || "LOW")}</strong>
+            </div>
+            <div class="pdf-score-item">
+              <span>Confidence</span>
+              <strong>${escapeHtml(formatNumber(provenanceAnalysis.confidence_score, 2))}</strong>
+            </div>
+            <div class="pdf-score-item">
+              <span>Possible Matches</span>
+              <strong>${escapeHtml(String((provenanceAnalysis.possible_reference_matches || []).length))}</strong>
+            </div>
+          </div>
+          <p>${escapeHtml(provenanceAnalysis.summary || "No meaningful reference overlap was detected in submitted answers.")}</p>
+          ${(provenanceAnalysis.possible_reference_matches || []).map((match) => `
+            <div class="pdf-match-card">
+              <div class="pdf-match-head">
+                <div>
+                  <strong>${escapeHtml(match.source_title || "Possible source match")}</strong>
+                  <small>
+                    ${escapeHtml(match.source_type || "Reference")}
+                    ${match.source_domain ? ` • ${escapeHtml(match.source_domain)}` : ""}
+                    ${match.question_title ? ` • ${escapeHtml(match.question_title)}` : ""}
+                  </small>
+                </div>
+                <span class="pdf-match-score">${escapeHtml(String(match.similarity_percent || 0))}% similarity</span>
+              </div>
+              <div class="pdf-detail-grid">
+                <div class="pdf-detail-row">
+                  <span>Match origin</span>
+                  <strong>${escapeHtml(match.match_origin || "controlled_corpus")}</strong>
+                </div>
+                <div class="pdf-detail-row">
+                  <span>Possible source match</span>
+                  <strong>${escapeHtml(match.match_reason || match.confidence_label || "Observed similarity pattern")}</strong>
+                </div>
+                ${match.retrieval_source ? `
+                  <div class="pdf-detail-row">
+                    <span>Retrieval source</span>
+                    <strong>${escapeHtml(match.retrieval_source)}</strong>
+                  </div>
+                ` : ""}
+                ${match.retrieval_timestamp ? `
+                  <div class="pdf-detail-row">
+                    <span>Retrieved</span>
+                    <strong>${escapeHtml(formatDateTime(match.retrieval_timestamp))}</strong>
+                  </div>
+                ` : ""}
+                ${match.retrieval_confidence != null ? `
+                  <div class="pdf-detail-row">
+                    <span>Retrieval confidence</span>
+                    <strong>${escapeHtml(formatNumber(match.retrieval_confidence, 2))}</strong>
+                  </div>
+                ` : ""}
+                ${match.semantic_enabled && match.semantic_similarity != null ? `
+                  <div class="pdf-detail-row">
+                    <span>Semantic similarity</span>
+                    <strong>${escapeHtml(formatNumber(match.semantic_similarity, 2))}${match.semantic_provider ? ` · ${escapeHtml(match.semantic_provider)}` : ""}</strong>
+                  </div>
+                ` : ""}
+                ${match.source_url ? `
+                  <div class="pdf-detail-row pdf-span-2">
+                    <span>Source URL</span>
+                    <strong>${escapeHtml(match.source_url)}</strong>
+                  </div>
+                ` : ""}
+              </div>
+              ${(provenanceAnalysis.generated_at || provenanceAnalysis.retrieval_duration_ms != null) ? `
+                <div class="pdf-detail-grid pdf-provenance-meta">
+                  ${provenanceAnalysis.generated_at ? `
+                    <div class="pdf-detail-row">
+                      <span>Generated</span>
+                      <strong>${escapeHtml(formatDateTime(provenanceAnalysis.generated_at))}</strong>
+                    </div>
+                  ` : ""}
+                  ${provenanceAnalysis.retrieval_duration_ms != null ? `
+                    <div class="pdf-detail-row">
+                      <span>Retrieval duration</span>
+                      <strong>${escapeHtml(String(Math.round(Number(provenanceAnalysis.retrieval_duration_ms) || 0)))} ms</strong>
+                    </div>
+                  ` : ""}
+                </div>
+              ` : ""}
+              <div class="pdf-grid-two pdf-provenance-preview-grid">
+                <div class="pdf-preview-card">
+                  <span>Candidate excerpt</span>
+                  <p>${escapeHtml(match.candidate_excerpt || "No candidate excerpt available.")}</p>
+                </div>
+                <div class="pdf-preview-card">
+                  <span>Reference excerpt</span>
+                  <p>${escapeHtml(match.reference_excerpt || "No reference excerpt available.")}</p>
+                </div>
+              </div>
+            </div>
+          `).join("")}
+          ${provenanceAnalysis.limitations_note ? `<p class="pdf-note">${escapeHtml(provenanceAnalysis.limitations_note)}</p>` : ""}
+          ${provenanceAnalysis.web_retrieval_disclaimer ? `<p class="pdf-note">${escapeHtml(provenanceAnalysis.web_retrieval_disclaimer)}</p>` : ""}
+        </div>
+      ` : `<p>${escapeHtml(provenanceWaitingMessage)}</p>`;
       const technicalHtml = technicalDetails.map((item) => `
         <div class="pdf-detail-row">
           <span>${escapeHtml(item.label)}</span>
@@ -5726,6 +5978,20 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
               .pdf-insight-list { margin: 0; padding-left: 18px; color: #334155; display: grid; gap: 8px; }
               .pdf-insight-list li { line-height: 1.45; }
               .pdf-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; }
+              .pdf-span-2 { grid-column: span 2; }
+              .pdf-provenance { display: grid; gap: 14px; }
+              .pdf-provenance-scoreboard { margin-bottom: 2px; }
+              .pdf-match-card { border-top: 1px solid #e2e8f0; padding-top: 14px; page-break-inside: avoid; }
+              .pdf-match-card:first-of-type { border-top: 0; padding-top: 0; }
+              .pdf-match-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; margin-bottom: 10px; }
+              .pdf-match-head strong { display: block; margin-bottom: 4px; font-size: 15px; }
+              .pdf-match-head small { display: block; color: #64748b; line-height: 1.45; }
+              .pdf-match-score { display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border-radius: 999px; background: #eef2ff; color: #4f46e5; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+              .pdf-preview-card { padding: 12px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; min-height: 100%; }
+              .pdf-preview-card span { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+              .pdf-preview-card p, .pdf-provenance p, .pdf-note { margin: 0; color: #334155; line-height: 1.55; }
+              .pdf-provenance-preview-grid { align-items: stretch; }
+              .pdf-note { color: #64748b; font-size: 12px; }
               .pdf-empty { padding: 12px 0; color: #64748b; }
               .pdf-generated { margin-top: 18px; color: #64748b; font-size: 12px; }
             </style>
@@ -5737,7 +6003,7 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
                 <div class="pdf-summary-card">
                   <div class="pdf-badges">
                     <span class="pdf-badge risk">${escapeHtml(displayRisk)} Risk</span>
-                    <span class="pdf-badge status">${escapeHtml(status)}</span>
+                    <span class="pdf-badge status">${escapeHtml(exportStatus)}</span>
                   </div>
                   <div class="pdf-title">${escapeHtml(candidateName)}</div>
                   <p class="pdf-subtitle">${escapeHtml(candidateEmail)}</p>
@@ -5768,6 +6034,11 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
               <section class="pdf-section">
                 <h2>Most Suspicious Behaviors Observed</h2>
                 <ul class="pdf-insight-list">${insightsHtml}</ul>
+              </section>
+
+              <section class="pdf-section">
+                <h2>Answer Provenance Intelligence</h2>
+                ${provenanceHtml}
               </section>
 
               <section class="pdf-section">
@@ -5869,9 +6140,12 @@ function ReportPage({ selected, selectedCase, caseAccessError, token, currentUse
     investigationInsights,
     liveRisk,
     overviewItems,
+    provenanceAnalysis,
+    provenanceWaitingMessage,
     reportData,
     reportLoading,
     selected?.attempt_id,
+    exportStatus,
     status,
     strongestReason,
     summaryText,
@@ -6328,14 +6602,37 @@ function InvestigationInsightsCard({ insights, riskLevel, title = "Most Suspicio
   );
 }
 
+function ProvenanceExcerpt({ label, text }) {
+  const excerpt = String(text || "").trim();
+  const shouldCollapse = excerpt.length > 220;
+  const preview = shouldCollapse ? `${excerpt.slice(0, 220).trimEnd()}...` : excerpt;
+
+  return (
+    <article>
+      <span>{label}</span>
+      <p>{preview || `No ${label.toLowerCase()} available.`}</p>
+      {shouldCollapse ? (
+        <details className="provenance-full-excerpt">
+          <summary>View full excerpt</summary>
+          <div>{excerpt}</div>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
 function ProvenanceIntelligenceCard({
   provenanceAnalysis,
   waitingMessage = "Waiting for post-submission answer provenance analysis.",
+  isProcessing = false,
 }) {
   return (
     <section className="investigation-card provenance-intelligence-card">
       <div className="report-card-head accent">
-        <h3>Answer Provenance Intelligence</h3>
+        <div className="provenance-card-heading">
+          <h3>Answer Provenance Intelligence</h3>
+          {isProcessing ? <span className="provenance-status-badge">Processing provenance analysis...</span> : null}
+        </div>
       </div>
       {provenanceAnalysis ? (
         <div className="provenance-intelligence-body">
@@ -6369,6 +6666,12 @@ function ProvenanceIntelligenceCard({
             {provenanceAnalysis.web_retrieval_disclaimer ? (
               <p className="provenance-limitations-note">{provenanceAnalysis.web_retrieval_disclaimer}</p>
             ) : null}
+            {(provenanceAnalysis.generated_at || provenanceAnalysis.retrieval_duration_ms != null) ? (
+              <div className="provenance-meta-inline">
+                {provenanceAnalysis.generated_at ? <span>Generated {formatDateTime(provenanceAnalysis.generated_at)}</span> : null}
+                {provenanceAnalysis.retrieval_duration_ms != null ? <span>Retrieval {Math.round(Number(provenanceAnalysis.retrieval_duration_ms) || 0)} ms</span> : null}
+              </div>
+            ) : null}
           </div>
           {(provenanceAnalysis.behavioral_correlation || []).length ? (
             <div className="provenance-correlation-list">
@@ -6400,14 +6703,8 @@ function ProvenanceIntelligenceCard({
                   </summary>
                   <div className="provenance-match-body">
                     <div className="provenance-preview-grid">
-                      <article>
-                        <span>Candidate Excerpt</span>
-                        <p>{match.candidate_excerpt || "No candidate excerpt available."}</p>
-                      </article>
-                      <article>
-                        <span>Reference Excerpt</span>
-                        <p>{match.reference_excerpt || "No reference excerpt available."}</p>
-                      </article>
+                      <ProvenanceExcerpt label="Candidate Excerpt" text={match.candidate_excerpt} />
+                      <ProvenanceExcerpt label="Reference Excerpt" text={match.reference_excerpt} />
                     </div>
                     <div className="provenance-match-footer">
                       <div>
@@ -6479,6 +6776,7 @@ function ProvenanceIntelligenceCard({
         </div>
       ) : (
         <div className="provenance-empty-state">
+          {isProcessing ? <span className="provenance-status-badge">Processing provenance analysis...</span> : null}
           <p>{waitingMessage}</p>
         </div>
       )}
@@ -6567,6 +6865,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           const nextAttemptStatus = String(payload?.attempt_status || payload?.data?.attempt_status || "").toUpperCase();
           const nextProvenanceReady = Boolean(payload?.provenance_ready ?? payload?.data?.provenance_ready);
           const nextProvenanceFinalized = Boolean(payload?.provenance_finalized ?? payload?.data?.provenance_finalized);
+          const nextProvenanceStatus = String(payload?.data?.provenance_status || payload?.provenance_status || "").toLowerCase();
           const nextState = {
             loading: !nextProvenanceFinalized,
             ready: true,
@@ -6593,6 +6892,13 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
             provenanceReady: nextProvenanceReady,
             provenanceFinalized: nextProvenanceFinalized,
           });
+          if (nextProvenanceFinalized && !nextProvenanceReady) {
+            console.info("[Candidate Report]", {
+              event: "candidate_report_unblocked_without_provenance",
+              attemptId,
+              provenanceStatus: nextProvenanceStatus || "unavailable",
+            });
+          }
           setReportState(nextState);
           if (nextProvenanceFinalized) {
             stableReadySeen = true;
@@ -6677,15 +6983,32 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
   }, [apiBaseUrl, attemptId]);
 
   useEffect(() => {
-    if (!reportState.ready || !reportState.data) return;
+    const provenanceStatusForLog = reportState.data?.provenance_status || "processing";
+    const processingDurationMs = reportState.data?.answer_provenance?.generated_at
+      ? Math.max(0, Date.now() - new Date(reportState.data.answer_provenance.generated_at).getTime())
+      : null;
     console.info("[Candidate Report]", {
-      event: "candidate_report_ready_state",
+      event: "provenance_render_state",
       attemptId,
       ready: reportState.ready,
-      attemptStatus: reportState.attemptStatus,
+      provenanceStatus: provenanceStatusForLog,
       provenanceReady: reportState.provenanceReady,
       provenanceFinalized: reportState.provenanceFinalized,
+      provenanceProcessingDurationMs: processingDurationMs,
     });
+    if (!reportState.ready || !reportState.data) return;
+    console.info("[Candidate Report]", {
+      event: "provenance_match_count",
+      attemptId,
+      count: (reportState.data?.answer_provenance?.possible_reference_matches || []).length,
+    });
+    if (processingDurationMs != null) {
+      console.info("[Candidate Report]", {
+        event: "provenance_processing_duration_ms",
+        attemptId,
+        durationMs: processingDurationMs,
+      });
+    }
     console.info("[Candidate Report]", {
       event: "candidate_report_rendered",
       attemptId,
@@ -6695,13 +7018,16 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
 
   const report = reportState.data;
   const provenance = report?.answer_provenance || null;
+  const candidateHybridReasoningDetails = buildHybridReasoningDetails(report?.hybrid_reasoning || {});
   const riskLevel = report?.risk_level || "LOW";
   const status = String(reportState.attemptStatus || report?.attempt_status || "SUBMITTED").toUpperCase();
   const statusReadyForExport = !["ONGOING", "IN_PROGRESS", ""].includes(status);
   const provenanceStatus = report?.provenance_status || provenance?.provenance_status || "processing";
   const provenanceWaitingMessage = provenanceStatus === "processing"
     ? "Answer provenance analysis is still finalizing."
-    : "Answer provenance analysis was not available for this attempt.";
+    : provenanceStatus === "failed"
+      ? "Answer provenance analysis could not be completed for this attempt."
+      : "Answer provenance analysis was not available for this attempt.";
   const pdfExportReady = Boolean(reportState.ready && report && statusReadyForExport && reportState.provenanceFinalized);
   const overviewItems = buildViolationOverviewFromCounts(report?.violation_summary || {});
   const candidateInsights = (report?.most_suspicious_behaviors || []).length
@@ -6715,6 +7041,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
     { label: "Submitted", value: formatDateTime(report?.submitted_at) },
     { label: "Latest Activity", value: formatDateTime(report?.latest_event_at) },
     { label: "Event Count", value: String(report?.event_count ?? 0) },
+    ...candidateHybridReasoningDetails,
   ];
   const candidateMetadata = [
     { label: "Assessment", value: report?.assessment_name || "Assessment" },
@@ -6725,6 +7052,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
   const executiveSummaryPoints = [
     report?.summary_text,
     report?.strongest_reason ? `Strongest reason: ${report.strongest_reason}` : "",
+    report?.hybrid_reasoning?.escalation_reason ? `Hybrid reasoning: ${report.hybrid_reasoning.escalation_reason}` : "",
     report?.behavioral_summary && report?.behavioral_summary !== report?.summary_text ? report.behavioral_summary : "",
   ].filter(Boolean);
   const scorebandItems = [
@@ -6989,7 +7317,11 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
 
             <InvestigationInsightsCard insights={candidateInsights} riskLevel={riskLevel} />
 
-            <ProvenanceIntelligenceCard provenanceAnalysis={provenance} waitingMessage={provenanceWaitingMessage} />
+            <ProvenanceIntelligenceCard
+              provenanceAnalysis={provenance}
+              waitingMessage={provenanceWaitingMessage}
+              isProcessing={provenanceStatus === "processing"}
+            />
 
             <div className="report-main-row candidate-report-main-grid">
               <EvidenceTable rows={candidateEvidenceRows} loading={reportState.loading} />
@@ -7179,6 +7511,22 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
                           </div>
                         ) : null}
                       </div>
+                      {(provenance.generated_at || provenance.retrieval_duration_ms != null) ? (
+                        <div className="pdf-report-detail-grid">
+                          {provenance.generated_at ? (
+                            <div>
+                              <span>Generated</span>
+                              <strong>{formatDateTime(provenance.generated_at)}</strong>
+                            </div>
+                          ) : null}
+                          {provenance.retrieval_duration_ms != null ? (
+                            <div>
+                              <span>Retrieval duration</span>
+                              <strong>{Math.round(Number(provenance.retrieval_duration_ms) || 0)} ms</strong>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
                       <div className="pdf-report-preview-grid">
                         <article>
                           <span>Candidate excerpt</span>

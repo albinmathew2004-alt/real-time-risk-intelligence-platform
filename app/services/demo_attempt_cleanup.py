@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -20,6 +21,9 @@ DEMO_ATTEMPT_PREFIXES = tuple(
 SUBMISSION_EVENT_TYPES = {"exam_submitted", "assessment_submitted", "submit", "completed"}
 ACTIVE_ATTEMPT_STATUSES = {"ONGOING", "IN_PROGRESS"}
 TERMINAL_ATTEMPT_STATUSES = {"SUBMITTED", "UNDER_REVIEW", "RESOLVED", "COMPLETED", DEMO_EXPIRED_STATUS, DEMO_ABANDONED_STATUS}
+DEMO_CLEANUP_MIN_INTERVAL_SECONDS = max(5, int(os.getenv("DEMO_CLEANUP_MIN_INTERVAL_SECONDS", "30")))
+_last_cleanup_run_at: datetime | None = None
+_cleanup_lock = Lock()
 
 
 def _utcnow() -> datetime:
@@ -106,3 +110,38 @@ def expire_stale_demo_attempts(
         "status": DEMO_EXPIRED_STATUS,
         "message": DEMO_EXPIRED_MESSAGE,
     }
+
+
+def expire_stale_demo_attempts_if_due(
+    db,
+    *,
+    timeout_minutes: int | None = None,
+    prefixes: Iterable[str] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    global _last_cleanup_run_at
+
+    now = _utcnow()
+    with _cleanup_lock:
+        if not force and _last_cleanup_run_at and (now - _last_cleanup_run_at).total_seconds() < DEMO_CLEANUP_MIN_INTERVAL_SECONDS:
+            return {
+                "updated_count": 0,
+                "updated_attempt_ids": [],
+                "timeout_minutes": max(1, int(timeout_minutes or DEMO_STALE_TIMEOUT_MINUTES)),
+                "status": DEMO_EXPIRED_STATUS,
+                "message": DEMO_EXPIRED_MESSAGE,
+                "skipped": True,
+                "next_due_seconds": max(0, DEMO_CLEANUP_MIN_INTERVAL_SECONDS - int((now - _last_cleanup_run_at).total_seconds())),
+            }
+
+        result = expire_stale_demo_attempts(
+            db,
+            timeout_minutes=timeout_minutes,
+            prefixes=prefixes,
+        )
+        _last_cleanup_run_at = now
+        return {
+            **result,
+            "skipped": False,
+            "next_due_seconds": DEMO_CLEANUP_MIN_INTERVAL_SECONDS,
+        }
