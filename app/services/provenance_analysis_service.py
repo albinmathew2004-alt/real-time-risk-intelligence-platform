@@ -471,6 +471,9 @@ class TavilySearchProvider:
         candidates: list[RetrievedWebCandidate] = []
         seen_urls: set[str] = set()
         fetch_stats = {"fetch_success_count": 0, "fetch_failure_count": 0}
+        snippet_lengths: list[int] = []
+        extracted_lengths: list[int] = []
+        extracted_chunk_counts: list[int] = []
         logger.info("web_retrieval_provider_used provider=%s query_count=%s", self.provider_name, len(queries[:3]))
         try:
             for query in queries[:3]:
@@ -502,7 +505,10 @@ class TavilySearchProvider:
 
                     raw_content = str(result.get("raw_content") or "").strip()
                     content_snippet = str(result.get("content") or result.get("snippet") or "").strip()
-                    snippet_lengths.append(len(content_snippet))
+                    try:
+                        snippet_lengths.append(len(content_snippet))
+                    except Exception:
+                        pass
                     source_title = str(result.get("title") or "Possible web reference").strip() or "Possible web reference"
                     cleaned_provider_text = _clean_provider_text(raw_content or content_snippet)
                     normalized_text = _normalize_text(cleaned_provider_text)
@@ -527,12 +533,18 @@ class TavilySearchProvider:
                             continue
                         source_candidate = extracted
                         extraction_status = "content_extracted"
-                        extracted_lengths.append(len(source_candidate.normalized_text or ""))
-                        extracted_chunk_counts.append(len(_chunk_text(source_candidate.normalized_text or "")))
+                        try:
+                            extracted_lengths.append(len(source_candidate.normalized_text or ""))
+                            extracted_chunk_counts.append(len(_chunk_text(source_candidate.normalized_text or "")))
+                        except Exception:
+                            pass
                     else:
                         fetch_stats["fetch_success_count"] += 1
-                        extracted_lengths.append(len(normalized_text))
-                        extracted_chunk_counts.append(len(_chunk_text(cleaned_provider_text)))
+                        try:
+                            extracted_lengths.append(len(normalized_text))
+                            extracted_chunk_counts.append(len(_chunk_text(cleaned_provider_text)))
+                        except Exception:
+                            pass
                         source_candidate = SourceCandidate(
                             source_title=source_title,
                             source_url=source_url,
@@ -1928,11 +1940,15 @@ def analyze_answer_provenance(
         validation_mode,
     )
     matches: list[dict[str, Any]] = []
+    answer_chunk_count = 0
+    controlled_corpus_candidate_count = 0
+    controlled_corpus_surviving_threshold = 0
 
     for answer in answers:
         answer_text = str(answer.get("answer_text") or "").strip()
         if len(answer_text) < 20:
             continue
+        answer_chunk_count += len(_chunk_text(answer_text))
 
         answer_assessment_type = str(answer.get("assessment_type") or assessment_name or "").strip()
         logger.info("using_controlled_corpus_fallback attempt_id=%s question_id=%s", attempt_id, str(answer.get("question_id") or ""))
@@ -1949,6 +1965,7 @@ def analyze_answer_provenance(
         except Exception as exc:
             _log_provenance_stage_failure(attempt_id=attempt_id, stage_name="controlled_corpus_ranking", exc=exc)
             relevant_references = corpus
+        controlled_corpus_candidate_count += len(relevant_references)
 
         for reference in relevant_references:
             try:
@@ -1962,6 +1979,7 @@ def analyze_answer_provenance(
                 )
                 if similarity < minimum_match_threshold:
                     continue
+                controlled_corpus_surviving_threshold += 1
                 matches.append(
                     _build_match_payload(
                         attempt_id=attempt_id,
@@ -1999,6 +2017,11 @@ def analyze_answer_provenance(
         0,
         int((datetime.now(timezone.utc) - retrieval_started_at).total_seconds() * 1000),
     )
+    retrieval_results = list(retrieval_hooks.get("results") or [])
+    generated_queries = list(retrieval_hooks.get("generated_queries") or [])
+    retrieved_candidate_count = sum(len(result.get("candidates") or []) for result in retrieval_results if isinstance(result, dict))
+    if not retrieved_candidate_count:
+        logger.info("web_retrieval_zero_usable_candidates attempt_id=%s generated_query_count=%s", attempt_id, len(generated_queries))
     matches.extend(retrieved_matches)
     pre_dedupe_matches = len(matches)
     matches = _dedupe_matches(matches)
@@ -2034,6 +2057,16 @@ def analyze_answer_provenance(
         web_retrieval_match_count,
         round(float(top_web_score), 4),
     )
+    logger.info(
+        "provenance_match_diagnostics attempt_id=%s generated_query_count=%s answer_chunk_count=%s retrieved_candidate_count=%s controlled_corpus_candidate_count=%s candidates_surviving_threshold=%s final_ranked_match_count=%s",
+        attempt_id,
+        len(generated_queries),
+        answer_chunk_count,
+        retrieved_candidate_count,
+        controlled_corpus_candidate_count,
+        controlled_corpus_surviving_threshold + web_retrieval_match_count,
+        len(top_matches),
+    )
     if web_retrieval_match_count > 0 and final_match_origins == "controlled_corpus":
         logger.info(
             "web_retrieval_ranking_filtered attempt_id=%s reason=web_score_too_low_or_deduped top_web_score=%s top_corpus_score=%s dedupe_removed_count=%s",
@@ -2062,6 +2095,15 @@ def analyze_answer_provenance(
         final_match_origins,
         dedupe_removed_count,
     )
+    if not top_matches:
+        logger.info(
+            "provenance_no_matches_reason attempt_id=%s generated_query_count=%s retrieved_candidate_count=%s controlled_corpus_executed=%s threshold=%s",
+            attempt_id,
+            len(generated_queries),
+            retrieved_candidate_count,
+            controlled_corpus_candidate_count > 0,
+            minimum_match_threshold,
+        )
     logger.info(
         "provenance_matches_found attempt_id=%s total_matches=%s top_matches=%s",
         attempt_id,
