@@ -454,15 +454,38 @@ body::-webkit-scrollbar-thumb:hover,
   opacity: 1;
   visibility: visible;
   overflow: visible;
+  height: auto;
+  min-height: 0;
+  max-height: none;
 }
 
 .pdf-export-mode .pdf-report-shell {
   width: 794px;
   box-sizing: border-box;
-  padding: 28px 26px 24px;
+  padding: 24px 24px 72px;
   background: #ffffff;
   color: #0f172a;
   font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 12px;
+  line-height: 1.45;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  overflow: visible;
+}
+
+.pdf-export-mode,
+.pdf-export-mode * {
+  box-sizing: border-box;
+  max-width: 100%;
+  overflow: visible;
+}
+
+.pdf-export-mode .pdf-report-shell,
+.pdf-export-mode .pdf-report-shell * {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .pdf-export-mode .pdf-report-header,
@@ -475,7 +498,9 @@ body::-webkit-scrollbar-thumb:hover,
 }
 
 .pdf-export-mode .pdf-report-header {
-  padding: 24px 24px 20px;
+  padding: 20px 20px 18px;
+  break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .pdf-export-mode .pdf-report-brand-row {
@@ -495,8 +520,8 @@ body::-webkit-scrollbar-thumb:hover,
 }
 
 .pdf-export-mode .pdf-report-brand-copy h1 {
-  margin: 8px 0 8px;
-  font-size: 30px;
+  margin: 6px 0 7px;
+  font-size: 26px;
   line-height: 1.15;
   color: #0f172a;
 }
@@ -508,7 +533,7 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-note {
   margin: 0;
   color: #475569;
-  line-height: 1.62;
+  line-height: 1.5;
 }
 
 .pdf-export-mode .pdf-report-badges {
@@ -553,11 +578,11 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px 18px;
+  gap: 10px 14px;
 }
 
 .pdf-export-mode .pdf-report-meta-grid {
-  margin-top: 18px;
+  margin-top: 14px;
 }
 
 .pdf-export-mode .pdf-report-meta-item span,
@@ -566,9 +591,9 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-score-card span,
 .pdf-export-mode .pdf-report-preview-grid span {
   display: block;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
   color: #64748b;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -578,31 +603,46 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-detail-grid strong {
   display: block;
   color: #0f172a;
-  font-size: 14px;
-  line-height: 1.45;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .pdf-export-mode .pdf-report-section,
 .pdf-export-mode .pdf-report-panel {
-  padding: 18px 20px;
-  margin-top: 16px;
+  padding: 14px 16px;
+  margin-top: 12px;
+  min-height: 0;
+  height: auto;
+  max-height: none;
+}
+
+.pdf-export-mode .pdf-report-section {
+  break-inside: auto;
+  page-break-inside: auto;
+}
+
+.pdf-export-mode .pdf-report-section:not(.pdf-report-section-large):not(.pdf-report-grid-two),
+.pdf-export-mode .pdf-report-panel {
   break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .pdf-export-mode .pdf-report-section-head {
-  margin-bottom: 14px;
+  margin-bottom: 10px;
+  break-after: avoid;
+  page-break-after: avoid;
 }
 
 .pdf-export-mode .pdf-report-section-head h2 {
   margin: 0;
   color: #0f172a;
-  font-size: 19px;
+  font-size: 16px;
 }
 
 .pdf-export-mode .pdf-report-score-grid,
 .pdf-export-mode .pdf-report-overview-grid {
   display: grid;
-  gap: 12px;
+  gap: 9px;
 }
 
 .pdf-export-mode .pdf-report-score-grid {
@@ -615,25 +655,40 @@ body::-webkit-scrollbar-thumb:hover,
 
 .pdf-export-mode .pdf-report-score-card,
 .pdf-export-mode .pdf-report-overview-card {
-  padding: 14px;
-  border-radius: 14px;
+  padding: 11px;
+  border-radius: 12px;
   border: 1px solid #e2e8f0;
   background: #f8fafc;
+  min-height: 0;
+  height: auto;
+  break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .pdf-export-mode .pdf-report-score-card strong,
 .pdf-export-mode .pdf-report-overview-card strong {
   display: block;
   color: #0f172a;
-  font-size: 20px;
+  font-size: 17px;
   line-height: 1.28;
 }
 
 .pdf-export-mode .pdf-report-overview-card small {
   display: block;
-  margin-top: 6px;
+  margin-top: 4px;
   color: #64748b;
-  font-size: 12px;
+  font-size: 11px;
+}
+
+.pdf-export-mode .pdf-report-empty-message {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  background: #f8fafc;
+  color: #475569;
+  line-height: 1.5;
 }
 
 .pdf-export-mode .pdf-report-score-card.tone-high,
@@ -661,7 +716,7 @@ body::-webkit-scrollbar-thumb:hover,
 
 .pdf-export-mode .pdf-report-bullet-list {
   display: grid;
-  gap: 10px;
+  gap: 7px;
 }
 
 .pdf-export-mode .pdf-report-bullet {
@@ -674,7 +729,7 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-bullet-dot {
   width: 9px;
   height: 9px;
-  margin-top: 8px;
+  margin-top: 6px;
   border-radius: 999px;
   background: #60a5fa;
 }
@@ -684,11 +739,11 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-bullet-dot.low { background: #3b82f6; }
 
 .pdf-export-mode .pdf-report-match-card {
-  padding-top: 14px;
-  margin-top: 14px;
+  padding-top: 12px;
+  margin-top: 12px;
   border-top: 1px solid #e2e8f0;
-  break-inside: avoid;
-  page-break-inside: avoid;
+  break-inside: auto;
+  page-break-inside: auto;
 }
 
 .pdf-export-mode .pdf-report-match-card:first-of-type {
@@ -701,41 +756,47 @@ body::-webkit-scrollbar-thumb:hover,
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 14px;
+  gap: 10px;
+}
+
+.pdf-export-mode .pdf-report-match-head > div {
+  min-width: 0;
 }
 
 .pdf-export-mode .pdf-report-match-head strong {
   display: block;
   color: #0f172a;
-  font-size: 15px;
+  font-size: 13px;
 }
 
 .pdf-export-mode .pdf-report-match-head small {
   display: block;
-  margin-top: 5px;
+  margin-top: 4px;
   color: #64748b;
 }
 
 .pdf-export-mode .pdf-report-preview-grid,
 .pdf-export-mode .pdf-report-grid-two {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px 16px;
+  grid-template-columns: 1fr;
+  gap: 10px;
 }
 
 .pdf-export-mode .pdf-report-preview-grid {
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
 .pdf-export-mode .pdf-report-preview-grid article {
-  padding: 12px 14px;
-  border-radius: 14px;
+  padding: 10px 12px;
+  border-radius: 12px;
   border: 1px solid #e2e8f0;
   background: #f8fafc;
+  break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .pdf-export-mode .pdf-report-detail-grid {
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
 .pdf-export-mode .pdf-report-detail-grid .span-2 {
@@ -745,30 +806,38 @@ body::-webkit-scrollbar-thumb:hover,
 .pdf-export-mode .pdf-report-table {
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
+  break-inside: auto;
+  page-break-inside: auto;
 }
 
 .pdf-export-mode .pdf-report-table th,
 .pdf-export-mode .pdf-report-table td {
-  padding: 10px 8px;
+  padding: 7px 6px;
   border-top: 1px solid #e2e8f0;
   text-align: left;
   vertical-align: top;
-  font-size: 13px;
+  font-size: 11px;
   color: #334155;
+}
+
+.pdf-export-mode .pdf-report-table tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
 }
 
 .pdf-export-mode .pdf-report-table th {
   border-top: 0;
   color: #64748b;
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
 .pdf-export-mode .pdf-report-note {
-  margin-top: 14px;
-  font-size: 12px;
+  margin-top: 10px;
+  font-size: 11px;
 }
 
 @media (max-width: 980px) {
@@ -3189,6 +3258,16 @@ body {
 .violation-overview-card em.high { color: #ff8ba1; }
 .violation-overview-card em.medium { color: #ffc94f; }
 .violation-overview-card em.low { color: #69da94; }
+
+.violation-overview-empty {
+  margin: 0 18px 22px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.024);
+  color: #c2d0e3;
+  line-height: 1.5;
+}
 
 .evidence-card-shell,
 .reviewer-workflow-card,

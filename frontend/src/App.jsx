@@ -60,7 +60,7 @@ import InvestigationHeader from "./components/InvestigationHeader";
 import ReviewerWorkflow from "./components/ReviewerWorkflow";
 import RiskHistoryChart from "./components/RiskHistoryChart";
 import TechnicalDetails from "./components/TechnicalDetails";
-import ViolationOverview from "./components/ViolationOverview";
+import ViolationOverview, { EMPTY_CANDIDATE_MESSAGE, getVisibleViolationOverviewItems } from "./components/ViolationOverview";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 const DEMO_SIGNAL_TOASTS_ENABLED = String(
@@ -78,6 +78,7 @@ const DEMO_SIGNAL_TOAST_COOLDOWN_MS = 4500;
 const DEMO_SIGNAL_TOAST_LIMIT = 2;
 const DEMO_BROWSER_NOTIFICATION_COOLDOWN_MS = 10000;
 const DEMO_BROWSER_NOTIFICATION_DUPLICATE_MS = 20000;
+const TERMINAL_PROVENANCE_STATUSES = new Set(["ready", "failed", "unavailable"]);
 const DEMO_BROWSER_NOTIFICATION_KEYS = new Set([
   "focus_loss",
   "visibility_hidden",
@@ -983,6 +984,7 @@ function buildViolationOverview(attempt, events) {
       title: "Clipboard",
       subtitle: "Copy/Paste Count",
       value: String(clipboardCount),
+      signalValue: clipboardCount,
       severity: getSeverityFromCount(clipboardCount, 1, 5),
     },
     {
@@ -990,6 +992,7 @@ function buildViolationOverview(attempt, events) {
       title: "Tab Switches",
       subtitle: "Count",
       value: String(tabSwitchCount),
+      signalValue: tabSwitchCount,
       severity: getSeverityFromCount(tabSwitchCount, 2, 6),
     },
     {
@@ -997,6 +1000,7 @@ function buildViolationOverview(attempt, events) {
       title: "Blur Events",
       subtitle: "Focus Loss Count",
       value: String(blurEvents),
+      signalValue: blurEvents,
       severity: getSeverityFromCount(blurEvents, 2, 6),
     },
     {
@@ -1004,6 +1008,7 @@ function buildViolationOverview(attempt, events) {
       title: "Idle Time",
       subtitle: "Max",
       value: idleMaxSeconds > 0 ? formatDuration(idleMaxSeconds) : "00:00",
+      signalValue: idleMaxSeconds,
       severity: idleMaxSeconds >= 180 ? "MEDIUM" : idleMaxSeconds > 0 ? "LOW" : "LOW",
     },
     {
@@ -1011,6 +1016,7 @@ function buildViolationOverview(attempt, events) {
       title: "Rapid Answer Bursts",
       subtitle: "Fast Sequence Count",
       value: String(rapidAnswerBursts),
+      signalValue: rapidAnswerBursts,
       severity: getSeverityFromCount(rapidAnswerBursts, 2, 5),
     },
     {
@@ -1018,6 +1024,7 @@ function buildViolationOverview(attempt, events) {
       title: "Suspicious Sequences",
       subtitle: "Correlated Patterns",
       value: String(suspiciousSequences),
+      signalValue: suspiciousSequences,
       severity: getSeverityFromCount(suspiciousSequences, 1, 3),
     },
     {
@@ -1025,6 +1032,7 @@ function buildViolationOverview(attempt, events) {
       title: "Typing Behavior Anomalies",
       subtitle: "Typing Pattern Irregularities",
       value: String(typingBehaviorAnomalies),
+      signalValue: typingBehaviorAnomalies,
       severity: typingBehaviorAnomalies >= 3 ? "MEDIUM" : typingBehaviorAnomalies > 0 ? "LOW" : "LOW",
     },
     {
@@ -1032,6 +1040,7 @@ function buildViolationOverview(attempt, events) {
       title: "Focus Loss Rate",
       subtitle: "Session Share",
       value: `${focusLossRate}%`,
+      signalValue: focusLossRate,
       severity: focusLossRate >= 25 ? "HIGH" : focusLossRate >= 10 ? "MEDIUM" : "LOW",
     },
   ].map((item) => ({
@@ -1044,6 +1053,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
   const clipboardCount = Number(counts.clipboard_count || 0);
   const tabSwitchCount = Number(counts.tab_switch_count || 0);
   const blurEvents = Number(counts.focus_blur_count || 0);
+  const idleSpikeCount = Number(counts.idle_spike_count || 0);
   const idleMaxSeconds = Number(counts.idle_max_duration_s || 0);
   const rapidAnswerBursts = Number(counts.rapid_answer_burst_count || 0);
   const suspiciousSequences = Number(counts.suspicious_sequence_count || 0);
@@ -1056,6 +1066,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Clipboard",
       subtitle: "Copy/Paste Count",
       value: String(clipboardCount),
+      signalValue: clipboardCount,
       severity: getSeverityFromCount(clipboardCount, 1, 5),
     },
     {
@@ -1063,6 +1074,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Tab Switches",
       subtitle: "Count",
       value: String(tabSwitchCount),
+      signalValue: tabSwitchCount,
       severity: getSeverityFromCount(tabSwitchCount, 2, 6),
     },
     {
@@ -1070,13 +1082,15 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Blur Events",
       subtitle: "Focus Loss Count",
       value: String(blurEvents),
+      signalValue: blurEvents,
       severity: getSeverityFromCount(blurEvents, 2, 6),
     },
     {
       key: "idle_time",
       title: "Idle Time",
-      subtitle: "Max",
-      value: idleMaxSeconds > 0 ? formatDuration(idleMaxSeconds) : "00:00",
+      subtitle: idleMaxSeconds > 0 ? "Max" : "Idle Spike Count",
+      value: idleMaxSeconds > 0 ? formatDuration(idleMaxSeconds) : String(idleSpikeCount),
+      signalValue: Math.max(idleMaxSeconds, idleSpikeCount),
       severity: idleMaxSeconds >= 300 ? "HIGH" : idleMaxSeconds >= 180 ? "MEDIUM" : "LOW",
     },
     {
@@ -1084,6 +1098,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Rapid Answer Bursts",
       subtitle: "Fast Sequence Count",
       value: String(rapidAnswerBursts),
+      signalValue: rapidAnswerBursts,
       severity: getSeverityFromCount(rapidAnswerBursts, 2, 5),
     },
     {
@@ -1091,6 +1106,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Suspicious Sequences",
       subtitle: "Correlated Patterns",
       value: String(suspiciousSequences),
+      signalValue: suspiciousSequences,
       severity: getSeverityFromCount(suspiciousSequences, 1, 3),
     },
     {
@@ -1098,6 +1114,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Typing Behavior Anomalies",
       subtitle: "Typing Pattern Irregularities",
       value: String(typingBehaviorAnomalies),
+      signalValue: typingBehaviorAnomalies,
       severity: typingBehaviorAnomalies >= 3 ? "MEDIUM" : typingBehaviorAnomalies > 0 ? "LOW" : "LOW",
     },
     {
@@ -1105,6 +1122,7 @@ function buildViolationOverviewFromCounts(counts = {}) {
       title: "Focus Loss Rate",
       subtitle: "Session Share",
       value: `${focusLossRate}%`,
+      signalValue: focusLossRate,
       severity: focusLossRate >= 25 ? "HIGH" : focusLossRate >= 10 ? "MEDIUM" : "LOW",
     },
   ].map((item) => ({
@@ -2873,7 +2891,7 @@ function PublicDemoPage({ apiBaseUrl }) {
         if (lastKnown.reportReady) {
           console.info("[Demo Submit Lifecycle]", { event: "report_ready", attemptId: targetAttemptId });
         }
-        if (lastKnown.reportReady && lastKnown.provenanceFinalized) {
+        if (lastKnown.reportReady && (lastKnown.provenanceFinalized || TERMINAL_PROVENANCE_STATUSES.has(lastKnown.provenanceStatus.toLowerCase()))) {
           return lastKnown;
         }
       }
@@ -4243,7 +4261,7 @@ export default function App() {
 
   const fetchReviewQueue = useCallback(async () => {
     try {
-      const result = await authJsonFetch(`${REVIEW_QUEUE_URL}?recent_hours=${RECENT_DEMO_HOURS}`, { token });
+      const result = await authJsonFetch(`${REVIEW_QUEUE_URL}?recent_hours=0`, { token });
       if (!result.ok) {
         if (result.status === 401) {
           logout();
@@ -4879,17 +4897,18 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, onOp
     : fallbackSignalSummary;
   const liveEventRate = dashboardSummary?.live_event_rate ?? fallbackLiveEventRate;
   const lastUpdated = dashboardSummary?.system_health_basic?.last_updated || fallbackLastUpdated;
-  const metricTotalAttempts = dashboardSummary?.total_attempts ?? fallbackStats.total;
-  const metricHighRisk = dashboardSummary?.high_risk_count ?? fallbackStats.high;
+  const metricTotalAttempts = dashboardSummary?.total_attempts_lifetime ?? dashboardSummary?.total_attempts ?? fallbackStats.total;
+  const metricRecentAttempts = dashboardSummary?.total_attempts_recent ?? fallbackStats.total;
+  const metricHighRisk = dashboardSummary?.high_risk_now ?? dashboardSummary?.high_risk_count ?? fallbackStats.high;
   const metricMediumRisk = dashboardSummary?.medium_risk_count ?? fallbackStats.medium;
   const metricLowRisk = dashboardSummary?.low_risk_count ?? fallbackStats.low;
   const metricActiveSessions = dashboardSummary?.active_sessions ?? fallbackStats.ongoing;
-  const metricNeedsReview = dashboardSummary?.needs_review_count ?? unresolvedCases;
+  const metricNeedsReview = dashboardSummary?.needs_review ?? dashboardSummary?.needs_review_count ?? unresolvedCases;
   const metricAvgConfidence = dashboardSummary?.avg_confidence ?? fallbackStats.avgConfidence;
 
   const metrics = [
     { title: "Active Sessions", value: metricActiveSessions, subtitle: "Live exams in progress", tone: "blue", icon: <Users size={20} /> },
-    { title: "Total Attempts", value: metricTotalAttempts, subtitle: "Persisted attempts", tone: "cyan", icon: <ClipboardList size={20} /> },
+    { title: "Total Attempts", value: metricTotalAttempts, subtitle: "Persisted lifetime attempts", tone: "cyan", icon: <ClipboardList size={20} /> },
     { title: "High Risk Now", value: metricHighRisk, subtitle: "Requires attention", tone: "high", icon: <AlertTriangle size={20} /> },
     { title: "Medium Risk", value: metricMediumRisk, subtitle: "Monitoring", tone: "medium", icon: <ShieldAlert size={20} /> },
     { title: "Needs Review", value: metricNeedsReview, subtitle: "Unresolved cases", tone: "violet", icon: <ListChecks size={20} /> },
@@ -4898,13 +4917,14 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, onOp
   ];
 
   const distributionSegments = [
-    { label: "High Risk", value: Number((((dashboardSummary?.risk_distribution?.high_risk_count ?? metricHighRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#ff5f67", count: dashboardSummary?.risk_distribution?.high_risk_count ?? metricHighRisk },
-    { label: "Medium Risk", value: Number((((dashboardSummary?.risk_distribution?.medium_risk_count ?? metricMediumRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#ffb703", count: dashboardSummary?.risk_distribution?.medium_risk_count ?? metricMediumRisk },
-    { label: "Low Risk", value: Number((((dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#65d46e", count: dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk },
+    { label: "High Risk", value: Number((((dashboardSummary?.risk_distribution?.high_risk_count ?? metricHighRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts_lifetime ?? dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#ff5f67", count: dashboardSummary?.risk_distribution?.high_risk_count ?? metricHighRisk },
+    { label: "Medium Risk", value: Number((((dashboardSummary?.risk_distribution?.medium_risk_count ?? metricMediumRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts_lifetime ?? dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#ffb703", count: dashboardSummary?.risk_distribution?.medium_risk_count ?? metricMediumRisk },
+    { label: "Low Risk", value: Number((((dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk) / Math.max(1, dashboardSummary?.risk_distribution?.total_attempts_lifetime ?? dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts ?? riskTotal)) * 100).toFixed(1)), color: "#65d46e", count: dashboardSummary?.risk_distribution?.low_risk_count ?? metricLowRisk },
   ];
 
   const analyticsSummary = [
     { label: "Total Attempts", value: metricTotalAttempts },
+    { label: "Recent Attempts", value: metricRecentAttempts },
     { label: "Medium Risk", value: metricMediumRisk },
     { label: "Live Event Rate", value: liveEventRate },
     { label: "Stream", value: wsState === "connected" ? "Connected" : wsState === "reconnecting" ? "Reconnecting" : "Paused" },
@@ -4990,9 +5010,9 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, onOp
 
         <div className={`enterprise-panel${!liveUpdatesEnabled ? " command-primary-full" : ""}`}>
           <PanelHeader
-            title="Cases Needing Review"
-            subtitle="Prioritized unresolved cases"
-            actionLabel="View Review Queue"
+            title="Top unresolved cases"
+            subtitle="Prioritized preview from recent dashboard activity"
+            actionLabel="View all persisted cases"
             onActionClick={() => setPage("queue")}
           />
           {reviewCases.length === 0 ? (
@@ -5035,7 +5055,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, onOp
           <div className="panel-footer-link">
             <span>Showing top {visibleReviewCases.length} cases</span>
             <button className="panel-footer-action" onClick={() => setPage("queue")} type="button">
-              View All Cases
+              View all persisted cases
             </button>
           </div>
         </div>
@@ -5080,7 +5100,7 @@ function DashboardPage({ logs, cases, stats, dashboardSummary, currentUser, onOp
                   ))}
                 </div>
               </div>
-              <div className="panel-caption">Total Attempts: {dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts}</div>
+              <div className="panel-caption">Total Attempts: {dashboardSummary?.risk_distribution?.total_attempts_lifetime ?? dashboardSummary?.risk_distribution?.total_attempts ?? metricTotalAttempts}</div>
             </div>
             <div className="command-analytics-section">
               <PanelHeader title="Recent Evidence Signals" subtitle="Summary of recent suspicious activity" />
@@ -6807,8 +6827,41 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
       const startedAt = Date.now();
       let transientFailureCount = 0;
       let stableReadySeen = false;
+      let lastUsableReport = null;
+      let lastReadiness = {
+        reportReady: false,
+        provenanceReady: false,
+        provenanceFinalized: false,
+        provenanceStatus: "processing",
+        attemptStatus: "",
+      };
+
+      const buildFallbackReport = (readiness) => ({
+        attempt_id: attemptId,
+        candidate_name: "Unknown Candidate",
+        candidate_email: "No email available",
+        assessment_name: "Assessment",
+        attempt_status: readiness.attemptStatus || "SUBMITTED",
+        risk_level: "LOW",
+        risk_score: 0,
+        confidence: 0,
+        summary_text: "Behavioral signals were analyzed after assessment submission.",
+        strongest_reason: "Behavioral signals were reviewed in context after submission.",
+        why_score_text: "Behavioral signals were analyzed after assessment submission.",
+        behavioral_summary: "Behavioral signals were analyzed after assessment submission.",
+        most_suspicious_behaviors: ["Behavioral signals were reviewed in context after submission."],
+        violation_summary: {},
+        evidence_items: [],
+        provenance_status: readiness.provenanceStatus || "failed",
+        provenance_ready: false,
+        provenance_finalized: true,
+        answer_provenance: null,
+        privacy_note: "This summary reflects metadata-based integrity analysis only. It does not use webcam, microphone, screen recording, or clipboard contents.",
+      });
+
       while (!cancelled && Date.now() - startedAt < 18000) {
         const requestUrl = `${apiBaseUrl.replace(/\/$/, "")}/v1/demo/attempts/${encodeURIComponent(attemptId)}/report`;
+        const statusUrl = `${apiBaseUrl.replace(/\/$/, "")}/v1/reports/${encodeURIComponent(attemptId)}/status`;
         console.info("[Candidate Report]", {
           event: "candidate_report_fetch_started",
           attemptId,
@@ -6818,14 +6871,27 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
         const timeoutId = window.setTimeout(() => controller.abort(), 20000);
         let response;
         let payload = null;
+        let statusPayload = null;
         try {
-          response = await fetch(requestUrl, {
-            method: "GET",
-            headers: { Accept: "application/json" },
-            signal: controller.signal,
-          });
+          const [reportResult, statusResult] = await Promise.all([
+            fetch(requestUrl, {
+              method: "GET",
+              headers: { Accept: "application/json" },
+              signal: controller.signal,
+            }),
+            fetch(statusUrl, {
+              method: "GET",
+              headers: { Accept: "application/json" },
+              signal: controller.signal,
+            }).catch(() => null),
+          ]);
+          response = reportResult;
           const text = await response.text();
           payload = text ? JSON.parse(text) : null;
+          if (statusResult) {
+            const statusText = await statusResult.text();
+            statusPayload = statusText ? JSON.parse(statusText) : null;
+          }
         } catch (error) {
           console.error("[Candidate Report]", {
             event: "candidate_report_fetch_failed",
@@ -6854,22 +6920,72 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
 
         if (cancelled) return;
 
+        const statusData = statusPayload?.data || {};
+        const payloadData = payload?.data || null;
+        const nextAttemptStatus = String(
+          payload?.attempt_status
+          || payloadData?.attempt_status
+          || statusData?.attempt_status
+          || "",
+        ).toUpperCase();
+        const nextProvenanceStatus = String(
+          payloadData?.provenance_status
+          || payload?.provenance_status
+          || statusData?.provenance_status
+          || "processing",
+        ).toLowerCase();
+        const nextProvenanceReady = Boolean(
+          payload?.provenance_ready
+          ?? payloadData?.provenance_ready
+          ?? statusData?.provenance_ready,
+        );
+        const nextProvenanceFinalized = Boolean(
+          payload?.provenance_finalized
+          ?? payloadData?.provenance_finalized
+          ?? statusData?.provenance_finalized,
+        ) || TERMINAL_PROVENANCE_STATUSES.has(nextProvenanceStatus);
+        const nextReportReady = Boolean(
+          payload?.ready === true
+          || statusData?.report_exists
+          || (payload?.status === "success" && payloadData),
+        );
+        lastReadiness = {
+          reportReady: nextReportReady,
+          provenanceReady: nextProvenanceReady,
+          provenanceFinalized: nextProvenanceFinalized,
+          provenanceStatus: nextProvenanceStatus,
+          attemptStatus: nextAttemptStatus,
+        };
+        console.info("[Candidate Report]", {
+          event: "candidate_report_route_ready_state",
+          attemptId,
+          reportReady: nextReportReady,
+          provenanceReady: nextProvenanceReady,
+          provenanceFinalized: nextProvenanceFinalized,
+          provenanceStatus: nextProvenanceStatus,
+          attemptStatus: nextAttemptStatus,
+        });
+
         const hasReadyReport = Boolean(
           response?.ok
           && (
-            (payload?.ready === true && payload?.data)
-            || (payload?.status === "success" && payload?.data)
+            (nextReportReady && payloadData)
+            || (payload?.ready === true && payloadData)
+            || (payload?.status === "success" && payloadData)
           )
         );
         if (hasReadyReport) {
-          const nextAttemptStatus = String(payload?.attempt_status || payload?.data?.attempt_status || "").toUpperCase();
-          const nextProvenanceReady = Boolean(payload?.provenance_ready ?? payload?.data?.provenance_ready);
-          const nextProvenanceFinalized = Boolean(payload?.provenance_finalized ?? payload?.data?.provenance_finalized);
-          const nextProvenanceStatus = String(payload?.data?.provenance_status || payload?.provenance_status || "").toLowerCase();
+          const reportData = {
+            ...payloadData,
+            provenance_status: payloadData.provenance_status || nextProvenanceStatus,
+            provenance_ready: nextProvenanceReady,
+            provenance_finalized: nextProvenanceFinalized,
+          };
+          lastUsableReport = reportData;
           const nextState = {
-            loading: !nextProvenanceFinalized,
+            loading: false,
             ready: true,
-            data: payload.data,
+            data: reportData,
             error: "",
             provenanceReady: nextProvenanceReady,
             provenanceFinalized: nextProvenanceFinalized,
@@ -6885,25 +7001,28 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
             provenanceFinalized: nextProvenanceFinalized,
           });
           console.info("[Candidate Report]", {
-            event: "candidate_report_ready_state",
+            event: "candidate_report_route_ready_state",
             attemptId,
             ready: nextState.ready,
             attemptStatus: nextAttemptStatus,
             provenanceReady: nextProvenanceReady,
             provenanceFinalized: nextProvenanceFinalized,
+            provenanceStatus: nextProvenanceStatus,
           });
-          if (nextProvenanceFinalized && !nextProvenanceReady) {
+          if (nextProvenanceFinalized) {
             console.info("[Candidate Report]", {
-              event: "candidate_report_unblocked_without_provenance",
+              event: "candidate_report_route_unblocked",
               attemptId,
               provenanceStatus: nextProvenanceStatus || "unavailable",
             });
           }
           setReportState(nextState);
-          if (nextProvenanceFinalized) {
+          if (nextProvenanceFinalized || TERMINAL_PROVENANCE_STATUSES.has(nextProvenanceStatus)) {
             stableReadySeen = true;
             return;
           }
+        } else if (nextReportReady && nextProvenanceFinalized) {
+          lastUsableReport = lastUsableReport || buildFallbackReport(lastReadiness);
         }
         transientFailureCount = 0;
 
@@ -6920,8 +7039,8 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
         if (response?.ok && payload?.ready === false && payload?.status === "processing") {
           setReportState((prev) => ({
             ...prev,
-            loading: true,
-            ready: stableReadySeen ? prev.ready : false,
+            loading: !prev.ready,
+            ready: Boolean((prev.ready && prev.data) || stableReadySeen),
             error: "",
           }));
         } else if (!response?.ok) {
@@ -6949,7 +7068,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
         setReportState((prev) => {
           if (prev.ready && prev.data) {
             console.info("[Candidate Report]", {
-              event: "candidate_report_ready_state",
+              event: "candidate_report_route_timeout_fallback",
               attemptId,
               ready: prev.ready,
               attemptStatus: prev.attemptStatus,
@@ -6962,6 +7081,43 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
               provenanceFinalized: true,
             };
           }
+          if (lastUsableReport || lastReadiness.reportReady) {
+            const fallbackReport = lastUsableReport || buildFallbackReport({
+              ...lastReadiness,
+              provenanceStatus: TERMINAL_PROVENANCE_STATUSES.has(lastReadiness.provenanceStatus)
+                ? lastReadiness.provenanceStatus
+                : "failed",
+            });
+            console.info("[Candidate Report]", {
+              event: "candidate_report_route_timeout_fallback",
+              attemptId,
+              reportReady: lastReadiness.reportReady,
+              provenanceReady: lastReadiness.provenanceReady,
+              provenanceFinalized: true,
+              provenanceStatus: fallbackReport.provenance_status || "failed",
+            });
+            return {
+              loading: false,
+              ready: true,
+              data: {
+                ...fallbackReport,
+                provenance_status: fallbackReport.provenance_status || "failed",
+                provenance_finalized: true,
+              },
+              error: "",
+              provenanceReady: Boolean(fallbackReport.provenance_ready),
+              provenanceFinalized: true,
+              attemptStatus: fallbackReport.attempt_status || lastReadiness.attemptStatus || "SUBMITTED",
+            };
+          }
+          console.info("[Candidate Report]", {
+            event: "candidate_report_route_timeout_fallback",
+            attemptId,
+            reportReady: false,
+            provenanceReady: false,
+            provenanceFinalized: false,
+            provenanceStatus: "processing",
+          });
           return {
             loading: false,
             ready: false,
@@ -7030,6 +7186,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
       : "Answer provenance analysis was not available for this attempt.";
   const pdfExportReady = Boolean(reportState.ready && report && statusReadyForExport && reportState.provenanceFinalized);
   const overviewItems = buildViolationOverviewFromCounts(report?.violation_summary || {});
+  const candidateOverviewItems = getVisibleViolationOverviewItems(overviewItems, true);
   const candidateInsights = (report?.most_suspicious_behaviors || []).length
     ? report.most_suspicious_behaviors
     : [report?.behavioral_summary || report?.strongest_reason || "Behavioral signals were analyzed after submission."];
@@ -7157,10 +7314,43 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
       const usableHeight = pageHeight - margin * 2;
       const scaleRatio = usableWidth / canvas.width;
       const pagePixelHeight = Math.max(1, Math.floor(usableHeight / scaleRatio));
+      const domToCanvasScale = canvas.height / Math.max(targetHeight, 1);
+      const exportTop = exportNode.getBoundingClientRect().top;
+      const minSliceHeight = Math.floor(pagePixelHeight * 0.42);
+      const pageBreakPadding = Math.floor(18 * domToCanvasScale);
+      const pageBreakSelectors = [
+        ".pdf-report-header",
+        ".pdf-report-section",
+        ".pdf-report-match-card",
+        ".pdf-report-preview-grid article",
+        ".pdf-report-table tr",
+        ".pdf-report-panel",
+      ].join(",");
+      const pageBreaks = Array.from(exportNode.querySelectorAll(pageBreakSelectors))
+        .flatMap((element) => {
+          const rect = element.getBoundingClientRect();
+          const top = Math.round((rect.top - exportTop) * domToCanvasScale);
+          const bottom = Math.round((rect.bottom - exportTop) * domToCanvasScale);
+          return [top, bottom];
+        })
+        .filter((value) => Number.isFinite(value) && value > 0 && value < canvas.height)
+        .sort((a, b) => a - b)
+        .filter((value, index, values) => index === 0 || Math.abs(value - values[index - 1]) > 4);
 
       let pageIndex = 0;
-      for (let offsetY = 0; offsetY < canvas.height; offsetY += pagePixelHeight) {
-        const sliceHeight = Math.min(pagePixelHeight, canvas.height - offsetY);
+      let offsetY = 0;
+      while (offsetY < canvas.height) {
+        const remainingHeight = canvas.height - offsetY;
+        let sliceHeight = Math.min(pagePixelHeight, remainingHeight);
+        if (remainingHeight > pagePixelHeight) {
+          const pageEnd = offsetY + pagePixelHeight - pageBreakPadding;
+          const cleanBreak = [...pageBreaks]
+            .reverse()
+            .find((breakY) => breakY > offsetY + minSliceHeight && breakY <= pageEnd);
+          if (cleanBreak) {
+            sliceHeight = cleanBreak - offsetY;
+          }
+        }
         const pageCanvas = document.createElement("canvas");
         pageCanvas.width = canvas.width;
         pageCanvas.height = sliceHeight;
@@ -7191,6 +7381,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
           "FAST",
         );
         pageIndex += 1;
+        offsetY += sliceHeight;
       }
 
       pdf.save(`ProctorIQ_Candidate_Report_${attemptId}.pdf`);
@@ -7313,7 +7504,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
               </div>
             </section>
 
-            <ViolationOverview items={overviewItems} />
+            <ViolationOverview items={overviewItems} hideZeroSignals />
 
             <InvestigationInsightsCard insights={candidateInsights} riskLevel={riskLevel} />
 
@@ -7410,13 +7601,17 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
                 <h2>Violation Overview</h2>
               </div>
               <div className="pdf-report-overview-grid">
-                {overviewItems.map((item) => (
-                  <article className={`pdf-report-overview-card ${String(item.severity || "low").toLowerCase()}`} key={item.title}>
-                    <span>{item.title}</span>
-                    <strong>{item.value}</strong>
-                    <small>{item.severityLabel || severityLabel(item.severity)}</small>
-                  </article>
-                ))}
+                {candidateOverviewItems.length ? (
+                  candidateOverviewItems.map((item) => (
+                    <article className={`pdf-report-overview-card ${String(item.severity || "low").toLowerCase()}`} key={item.title}>
+                      <span>{item.title}</span>
+                      <strong>{item.value}</strong>
+                      <small>{item.severityLabel || severityLabel(item.severity)}</small>
+                    </article>
+                  ))
+                ) : (
+                  <p className="pdf-report-empty-message">{EMPTY_CANDIDATE_MESSAGE}</p>
+                )}
               </div>
             </section>
 
@@ -7434,7 +7629,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
               </div>
             </section>
 
-            <section className="pdf-report-section">
+            <section className="pdf-report-section pdf-report-section-large">
               <div className="pdf-report-section-head">
                 <h2>Answer Provenance Intelligence</h2>
               </div>
@@ -7547,7 +7742,7 @@ function PublicDemoReportPage({ apiBaseUrl, attemptId }) {
               )}
             </section>
 
-            <section className="pdf-report-section">
+            <section className="pdf-report-section pdf-report-section-large">
               <div className="pdf-report-section-head">
                 <h2>Evidence & Violations</h2>
               </div>

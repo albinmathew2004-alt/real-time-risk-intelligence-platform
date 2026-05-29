@@ -1389,49 +1389,64 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
     latest_event_by_attempt = _latest_event_metadata(db)
     latest_meaningful_event_by_attempt = _latest_meaningful_event_metadata(db)
     latest_history_by_attempt = _latest_risk_history_by_attempt(db)
-    cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
+    all_cases = db.query(InvestigationCase).order_by(InvestigationCase.updated_at.desc(), InvestigationCase.id.desc()).all()
     cutoff = _recent_cutoff(recent_hours)
-    attempt_rows = _build_persisted_attempt_rows(db, recent_hours=recent_hours, sync_cases=False)
-    if cutoff is not None and attempt_rows:
-        recent_attempt_ids = {row.get("attempt_id") for row in attempt_rows if row.get("attempt_id")}
-        cases = [
-            case for case in cases
+    lifetime_attempt_rows = _build_persisted_attempt_rows(db, recent_hours=None, sync_cases=False)
+    if cutoff is None:
+        recent_attempt_rows = list(lifetime_attempt_rows)
+    else:
+        recent_attempt_rows = [
+            row for row in lifetime_attempt_rows
+            if _is_recent_timestamp(row.get("timestamp"), cutoff)
+        ]
+    recent_attempt_ids = {row.get("attempt_id") for row in recent_attempt_rows if row.get("attempt_id")}
+    recent_cases = all_cases
+    if cutoff is not None:
+        recent_cases = [
+            case for case in all_cases
             if case.attempt_id in recent_attempt_ids
             or _is_recent_timestamp(getattr(case, "latest_event_at", None), cutoff)
             or _is_recent_timestamp(getattr(case, "updated_at", None), cutoff)
         ]
-    case_by_attempt = {case.attempt_id: case for case in cases if case.attempt_id}
+    case_by_attempt = {case.attempt_id: case for case in recent_cases if case.attempt_id}
 
-    attempt_rows.sort(
+    lifetime_attempt_rows.sort(
+        key=lambda row: parse_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    recent_attempt_rows.sort(
         key=lambda row: parse_timestamp(row.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
 
-    total_attempts = len(attempt_rows)
+    total_attempts_lifetime = len(lifetime_attempt_rows)
+    total_attempts_recent = len(recent_attempt_rows)
     active_sessions = sum(
         1
-        for row in attempt_rows
+        for row in lifetime_attempt_rows
         if _is_live_attempt_row(row)
     )
-    high_risk_count = sum(
+    high_risk_now = sum(
         1
-        for row in attempt_rows
+        for row in lifetime_attempt_rows
         if row.get("risk_level") == "HIGH" and _actionable_case_status(str(row.get("status") or "NEW"))
     )
-    medium_risk_count = sum(1 for row in attempt_rows if row.get("risk_level") == "MEDIUM")
-    low_risk_count = sum(1 for row in attempt_rows if row.get("risk_level") == "LOW")
+    high_risk_count = high_risk_now
+    medium_risk_count = sum(1 for row in lifetime_attempt_rows if row.get("risk_level") == "MEDIUM")
+    low_risk_count = sum(1 for row in lifetime_attempt_rows if row.get("risk_level") == "LOW")
     actionable_cases = [
-        case for case in cases
+        case for case in all_cases
         if _actionable_case_status(str(getattr(case, "status", None) or "NEW"))
     ]
-    needs_review_count = len(actionable_cases)
-    escalated_count = sum(1 for case in cases if getattr(case, "status", None) == "ESCALATED")
+    needs_review = len(actionable_cases)
+    needs_review_count = needs_review
+    escalated_count = sum(1 for case in all_cases if getattr(case, "status", None) == "ESCALATED")
     avg_confidence = round(
-        sum(safe_float(row.get("confidence"), 0.0) for row in attempt_rows) / max(1, total_attempts),
+        sum(safe_float(row.get("confidence"), 0.0) for row in lifetime_attempt_rows) / max(1, total_attempts_lifetime),
         4,
     )
 
-    latest_log_time = max((parse_timestamp(row.get("timestamp")) for row in attempt_rows if row.get("timestamp")), default=None)
+    latest_log_time = max((parse_timestamp(row.get("timestamp")) for row in lifetime_attempt_rows if row.get("timestamp")), default=None)
     if latest_log_time is not None:
         window_start = latest_log_time - timedelta(minutes=15)
         raw_event_times = [
@@ -1448,7 +1463,7 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
         live_event_rate = 0
 
     meaningful_feed_candidates: List[Dict[str, Any]] = []
-    for row in attempt_rows:
+    for row in recent_attempt_rows:
         attempt_id = row.get("attempt_id")
         event_meta = latest_event_by_attempt.get(attempt_id)
         meaningful_event_meta = latest_meaningful_event_by_attempt.get(attempt_id)
@@ -1508,7 +1523,7 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
 
     cases_needing_review: List[Dict[str, Any]] = []
     candidate_rows = []
-    for row in attempt_rows:
+    for row in recent_attempt_rows:
         attempt_id = row.get("attempt_id")
         if not attempt_id:
             continue
@@ -1541,18 +1556,20 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
         cases_needing_review.append({"priority": index, **item})
 
     risk_distribution = {
-        "total_attempts": total_attempts,
+        "total_attempts": total_attempts_lifetime,
+        "total_attempts_lifetime": total_attempts_lifetime,
+        "total_attempts_recent": total_attempts_recent,
         "high_risk_count": high_risk_count,
         "medium_risk_count": medium_risk_count,
         "low_risk_count": low_risk_count,
     }
 
     recent_evidence_signals = {
-        "clipboard_copy_paste": sum(int(safe_float((row.get("features") or {}).get("paste_count"), 0.0)) for row in attempt_rows),
-        "tab_switch_events": sum(int(safe_float((row.get("features") or {}).get("tab_hidden_count"), 0.0)) for row in attempt_rows),
-        "idle_time_spikes": sum(int(safe_float((row.get("features") or {}).get("idle_spike_count"), 0.0)) for row in attempt_rows),
-        "rapid_answer_bursts": sum(1 for row in attempt_rows if safe_float((row.get("features") or {}).get("time_per_question_mean_s"), 0.0) > 0 and safe_float((row.get("features") or {}).get("time_per_question_mean_s"), 0.0) <= 15),
-        "focus_blur_events": sum(int(safe_float((row.get("features") or {}).get("tab_hidden_count"), 0.0)) for row in attempt_rows),
+        "clipboard_copy_paste": sum(int(safe_float((row.get("features") or {}).get("paste_count"), 0.0)) for row in recent_attempt_rows),
+        "tab_switch_events": sum(int(safe_float((row.get("features") or {}).get("tab_hidden_count"), 0.0)) for row in recent_attempt_rows),
+        "idle_time_spikes": sum(int(safe_float((row.get("features") or {}).get("idle_spike_count"), 0.0)) for row in recent_attempt_rows),
+        "rapid_answer_bursts": sum(1 for row in recent_attempt_rows if safe_float((row.get("features") or {}).get("time_per_question_mean_s"), 0.0) > 0 and safe_float((row.get("features") or {}).get("time_per_question_mean_s"), 0.0) <= 15),
+        "focus_blur_events": sum(int(safe_float((row.get("features") or {}).get("tab_hidden_count"), 0.0)) for row in recent_attempt_rows),
     }
 
     system_health_basic = {
@@ -1564,13 +1581,25 @@ def _build_dashboard_summary(db, *, recent_hours: Optional[int] = None) -> Dict[
         "last_updated": latest_log_time.isoformat() if latest_log_time else None,
     }
 
+    logger.info(
+        "dashboard_summary_counts lifetime_attempts=%s recent_attempts=%s active_sessions=%s needs_review=%s",
+        total_attempts_lifetime,
+        total_attempts_recent,
+        active_sessions,
+        needs_review,
+    )
+
     return {
         "active_sessions": active_sessions,
-        "total_attempts": total_attempts,
+        "total_attempts": total_attempts_lifetime,
+        "total_attempts_lifetime": total_attempts_lifetime,
+        "total_attempts_recent": total_attempts_recent,
         "high_risk_count": high_risk_count,
+        "high_risk_now": high_risk_now,
         "medium_risk_count": medium_risk_count,
         "low_risk_count": low_risk_count,
         "needs_review_count": needs_review_count,
+        "needs_review": needs_review,
         "escalated_count": escalated_count,
         "avg_confidence": avg_confidence,
         "live_event_rate": live_event_rate,
